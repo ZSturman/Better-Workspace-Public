@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.aps-environment</key>
+    <string>development</string>
+    <key>com.apple.developer.icloud-container-environment</key>
+    <string>$(ICLOUD_CONTAINER_ENVIRONMENT)</string>
+    <key>com.apple.security.application-groups</key>
+    <array><string>MF8J7AY2X3.com.zacharysturman.BetterWorkspace.widgets</string></array>
+    <key>com.apple.developer.icloud-container-identifiers</key>
+    <array>
+        <string>iCloud.com.zacharysturman.BetterWorkspace</string>
+    </array>
+    <!-- The Mac reads the shared Inbox by plain path, which needs no entitlement — but a
+         path reader is invisible to the sync machinery, so nothing keeps the container
+         up to date and captures silently stop crossing between devices. Claiming the
+         ubiquity container is what registers this app as a user of it. -->
+    <key>com.apple.developer.ubiquity-container-identifiers</key>
+    <array>
+        <string>iCloud.com.zacharysturman.BetterWorkspace</string>
+    </array>
+    <key>com.apple.developer.icloud-services</key>
+    <array>
+        <string>CloudDocuments</string>
+        <string>CloudKit</string>
+    </array>
+</dict>
+</plist>

@@ -1,0 +1,15 @@
+# Declarative v2 rules. Keep this file intentionally small: it can match
+# event type plus simple context fields, then run only typed actions.
+#
+# [[rules]]
+# id = "to-test-route"
+# enabled = true
+# priority = 100
+# [rules.when]
+# event = "intent_item.intent_changed"
+# [rules.conditions]
+# intent = "To Test"
+# [[rules.actions]]
+# type = "route_message"
+# destination = "project:workspace"
+# message_type = "item.needs_testing"

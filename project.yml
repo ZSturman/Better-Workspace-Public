@@ -1,0 +1,518 @@
+name: BetterWorkspace
+options:
+  bundleIdPrefix: com.zacharysturman
+  deploymentTarget:
+    macOS: "14.4"
+    iOS: "17.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: "YES"
+    CODE_SIGNING_ALLOWED: "YES"
+    DEVELOPMENT_TEAM: MF8J7AY2X3
+    "CODE_SIGN_IDENTITY[sdk=iphoneos*]": "Apple Development"
+    "CODE_SIGN_STYLE[sdk=iphoneos*]": Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+
+  BetterWorkspaceCore:
+    type: framework
+    supportedDestinations: [macOS, iOS]
+    sources:
+      - path: Sources/Core
+      - path: Support/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspaceCore
+        DEFINES_MODULE: "YES"
+        "CODE_SIGN_IDENTITY[sdk=macosx*]": Apple Development
+        "CODE_SIGN_STYLE[sdk=macosx*]": Automatic
+        SKIP_INSTALL: "YES"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: BetterWorkspaceCore
+    dependencies:
+      - sdk: libsqlite3.tbd
+
+  BetterWorkspace:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Mac
+      - path: Support/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - path: Resources/AgentTasks/agent_tasks.py
+        buildPhase: resources
+      - path: Sources/Intents
+      - path: Sources/SharedUI
+    dependencies:
+      - target: BetterWorkspaceCore
+        embed: true
+      - target: BetterWorkspaceMacWidgets
+        embed: true
+        codeSign: true
+    # The background service ships inside the app and is installed from here
+    # (BackgroundServiceAgent). Code, launcher and requirements only.
+    postBuildScripts:
+      - name: Bundle background service
+        shell: /bin/bash
+        basedOnDependencyAnalysis: false
+        script: |
+          dest="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BackgroundService"
+          mkdir -p "$dest"
+          rsync -a --delete --exclude '__pycache__' --exclude '*.pyc' \
+            "${SRCROOT}/BackgroundService/workspace_watcher" "$dest/"
+          cp "${SRCROOT}/BackgroundService/run.sh" "${SRCROOT}/BackgroundService/requirements.txt" \
+            "${SRCROOT}/BackgroundService/rules.default.toml" "$dest/"
+          runtime="${SRCROOT}/Vendor/PythonRuntime"
+          if [[ -f "$runtime/manifest.json" ]]; then
+            identity="${BETTER_WORKSPACE_RUNTIME_SIGNING_IDENTITY:-${EXPANDED_CODE_SIGN_IDENTITY:--}}"
+            if ! cmp -s "$runtime/manifest.json" "$dest/PythonRuntime/manifest.json" || \
+               [[ "$(cat "$dest/PythonRuntime/.bw-signing-identity" 2>/dev/null || true)" != "$identity" ]]; then
+              mkdir -p "$dest/PythonRuntime"
+              rsync -a --delete "$runtime/" "$dest/PythonRuntime/"
+              if [[ "${CODE_SIGNING_ALLOWED}" != "NO" ]]; then
+                timestamp=()
+                if [[ "${BETTER_WORKSPACE_RUNTIME_SIGNING_IDENTITY:-}" != "" ]]; then timestamp=(--timestamp); fi
+                python3 "${SRCROOT}/Tools/sign_bundled_python.py" "$dest/PythonRuntime" --identity "$identity" "${timestamp[@]}"
+                printf '%s' "$identity" > "$dest/PythonRuntime/.bw-signing-identity"
+              fi
+            fi
+          elif [[ "${BW_REQUIRE_EMBEDDED_PYTHON:-NO}" == "YES" ]]; then
+            echo "error: Run python3 Tools/prepare_python_runtime.py before archiving the advanced Mac app."
+            exit 1
+          fi
+    info:
+      path: Support/BetterWorkspace-Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleName: Better Workspace
+        CFBundleDisplayName: Better Workspace
+        LSMinimumSystemVersion: "14.4"
+        BWNotebookCloudSyncEnabled: true
+        NSHumanReadableCopyright: "Copyright © 2026 Zachary Sturman"
+        LSApplicationCategoryType: public.app-category.productivity
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+        NSQuitAlwaysKeepsWindows: false
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # Widgets and other tools open places in the app: betterworkspace://project/<id>,
+        # item/<id>, intent/<id>, activity, today, diagnostics (AppModel.openDeepLink).
+        CFBundleURLTypes:
+          - CFBundleURLName: com.zacharysturman.BetterWorkspace
+            CFBundleURLSchemes: [betterworkspace]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Any
+            CFBundleTypeRole: Viewer
+            LSItemContentTypes: [public.item]
+            LSHandlerRank: Alternate
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspace
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MF8J7AY2X3
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_APP_SANDBOX: "NO"
+        ENABLE_HARDENED_RUNTIME: "YES"
+        COMBINE_HIDPI_IMAGES: "YES"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Support/BetterWorkspace.entitlements
+        ICLOUD_CONTAINER_ENVIRONMENT: Development
+      configs:
+        Release:
+          ICLOUD_CONTAINER_ENVIRONMENT: Production
+
+  # Sandboxed desktop widgets read the app-group dashboard and persist commands.
+  # Retained service-health/session widgets also use the service's loopback API.
+  BetterWorkspaceMacWidgets:
+    type: app-extension
+    platform: macOS
+    dependencies:
+      - target: BetterWorkspaceCore
+        embed: false
+    sources:
+      - path: Sources/MacWidgets
+      - path: Support/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - path: Sources/SharedWidgets
+      # The controls' intent; it runs in the app (`openAppWhenRun`).
+      - path: Sources/Intents/OpenCaptureIntent.swift
+    info:
+      path: Support/BetterWorkspaceMacWidgets-Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: Better Workspace Widgets
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: Support/BetterWorkspaceMacWidgets.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.application-groups:
+          - MF8J7AY2X3.com.zacharysturman.BetterWorkspace.widgets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspace.Widgets
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MF8J7AY2X3
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: "YES"
+
+  # One native Store app target for Mac, iPhone and iPad. Platform filters retain
+  # UIKit capture/connected views on iOS; native Mac starts with the shared notebook.
+  # The separate advanced Mac target retains unrestricted, opt-in integrations.
+  BetterWorkspaceMobile:
+    type: application
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - path: Sources/Mobile
+        destinationFilters: [iOS]
+      - path: Sources/StoreMac
+        destinationFilters: [macOS]
+      - path: Sources/Mac/Assets.xcassets
+        destinationFilters: [macOS]
+      - path: Support/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      # Capture is a normal Better Workspace flow.  The old companion app entry point
+      # is deliberately excluded so this remains one iPhone application.
+      - path: Sources/iOS
+        destinationFilters: [iOS]
+        excludes:
+          - IngestCompanionApp.swift
+          - Assets.xcassets
+      - path: Sources/Intents
+        destinationFilters: [iOS]
+      - path: Sources/SharedUI
+    dependencies:
+      - target: BetterWorkspaceCore
+        embed: true
+      - target: BetterWorkspaceMobileWidgets
+        destinationFilters: [iOS]
+        embed: true
+      - target: BetterWorkspaceShare
+        destinationFilters: [iOS]
+        embed: true
+    info:
+      path: Support/BetterWorkspaceMobile-Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleName: Better Workspace
+        CFBundleDisplayName: Better Workspace
+        UILaunchScreen: {}
+        BWNotebookCloudSyncEnabled: true
+        UIBackgroundModes: [remote-notification]
+        NSQuitAlwaysKeepsWindows: false
+        LSApplicationCategoryType: public.app-category.productivity
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        CFBundleURLTypes:
+          - CFBundleURLName: com.zacharysturman.BetterWorkspace.Mobile
+            CFBundleURLSchemes: [betterworkspace-mobile]
+        NSPhotoLibraryUsageDescription: "Attach photos and video to a workspace capture."
+        NSCameraUsageDescription: "Capture a photo for your workspace inbox."
+        NSHumanReadableCopyright: "Copyright © 2026 Zachary Sturman"
+        ITSAppUsesNonExemptEncryption: false
+        NSUbiquitousContainers:
+          iCloud.com.zacharysturman.BetterWorkspace:
+            NSUbiquitousContainerIsDocumentScopePublic: true
+            NSUbiquitousContainerName: Better Workspace
+            NSUbiquitousContainerSupportedFolderLevels: Any
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspace.Mobile
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_PREVIEWS: "YES"
+        # Optional host-only overrides let authenticated portal profiles be used
+        # when Xcode's account session is unavailable, without changing test runners.
+        BW_STORE_SIGNING_STYLE: Automatic
+        CODE_SIGN_STYLE: $(BW_STORE_SIGNING_STYLE)
+        PROVISIONING_PROFILE_SPECIFIER: $(BW_STORE_PROFILE_SPECIFIER)
+        DEVELOPMENT_TEAM: MF8J7AY2X3
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        CODE_SIGN_ENTITLEMENTS: Support/BetterWorkspaceMobile.entitlements
+        "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": Support/BetterWorkspaceStoreMac.entitlements
+        ICLOUD_CONTAINER_ENVIRONMENT: Development
+        MACOSX_DEPLOYMENT_TARGET: "14.4"
+        "ENABLE_APP_SANDBOX[sdk=macosx*]": "YES"
+        "ENABLE_HARDENED_RUNTIME[sdk=macosx*]": "YES"
+        # XcodeGen's iOS defaults do not account for native macOS Contents/MacOS.
+        # Xcode's test loader can mask this; installed Store apps need this rpath.
+        "LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]": "$(inherited) @executable_path/../Frameworks"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        Release:
+          ICLOUD_CONTAINER_ENVIRONMENT: Production
+
+  BetterWorkspaceMobileWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/BetterWorkspaceMobileWidgets
+      - path: Support/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - path: Sources/SharedWidgets
+      # Its Control Center control and widget buttons run the app's New Capture intent.
+      - path: Sources/Intents/OpenCaptureIntent.swift
+    dependencies:
+      # Link, but do not embed: the host app already ships BetterWorkspaceCore, and the
+      # extension reaches it through @executable_path/../../Frameworks. Embedding again
+      # put a second copy of the framework inside the appex.
+      - target: BetterWorkspaceCore
+        embed: false
+    info:
+      path: Support/BetterWorkspaceMobileWidgets-Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: Better Workspace Widgets
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: Support/BetterWorkspaceMobileWidgets.entitlements
+      properties:
+        com.apple.developer.icloud-container-identifiers:
+          - iCloud.com.zacharysturman.BetterWorkspace
+        com.apple.developer.icloud-services:
+          - CloudKit
+        com.apple.security.application-groups:
+          - group.com.zacharysturman.BetterWorkspace.mobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspace.Mobile.BetterWorkspaceMobileWidgets
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MF8J7AY2X3
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+  # Share → Better Workspace. Writes into the same iCloud Inbox as the app and queues
+  # filing requests in the shared app group; see Sources/ShareExtension.
+  BetterWorkspaceShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/ShareExtension
+      - path: Support/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - path: Sources/iOS/CaptureTagPicker.swift
+    dependencies:
+      - target: BetterWorkspaceCore
+        embed: false
+    info:
+      path: Support/BetterWorkspaceShare-Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: Better Workspace
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 10
+              NSExtensionActivationSupportsMovieWithMaxCount: 5
+              NSExtensionActivationSupportsFileWithMaxCount: 10
+    entitlements:
+      path: Support/BetterWorkspaceShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.zacharysturman.BetterWorkspace.mobile
+        com.apple.developer.icloud-container-identifiers:
+          - iCloud.com.zacharysturman.BetterWorkspace
+        com.apple.developer.ubiquity-container-identifiers:
+          - iCloud.com.zacharysturman.BetterWorkspace
+        com.apple.developer.icloud-services:
+          - CloudKit
+          - CloudDocuments
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspace.Mobile.Share
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MF8J7AY2X3
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+  BetterWorkspaceUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: Tests/UITests
+    dependencies:
+      - target: BetterWorkspace
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspaceUITests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: BetterWorkspace
+        ENABLE_APP_SANDBOX: "NO"
+
+  # The same core tests, compiled and run on iOS. The framework is shared between the
+  # two apps, so "it passes on macOS" is not evidence that it behaves on the phone.
+  BetterWorkspaceExperienceUITests:
+    type: bundle.ui-testing
+    supportedDestinations: [macOS, iOS]
+    sources: [Tests/ExperienceUITests]
+    dependencies:
+      - target: BetterWorkspaceMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        CODE_SIGN_STYLE: Automatic
+        TEST_TARGET_NAME: BetterWorkspaceMobile
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspace.ExperienceUITests
+        MACOSX_DEPLOYMENT_TARGET: "14.4"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+  BetterWorkspaceCoreTests_iOS:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/CoreTests/CoreTests.swift
+      - path: Tests/CoreTests/IngestPlacementTests.swift
+      - path: Tests/CoreTests/OverviewFocusTests.swift
+      - path: Tests/CoreTests/WidgetDashboardTests.swift
+      - path: Tests/CoreTests/WidgetCommandTests.swift
+      - path: Tests/CoreTests/WidgetLayoutTests.swift
+      - path: Tests/CoreTests/WorkItemPathIndexTests.swift
+      - path: Tests/CoreTests/ProjectAutoSyncTests.swift
+      - path: Tests/CoreTests/WorkspaceNotebookTests.swift
+      - path: Sources/SharedWidgets
+    dependencies:
+      - target: BetterWorkspaceCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspaceCoreTests.ios
+        GENERATE_INFOPLIST_FILE: "YES"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: MF8J7AY2X3
+
+  BetterWorkspaceMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: Tests/MobileUITests
+    dependencies:
+      - target: BetterWorkspaceMobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspaceMobileUITests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: BetterWorkspaceMobile
+
+  BetterWorkspaceCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/CoreTests
+      - path: Sources/SharedWidgets
+    dependencies:
+      - target: BetterWorkspaceCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspaceCoreTests
+        GENERATE_INFOPLIST_FILE: "YES"
+
+  BetterWorkspaceCloudAcceptanceTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [Tests/CloudAcceptanceTests]
+    dependencies:
+      - target: BetterWorkspaceMobile
+      - target: BetterWorkspaceCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspace.CloudAcceptanceTests
+        GENERATE_INFOPLIST_FILE: "YES"
+        CODE_SIGN_IDENTITY: Apple Development
+        CODE_SIGN_STYLE: Automatic
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/BetterWorkspaceMobile.app/Contents/MacOS/BetterWorkspaceMobile"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+schemes:
+  BetterWorkspaceCloudAcceptance:
+    build:
+      targets:
+        BetterWorkspaceMobile: all
+        BetterWorkspaceCloudAcceptanceTests: [test]
+    test:
+      targets: [BetterWorkspaceCloudAcceptanceTests]
+      environmentVariables:
+        BW_RUN_NOTEBOOK_CLOUD_ACCEPTANCE: "1"
+  BetterWorkspace:
+    build:
+      targets:
+        BetterWorkspace: all
+        BetterWorkspaceCoreTests: [test]
+        BetterWorkspaceUITests: [test]
+    run:
+      config: Debug
+    archive:
+      config: Release
+    test:
+      config: Debug
+      captureScreenshotsAutomatically: false
+      deleteScreenshotsWhenEachTestSucceeds: false
+      targets:
+        - BetterWorkspaceCoreTests
+        - BetterWorkspaceUITests
+  BetterWorkspaceMobile:
+    build:
+      targets:
+        BetterWorkspaceMobile: all
+        BetterWorkspaceMobileUITests: [test]
+    run:
+      config: Debug
+    archive:
+      config: Release
+    test:
+      config: Debug
+      captureScreenshotsAutomatically: false
+      deleteScreenshotsWhenEachTestSucceeds: false
+      targets:
+        - BetterWorkspaceMobileUITests
+
+  BetterWorkspaceWidgets_iOS:
+    build:
+      targets:
+        BetterWorkspaceMobile: all
+        BetterWorkspaceCoreTests_iOS: [test]
+    test:
+      config: Debug
+      targets:
+        - BetterWorkspaceCoreTests_iOS
+
+  BetterWorkspaceApp:
+    build:
+      targets:
+        BetterWorkspaceMobile: all
+        BetterWorkspaceExperienceUITests: [test]
+    run:
+      config: Debug
+    archive:
+      config: Release
+    test:
+      config: Debug
+      captureScreenshotsAutomatically: false
+      targets:
+        - BetterWorkspaceExperienceUITests
