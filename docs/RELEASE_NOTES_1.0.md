@@ -1,5 +1,7 @@
 # Better Workspace 1.0 — Build 8
 
+**App Store update — October 16:** iPhone/iPad and native Mac 1.0 (Build 8) have been submitted to Apple and are **Waiting for Review**. Both will release automatically after approval. The public Store listing is not available yet; the advanced Mac download below is available now.
+
 The first public advanced Mac release brings your folders, projects, tasks, ideas and captures into a native workspace.
 
 - Browse real folders and portable Markdown plans.
