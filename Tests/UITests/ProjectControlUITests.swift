@@ -25,6 +25,11 @@ final class ProjectControlUITests: IsolatedUITestCase {
         XCTAssertTrue(shortcut.waitForExistence(timeout: 15))
         XCTAssertTrue(shortcut.label.contains("New project created"))
         screenshot("new-project-projects-820", app)
+        let addNotion = app.buttons["Add to Notion…"].firstMatch
+        XCTAssertTrue(addNotion.waitForExistence(timeout: 10))
+        addNotion.click()
+        XCTAssertTrue(app.staticTexts["Notion settings"].firstMatch.waitForExistence(timeout: 10))
+        app.buttons["Done"].firstMatch.click()
         shortcut.click()
         XCTAssertTrue(app.descendants(matching: .any)["projects.workspace"].firstMatch.waitForExistence(timeout: 15))
     }

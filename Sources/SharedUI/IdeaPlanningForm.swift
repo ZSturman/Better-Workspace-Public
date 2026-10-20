@@ -6,6 +6,7 @@ struct IdeaPlanningForm: View {
     @Binding var planning: IdeaPlanning
     let preferences: ProjectScoringPreferences
     var projectOptions: [String: [String]] = [:]
+    var choiceDefaults: UserDefaults? = nil
     @State private var showingRatings = false
     var body: some View {
         let score = planning.score(preferences: preferences)
@@ -19,11 +20,14 @@ struct IdeaPlanningForm: View {
                     ForEach(1...5, id: \.self) { Text("\($0) · \($0 == 5 ? "Highest" : $0 == 1 ? "Lowest" : "Priority")").tag($0) }
                 }.accessibilityIdentifier("idea.planning.priority")
             }
-            if planning.potential == .project {
-                Section("Potential project") {
+            Section("Classification") {
                     projectProperty("Domain", keyPath: \.domain, optionKey: "domain")
                     projectProperty("Type", keyPath: \.projectType, optionKey: "Type")
+                    projectProperty("Status", keyPath: \.status, optionKey: "Status")
                     projectProperty("Phase", keyPath: \.phase, optionKey: "Phase")
+            }
+            if planning.potential == .project {
+                Section("Potential project") {
                     LabeledContent("One-liner") {
                         TextField("One-liner", text: Binding(get: { planning.project?.oneLiner ?? "" }, set: { ensureProject(); planning.project?.oneLiner = $0 }), prompt: Text("What it is, in a sentence"))
                             .labelsHidden().multilineTextAlignment(.trailing)
@@ -66,18 +70,9 @@ struct IdeaPlanningForm: View {
     }
     private func ensureProject() { if planning.project == nil { planning.project = .init() } }
     private func projectProperty(_ title: String, keyPath: WritableKeyPath<ProjectMetadata, String?>, optionKey: String) -> some View {
-        // A visible label, not just a placeholder: a filled field must still say what it is.
-        LabeledContent(title) {
-            HStack {
-                TextField(title, text: Binding(get: { planning.project?.metadata[keyPath: keyPath] ?? "" }, set: { ensureProject(); planning.project?.metadata[keyPath: keyPath] = $0.isEmpty ? nil : $0 }), prompt: Text("Not set"))
-                    .labelsHidden().multilineTextAlignment(.trailing)
-                    .accessibilityIdentifier("idea.project." + optionKey)
-                if let options = projectOptions[optionKey], !options.isEmpty {
-                    Menu { ForEach(options, id: \.self) { value in Button(value) { ensureProject(); planning.project?.metadata[keyPath: keyPath] = value } } } label: { Image(systemName: "chevron.down") }
-                        .fixedSize().accessibilityLabel("Choose " + title)
-                }
-            }
-        }
+        WorkspaceChoiceField(title, selection: Binding(
+            get: { planning.project?.metadata[keyPath: keyPath] ?? "" },
+            set: { ensureProject(); planning.project?.metadata[keyPath: keyPath] = $0.isEmpty ? nil : $0 }),
+            suggestions: projectOptions[optionKey] ?? [], identifier: "idea.project." + optionKey, store: choiceDefaults)
     }
-
 }

@@ -210,12 +210,9 @@ struct ProjectGraphRecordEditor: View {
                                         set: { draft.set(name, value: .bool($0), source: source) })).labelsHidden()
                 .accessibilityIdentifier(id)
         case "select", "status":
-            Picker(label, selection: Binding(get: { draft.value(name, source: source)[type]["name"].string ?? "" },
-                                             set: { draft.set(name, value: $0.isEmpty ? .null : ProjectJSON(["name": $0]), source: source) })) {
-                Text("None").tag("")
-                ForEach(options(schema, type), id: \.self) { Text($0).tag($0) }
-            }
-            .labelsHidden().fixedSize().accessibilityIdentifier(id)
+            WorkspaceChoiceField(label, selection: Binding(get: { draft.value(name, source: source)[type]["name"].string ?? "" },
+                set: { draft.set(name, value: $0.isEmpty ? .null : ProjectJSON(["name": $0]), source: source) }),
+                suggestions: options(schema, type), identifier: id, store: TestIsolation.defaults)
         case "multi_select":
             let selected = draft.value(name, source: source)[type].array.compactMap { $0["name"].string }
             Menu {

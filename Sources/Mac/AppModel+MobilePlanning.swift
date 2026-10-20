@@ -7,6 +7,18 @@ extension AppModel {
     func applyMobilePlanning(_ edit: MobilePlanningEdit) async throws {
         try MobilePlanningFiles.validate(edit)
         switch edit.operation {
+        case .downloadFiles:
+            guard let entry = edit.originalEntry, let area = entry.path.split(separator: "/").first.map(String.init),
+                  folders.contains(where: { $0.name == area }) else { throw MobilePlanningFiles.Error.invalid("Choose an available Workspace category.") }
+            let workspace = workspace
+            let bundleFile = try await Task.detached(priority: .utility) {
+                let bundle = try MobileDownloadBundle.prepare(entry, workspace: workspace)
+                let file = FileManager.default.temporaryDirectory.appendingPathComponent("bw-download-" + UUID().uuidString + ".plist")
+                try bundle.write(to: file)
+                return file
+            }.value
+            defer { try? FileManager.default.removeItem(at: bundleFile) }
+            try await mobileCloudPublisher.publishDownload(file: bundleFile, requestID: edit.id, path: entry.path)
         case .previewIdea:
             guard let original = edit.originalIdea else { throw MobilePlanningFiles.Error.invalid("Missing idea preview request.") }
             try await prepareMobileIdeaPreviews(original)
@@ -35,7 +47,11 @@ extension AppModel {
                   projectRecord(for: project)?.id == change.original.projectID else { throw MobilePlanningFiles.Error.conflict }
             try projectStore.saveMobileProject(change)
             reloadProjectRatings()
-            queueProjectGraphEdits(for: project, fields: Set(["one liner", "summary"] + MetricDefinition.all.map(\.displayName)))
+            var fields = change.properties?.changedFields(from: change.original) ?? []
+            if change.oneLiner != (change.original.oneLiner ?? "") { fields.insert("one liner") }
+            if change.summary != (change.original.summary ?? "") { fields.insert("summary") }
+            fields.formUnion(MetricDefinition.all.filter { change.ratings[$0.id] != change.original.ratings?[$0.id] }.map(\.displayName))
+            if !fields.isEmpty { queueProjectGraphEdits(for: project, fields: fields) }
             refreshOverview()
         case .previewProject:
             guard let entry = edit.originalEntry else { throw MobilePlanningFiles.Error.invalid("Missing project.") }
@@ -276,7 +292,7 @@ extension AppModel {
                 attachments = [MobileIdeaAttachment(path: path, name: item.name)]
             }
             result[path] = MobileIdea(path: path, title: title, revision: 0,
-                description: description, attachments: attachments, serviceID: metadata?.id, planning: metadata?.planning, scoringPreferences: scoringPreferences(), previews: previews["idea:" + (metadata?.id ?? item.id)])
+                description: description, attachments: attachments, serviceID: metadata?.id, planning: metadata?.planning, scoringPreferences: scoringPreferences(), previews: previews["idea:" + (metadata?.id ?? item.id)], createdAt: item.createdAt)
         }
         return result
     }

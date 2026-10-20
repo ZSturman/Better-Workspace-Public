@@ -1,6 +1,6 @@
 """Project identity.
 
-A "project" is an immediate child directory of the configured Projects
+A "project" is a visible child directory (through underscore containers) of the configured Projects
 area. Identity must survive a rename -- a future component asking "is this
 still Project X?" should not be forced to rely on the directory name.
 
@@ -22,7 +22,6 @@ inherit its project_id but are not projects themselves).
 
 from __future__ import annotations
 
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -30,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from .store import WorkspaceStore
+from .transparent_folders import FOREIGN_NAMES, is_visible_child, visible_children
 
 
 @dataclass
@@ -63,19 +63,20 @@ class ProjectRegistry:
         rest = relpath[len(self.prefix) + 1 :]
         if not rest:
             return None
-        top = rest.split("/", 1)[0]
-        # Workspace-owned indexes may live directly beneath Projects (for
-        # example Project Core's `.project-core`). They are infrastructure,
-        # not user projects, and must not receive identities or appear in
-        # downstream project reconciliation. Hidden content *within* an
-        # actual project remains attributed to that containing project.
-        if top.startswith("."):
-            return None
-        return f"{self.prefix}/{top}"
+        components: list[str] = []
+        for name in rest.split("/"):
+            if not name or name.startswith(".") or name in FOREIGN_NAMES:
+                return None
+            components.append(name)
+            if not name.startswith("_"):
+                return f"{self.prefix}/{'/'.join(components)}"
+        return None
 
     def resolve_for_relpath(self, relpath: str) -> Optional[ProjectRef]:
         root_relpath = self.project_root_relpath(relpath)
         if root_relpath is None:
+            return None
+        if not is_visible_child(self.workspace_root / root_relpath, self.workspace_root / self.prefix):
             return None
         ref = self._cache.get(root_relpath)
         if ref is not None:
@@ -167,12 +168,12 @@ class ProjectRegistry:
         ts = time.time()
         refs: list[ProjectRef] = []
 
-        for entry in sorted(os.scandir(projects_dir), key=lambda e: e.name):
-            if not entry.is_dir(follow_symlinks=False) or entry.name.startswith("."):
+        for entry in visible_children(projects_dir):
+            if not entry.is_dir():
                 continue
-            relpath = f"{self.prefix}/{entry.name}"
+            relpath = entry.relative_to(self.workspace_root).as_posix()
             seen_relpaths.add(relpath)
-            refs.append(self.ensure_project(relpath, Path(entry.path), ts))
+            refs.append(self.ensure_project(relpath, entry, ts))
 
         newly_detected = [r for r in refs if r.project_id not in known_ids_before]
 

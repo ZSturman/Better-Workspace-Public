@@ -69,7 +69,11 @@ struct ProjectSyncReviewView: View {
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(review.direction == .incoming ? "Get Notion Changes" : "Send to Notion").font(.title2.bold())
+            Text(review.createProjectOnly ? "Add project to Notion" : review.direction == .incoming ? "Get Notion Changes" : "Send to Notion").font(.title2.bold())
+            if review.createProjectOnly {
+                Text("Create only this project page. Related tasks, relationships and media stay pending for a separate Send review.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             if review.plan.initialCount > 0 && review.direction == .incoming {
                 Text("First import includes \(review.plan.initialCount.formatted()) existing Notion records. Select groups together; historical work is kept below.").font(.callout).foregroundStyle(.secondary)
             } else {
@@ -132,7 +136,7 @@ struct ProjectSyncReviewView: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction).disabled(model.graphBusy)
                 Spacer()
                 if model.graphBusy { ProgressView().controlSize(.small) }
-                Button("Apply \(selected.count.formatted()) Records") {
+                Button(review.createProjectOnly ? "Add to Notion" : "Apply \(selected.count.formatted()) Records") {
                     Task { @MainActor in
                         do { try await model.applyProjectSync(review, selected: selected, resolutions: resolutions); dismiss() }
                         catch { self.error = error.localizedDescription }

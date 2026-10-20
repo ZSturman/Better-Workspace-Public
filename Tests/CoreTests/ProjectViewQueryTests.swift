@@ -64,6 +64,25 @@ final class ProjectViewQueryTests: XCTestCase {
 }
 
 final class ProjectAnalyticsTests: XCTestCase {
+    func testSummaryIsUntruncatedDeduplicatesReviewAndReportsCoverage() {
+        let rows = (0..<12).map { index in
+            ProjectQueryRecord(id: String(index), name: "Same name", values: ["openWork": "6", "hours30": "2", "score": "80", "sort:lastWorked": "45", "bound:lastWorked": "lower"])
+        } + [.init(id: "unknown", name: "Unknown", values: [:]),
+             .init(id: "finished", name: "Finished", values: ["status": "Complete", "openWork": "99", "hours30": "99"])]
+        let summary = ProjectAnalytics.summary(rows + [rows[0]])
+        XCTAssertEqual(summary.projectCount, 13)
+        XCTAssertEqual(summary.openWork, 72)
+        XCTAssertEqual(summary.workCoverage, 12)
+        XCTAssertEqual(summary.reviewCount, 12, "A project in both review lenses counts once, including lower-bound inactivity")
+        XCTAssertEqual(summary.observedHours, 24)
+        XCTAssertEqual(summary.observationCoverage, 12)
+        XCTAssertEqual(ProjectAnalytics.summary(rows, activeOnly: false).openWork, 171)
+        XCTAssertEqual(ProjectAnalytics.summary(rows, days: 90).reviewCount, 0)
+        let unknown = ProjectAnalytics.summary([rows[12]])
+        XCTAssertNil(unknown.openWork); XCTAssertNil(unknown.observedHours)
+        XCTAssertEqual(unknown.reviewCount, 0)
+    }
+
     func testChartsUseOnlySuppliedFilteredRowsAndRealRawEvidence() {
         let rows = [ProjectQueryRecord(id: "active", name: "Same name", values: ["status": "Active", "domain": "Tech", "openWork": "8", "sort:lastWorked": "45", "hours30": "4"]),
                     .init(id: "complete", name: "Same name", values: ["status": "Complete", "openWork": "20", "sort:lastWorked": "180", "hours30": "99"]),
@@ -95,7 +114,7 @@ final class ProjectAnalyticsProgressTests: XCTestCase {
         let bars = ProjectAnalytics.bars(rows, metric: .nearDone)
         XCTAssertEqual(bars.map(\.id), ["most", "half"])
         XCTAssertEqual(bars.map(\.value), [90, 50])
-        XCTAssertEqual(bars.first?.note, "1 open")
+        XCTAssertEqual(bars.first?.note, "9 completed · 1 open")
     }
     func testHighValueIdleUsesScoreAndObservedAgeWithinThePeriod() {
         let rows = [ProjectQueryRecord(id: "idle", name: "Idle", values: ["score": "82", "sort:lastWorked": "45"]),

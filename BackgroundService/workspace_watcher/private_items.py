@@ -73,7 +73,12 @@ def prior_promoted_record(store, directory: Path, info):
     if row is None:
         return None
     old = Path(row["path"])
-    root = directory.parent.parent.resolve()
+    area = directory.parent
+    while area.name.startswith("_") and area.name not in {"_audit"}:
+        area = area.parent
+    if area.name.casefold() not in {"ideas", "[[ideas]]"}:
+        return None
+    root = area.parent.resolve()
     provenance = json.loads(row["payload_json"]).get("provenance") or {}
     if not isinstance(provenance, dict) or provenance.get("bw_promotion_birthtime") != birth:
         return None

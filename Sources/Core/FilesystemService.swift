@@ -36,16 +36,12 @@ public actor FilesystemService {
     public func items(inDirectory directory: URL, showHidden: Bool = false) throws -> [WorkspaceItem] {
         let contents: [URL]
         do {
-            contents = try fm.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: Self.resourceKeys,
-                options: []
-            )
+            contents = try WorkspaceListing.children(of: directory, keys: Self.resourceKeys, showHidden: showHidden)
         } catch {
             // A directory that is not there holds nothing — that is an answer, not a
             // failure. Anything else (permissions, I/O, a wedged provider) is thrown,
             // so a caller is never told an unreadable directory is empty.
-            if (error as NSError).code == NSFileReadNoSuchFileError { return [] }
+            if (error as NSError).code == NSFileReadNoSuchFileError, !fm.fileExists(atPath: directory.path) { return [] }
             throw error
         }
 
@@ -109,11 +105,7 @@ public actor FilesystemService {
 
     /// Counts real children and finds the newest real modification date, one level deep.
     private func shallowSummary(of directory: URL) -> (count: Int, newest: Date?) {
-        guard let entries = try? fm.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: []
-        ) else { return (0, nil) }
+        guard let entries = try? WorkspaceListing.children(of: directory, keys: [.contentModificationDateKey]) else { return (0, nil) }
 
         var count = 0
         var newest: Date?

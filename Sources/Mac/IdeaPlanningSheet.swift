@@ -13,7 +13,7 @@ struct IdeaPlanningSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack { Text("Idea planning · " + item.displayTitle).font(.headline); Spacer() }.padding()
-            if loaded { IdeaPlanningForm(planning: $planning, preferences: model.scoringPreferences(), projectOptions: model.ideaProjectPropertyOptions()) }
+            if loaded { IdeaPlanningForm(planning: $planning, preferences: model.scoringPreferences(), projectOptions: model.ideaProjectPropertyOptions(), choiceDefaults: TestIsolation.defaults) }
             else {
                 VStack(spacing: 12) {
                     Text("Idea decisions are saved by the background service.")

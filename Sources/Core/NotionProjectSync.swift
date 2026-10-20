@@ -162,7 +162,12 @@ public actor NotionProjectSync {
     /// `fields` restricts a reviewed merge to those existing-page properties. Other
     /// conflicts, incoming values, archives and uploads remain pending.
     public func push(ids: Set<String>, reviewed: [ProjectGraphRecord], resolutions: [String: [String: Bool]] = [:],
-                     fields: [String: Set<String>]? = nil) async throws {
+                     fields: [String: Set<String>]? = nil, createProjectsOnly: Bool = false) async throws {
+        if createProjectsOnly {
+            guard fields == nil, ids.count == 1, reviewed.filter({ ids.contains($0.id) }).count == 1,
+                  reviewed.filter({ ids.contains($0.id) }).allSatisfy({ $0.kind == .projects && $0.pageID == nil && !$0.archiveRequested })
+            else { throw SyncError.unsupported("Review one unlinked project to create its Notion page.") }
+        }
         let owner = "pid:\(ProcessInfo.processInfo.processIdentifier):\(UUID().uuidString)"
         guard try store.acquire(owner: owner) else { throw SyncError.busy }
         defer { try? store.release(owner: owner) }
@@ -174,6 +179,7 @@ public actor NotionProjectSync {
             guard let record = try store.record(id: prior.id), record.locallyDeleted != true, record.local == prior.local,
                   record.pendingUploads == prior.pendingUploads, record.archiveRequested == prior.archiveRequested else { throw SyncError.stale }
             guard let source = sources.first(where: { $0.id == record.sourceID }) else { throw SyncError.unsupported("Configure the source for \(record.kind.title).") }
+            if createProjectsOnly && (record.pageID != nil || record.archiveRequested || record.kind != .projects || source.kind != .projects || record.sourceID != prior.sourceID || record.localProjectID != prior.localProjectID || record.localPath != prior.localPath) { throw SyncError.stale }
             if let fields {
                 guard record.pageID != nil, !record.remoteArchived,
                       let selectedFields = fields[record.id], !selectedFields.isEmpty,
@@ -193,7 +199,10 @@ public actor NotionProjectSync {
             guard var record = try store.record(id: draft.id), record.local == draft.local, record.pendingUploads == draft.pendingUploads else { throw SyncError.stale }
             guard !record.ambiguousCreate else { throw SyncError.ambiguous(record.title) }
             guard let source = sources.first(where: { $0.id == record.sourceID }) else { throw SyncError.unsupported("Configure the source for \(record.kind.title).") }
-            let properties = record.local.filter { source.writable($0.key) && $0.value["type"].string != "relation" }.mapValues(Self.writeValue)
+            let properties = record.local.filter {
+                source.writable($0.key) && $0.value["type"].string != "relation"
+                    && (!createProjectsOnly || $0.value["type"].string != "files")
+            }.mapValues(Self.writeValue)
             // Durable attempt marker is written BEFORE the non-idempotent request.
             record.ambiguousCreate = true; try store.save(record)
             try store.write("operation:\(record.id):create", ProjectJSON(["state": "attempting", "source": record.sourceID, "properties": ProjectJSON.object(properties).foundationObject]))
@@ -205,7 +214,7 @@ public actor NotionProjectSync {
                 record = try store.record(id: record.id) ?? record
                 record.pageID = pageID; record.ambiguousCreate = false; record.error = nil
                 // Acknowledge only fields actually sent. Relationships are still outgoing.
-                for (key, value) in sent where value["type"].string != "relation" && source.writable(key) { record.baseline[key] = value; record.remote[key] = value }
+                for (key, value) in sent where properties[key] != nil { record.baseline[key] = value; record.remote[key] = value }
                 try store.save(record)
                 try store.write("operation:\(record.id):create", ProjectJSON(["state": "acknowledged", "pageID": pageID]))
             } catch {
@@ -214,6 +223,9 @@ public actor NotionProjectSync {
                 latest.error = error.localizedDescription; try store.save(latest); throw error
             }
         }
+        // A quick project creation never uploads media, wires relations or archives.
+        // Those drafts remain intact for the normal Send review.
+        if createProjectsOnly { return }
         for prior in reviewed where ids.contains(prior.id) {
             try Task.checkCancellation()
             guard var record = try store.record(id: prior.id), let pageID = record.pageID,

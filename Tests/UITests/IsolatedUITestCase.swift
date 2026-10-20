@@ -121,6 +121,11 @@ class IsolatedUITestCase: XCTestCase {
     /// regression and is not one. Check this before anything else.
     @discardableResult
     func requireWindow(_ app: XCUIApplication, timeout: TimeInterval = 30) -> Bool {
+        // SwiftUI may restore an empty window set after a menu-bar-only session.
+        // Use the normal New Window command, as the Store acceptance tests do.
+        if !app.windows.firstMatch.waitForExistence(timeout: 3) {
+            app.typeKey("n", modifierFlags: .command)
+        }
         let appeared = app.windows.firstMatch.waitForExistence(timeout: timeout)
         XCTAssertTrue(appeared, "The app launched but never opened a window — nothing below this can pass")
         return appeared

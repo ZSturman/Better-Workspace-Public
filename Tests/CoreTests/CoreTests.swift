@@ -2259,6 +2259,31 @@ final class MobileIntentOutboxTests: XCTestCase {
 }
 
 final class MobileCloudProjectionTests: XCTestCase {
+    func testDestinationChangeRepublishesLegacyStateAndRetriesOnlyUnacknowledgedRecords() throws {
+        let database = try Database(inMemory: true)
+        let candidates = ["one", "two"].map { MobileCloudPublicationCandidate.tag(Tag(id: $0, name: $0)) }
+        let legacy = MobileCloudProjectionState(database: database)
+        for record in try legacy.prepare(candidates).records { try legacy.markPublished(record) }
+        try legacy.markInitialReconciled()
+        let intent = MobileWorkspaceIntent.tagChange(path: "Ideas/One", baseRevision: 1, adding: ["one"], removing: [])
+        try legacy.markHandled(intent)
+        let production = MobileCloudProjectionState(database: database, destination: "container:Production")
+        XCTAssertTrue(try production.needsInitialReconciliation())
+        let migration = try production.prepare(candidates)
+        XCTAssertTrue(migration.records.allSatisfy(\.changed))
+        XCTAssertEqual(migration.records.map(\.revision), [2, 2])
+        try production.markPublished(migration.records[0]) // Interrupted after one success.
+        let retry = MobileCloudProjectionState(database: database, destination: "container:Production")
+        XCTAssertEqual(try retry.prepare(candidates).records.map(\.changed), [false, true])
+        XCTAssertTrue(try retry.isHandled(intent.id), "Environment repair must not replay applied phone commands")
+        try retry.markInitialReconciled()
+        XCTAssertFalse(try retry.needsInitialReconciliation())
+        let development = MobileCloudProjectionState(database: database, destination: "container:Development")
+        XCTAssertTrue(try development.needsInitialReconciliation())
+        XCTAssertTrue(try development.prepare(candidates).records.allSatisfy(\.changed))
+        XCTAssertTrue(try MobileCloudProjectionState(database: database, destination: "another:Production").needsInitialReconciliation())
+    }
+
 
     func testEveryCloudKitQueryChannelIsListedForSchemaIndexing() {
         XCTAssertEqual(

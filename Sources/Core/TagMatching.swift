@@ -6,6 +6,10 @@ import Foundation
 /// way. The point is to make picking an existing tag the easy path and creating a
 /// near-duplicate ("project" beside "Projects") the deliberate one.
 public enum TagMatching {
+    public static func equivalent(_ lhs: String, _ rhs: String) -> Bool {
+        let left = compact(normalized(lhs)), right = compact(normalized(rhs))
+        return !left.isEmpty && (left == right || singular(left) == singular(right))
+    }
 
     /// Folds case, diacritics and separators: "Machine-Learning", "machine learning"
     /// and "Machine_Learning" are one name.

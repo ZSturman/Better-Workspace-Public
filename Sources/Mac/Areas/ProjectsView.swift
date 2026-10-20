@@ -31,6 +31,9 @@ struct ProjectsView: View {
     @State private var portfolioSort: ProjectPortfolioSort
     @State private var portfolioSortAscending: Bool
     @State private var showingMetadataImport = false
+    @State private var preparingNotionProject = false
+    @State private var notionProjectError: String?
+    @State private var showingNotionSettings = false
 
     init() {
         let preferences = ProjectPortfolioPreferences.load()
@@ -161,21 +164,52 @@ struct ProjectsView: View {
                         ScrollView(.horizontal) {
                             HStack {
                                 ForEach(newProjects) { project in
+                                    VStack(alignment: .leading, spacing: 8) {
                                     Button { model.openProjectWorkspace(for: project) } label: {
                                         VStack(alignment: .leading) {
                                             Label("New project created", systemImage: "sparkles").font(.caption).foregroundStyle(.orange)
-                                            Text(project.displayTitle).font(.headline)
+                                            Text(project.displayTitle).font(.headline).lineLimit(2)
                                             Text("Add details, score, media and tasks").font(.caption).foregroundStyle(.secondary)
-                                        }.padding(10)
+                                        }
                                     }.buttonStyle(.plain)
+                                    if let id = model.graphProject(for: project)?.pageID ?? model.projectRecord(for: project)?.notionPageID,
+                                       let url = URL(string: "https://www.notion.so/" + id) {
+                                        Button("Open in Notion") { model.open(url) }.buttonStyle(.borderless)
+                                    } else {
+                                        Button(model.graphProject(for: project)?.ambiguousCreate == true ? "Review Notion creation…" : "Add to Notion…") {
+                                            if !model.hasNotionToken || !model.graphSources.contains(where: { $0.kind == .projects }) {
+                                                showingNotionSettings = true
+                                            } else {
+                                                preparingNotionProject = true
+                                                Task { @MainActor in
+                                                    defer { preparingNotionProject = false }
+                                                    do { try await model.reviewNewProjectInNotion(project) }
+                                                    catch { notionProjectError = error.localizedDescription }
+                                                }
+                                            }
+                                        }.buttonStyle(.bordered).controlSize(.small)
+                                            .disabled(preparingNotionProject || model.graphBusy)
+                                            .accessibilityIdentifier("projects.new.notion." + project.id)
+                                    }
+                                    }.padding(12).frame(width: 280, alignment: .leading)
+                                        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
                                 }
-                            }.padding(.horizontal)
-                        }.frame(maxHeight: 88)
+                            }.padding(.horizontal).padding(.vertical, 10)
+                        }.frame(height: 142)
                         Divider()
                     }
                     ProjectBrowserView()
                 }
             }
+        }
+        .alert("Couldn’t prepare Notion project", isPresented: Binding(get: { notionProjectError != nil }, set: { if !$0 { notionProjectError = nil } })) {
+            Button("OK") { notionProjectError = nil }
+        } message: { Text(notionProjectError ?? "") }
+        .sheet(isPresented: $showingNotionSettings) {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack { Text("Notion settings").font(.title2.bold()); Spacer(); Button("Done") { showingNotionSettings = false } }
+                ScrollView { NotionSettingsSection().environment(model) }
+            }.padding(20).frame(width: 660, height: 540)
         }
     }
 

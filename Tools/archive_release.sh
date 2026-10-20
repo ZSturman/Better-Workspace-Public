@@ -5,8 +5,9 @@ channel="${1:-mobile}"
 case "$channel" in
   mobile) scheme=BetterWorkspaceMobile; destination='generic/platform=iOS'; directory=AppStore ;;
   mac) scheme=BetterWorkspace; destination='generic/platform=macOS'; directory=MacDownload ;;
-  mac-store) scheme=BetterWorkspaceMobile; destination='generic/platform=macOS'; directory=MacAppStore ;;
-  *) echo 'Usage: bash Tools/archive_release.sh [mobile|mac|mac-store]' >&2; exit 2 ;;
+  # The sandboxed personal-only Mac Store edition is retired; the advanced Mac is the Mac app.
+  mac-store) echo 'mac-store is retired: archive the advanced Mac with "mac" instead.' >&2; exit 2 ;;
+  *) echo 'Usage: bash Tools/archive_release.sh [mobile|mac]' >&2; exit 2 ;;
 esac
 build_number="${BUILD_NUMBER:-1}"
 if [[ ! "$build_number" =~ ^[0-9]+$ ]]; then

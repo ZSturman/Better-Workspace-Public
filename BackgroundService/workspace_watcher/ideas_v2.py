@@ -231,9 +231,9 @@ def validate_planning(value: Any) -> None:
         for key, limit in (("oneLiner", 2000), ("summary", 12000)):
             if not isinstance(project.get(key), str) or len(project[key]) > limit:
                 raise ValueError("Potential project text is too long")
-        for key in ("domain", "projectType", "phase"):
+        for key in ("domain", "projectType", "phase", "status"):
             text = project["metadata"].get(key)
-            if text is not None and (not isinstance(text, str) or len(text) > 200):
+            if text is not None and (not isinstance(text, str) or len(text.encode()) > 200 or "\n" in text):
                 raise ValueError("Invalid potential project property")
         if len(json.dumps(project).encode()) > 128000:
             raise ValueError("Potential project details are too large")
@@ -249,10 +249,11 @@ def validate_planning(value: Any) -> None:
 
 
 def register_idea(store: CoreStore, ideas_root: Path, path: Path) -> dict[str, Any]:
-    """Register one explicit immediate child without reading its contents or sidecars."""
+    """Register one explicit visible child without reading its contents or sidecars."""
+    from .transparent_folders import is_visible_child
     import uuid
     root = ideas_root.resolve()
-    if ideas_root.is_symlink() or path.is_symlink() or path.parent.resolve() != root or path.name.startswith(".") or not path.exists():
+    if ideas_root.is_symlink() or path.is_symlink() or not is_visible_child(path, ideas_root) or path.name.startswith(".") or not path.exists():
         raise ValueError("Choose an ordinary immediate child of Ideas")
     if path.name in {"_audit", ".project-core", "watcher.item.toml", "Project.betterproject"}:
         raise ValueError("That metadata location cannot be an idea")
@@ -284,7 +285,8 @@ def relocate_idea(store: CoreStore, workspace: Path, item_id: str, source: str, 
         raise ValueError("Idea not found")
     old, new = Path(source), Path(destination)
     root = workspace.resolve()
-    if old.parent.resolve() != root / "Ideas" or new.parent.resolve() not in {root / "Projects", root / "Features", root / "Milestones"} or new.is_symlink() or not new.exists():
+    from .transparent_folders import is_visible_child
+    if not is_visible_child(old, root / "Ideas") or new.parent.resolve() not in {root / "Projects", root / "Features", root / "Milestones"} or new.is_symlink() or not new.exists():
         raise ValueError("Idea promotion must stay in the declared workspace areas")
     if row["path"] not in {str(old), str(new)}:
         raise ValueError("Idea changed location")

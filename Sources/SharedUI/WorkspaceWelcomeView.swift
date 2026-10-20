@@ -17,20 +17,20 @@ struct WorkspaceWelcomeView: View {
                 Text("Make room for your next step.").font(.largeTitle.bold())
                 Text("Keep projects, tasks, ideas and documents together. Start small, choose what matters today, and keep the details close.")
                     .font(.title3).foregroundStyle(.secondary)
-                capability("Start here, on this device", symbol: "checkmark.circle", detail: "Create a project, write a note or save an idea. Your personal workspace works offline and needs no Mac or background service.")
+                if platform == .storeMac { capability("Start here, on this device", symbol: "checkmark.circle", detail: "Create a project, write a note or save an idea. Your personal workspace works offline and needs no Mac or background service.") }
                 if platform == .mobile {
-                    capability("Connect a Mac when you need more", symbol: "desktopcomputer", detail: "Browse your Mac’s existing folders and send it planning changes. Connected workspace features use the same Apple account and the advanced Mac app.")
+                    capability("Your Workspace, wherever you are", symbol: "desktopcomputer", detail: "The Workspace lives on your Mac. Open Better Workspace on the Mac and enable mobile access using the same Apple account. Browse, score and plan from your phone; saves wait safely until your Mac is available.")
                 } else if platform == .advancedMac {
                     capability("Keep your existing folders", symbol: "folder", detail: "The advanced Mac workspace browses files you choose. Monitoring, observed sessions, idea metadata and agents are additional capabilities, with setup explained in Settings.")
                 } else {
                     capability("More ways to work on Mac", symbol: "desktopcomputer", detail: "This app keeps your personal projects and notes together. The separate advanced Mac download adds folder browsing, monitoring and automation. You can use this workspace without installing it.")
                 }
                 capability("Know where your information lives", symbol: "lock.shield", detail: WorkspaceNotebookPersistence.isCloudSyncEnabled ? "Personal items are saved on this device and sync through your private iCloud account when available. You can work offline; transfers may take a few minutes. Connected workspace files stay in your folders. No advertising or cross-app tracking." : "Personal items live in private app storage on this device. Connected workspace files stay in your folders; its index uses private iCloud and captures use iCloud Drive. No advertising or cross-app tracking.")
-                Button(action: startPersonal) { Label("Start my workspace", systemImage: "plus.circle.fill").frame(maxWidth: .infinity) }
+                Button(action: startPersonal) { Label("Open Workspace", systemImage: "plus.circle.fill").frame(maxWidth: .infinity) }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                     .accessibilityIdentifier("welcome.startPersonal")
-                if let connect {
-                    Button(platform == .advancedMac ? "Continue with my folders" : "Use my Mac workspace", action: connect)
+                if let connect, platform != .advancedMac {
+                    Button("Open Workspace", action: connect)
                         .accessibilityIdentifier("welcome.connect")
                 }
                 if let exploreSample {

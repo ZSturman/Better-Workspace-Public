@@ -8,9 +8,47 @@ struct ProjectSyncReview: Identifiable {
     let direction: Direction
     let records: [ProjectGraphRecord]
     let plan: ProjectSyncReviewPlan
+    var createProjectOnly = false
 }
 
 extension AppModel {
+    /// Prepare only the selected project's page. No general sync preparation runs
+    /// here: it can queue service records and unrelated work.
+    func reviewNewProjectInNotion(_ item: WorkspaceItem) async throws {
+        guard !graphBusy else { throw NotionProjectSync.SyncError.busy }
+        guard hasNotionToken else { throw NotionClient.Failure.noCredentials }
+        await refreshProjectGraph()
+        guard let local = projectRecord(for: item),
+              graphSources.contains(where: { $0.kind == .projects }) else {
+            throw NotionProjectSync.SyncError.unsupported("Configure and check the Projects source in Notion settings first.")
+        }
+        let matches = graphRecords.filter { record in
+            guard record.kind == .projects, record.pageID != nil, let source = graphSource(for: record) else { return false }
+            return record.localProjectID == local.id || record.value("Local Directory", source: source).display == local.lastPath
+        }
+        guard matches.count <= 1 else {
+            throw NotionProjectSync.SyncError.unsupported("Several Notion pages declare this directory. Resolve the duplicate links in Sync Center before adding this project.")
+        }
+        try bindGraphProjects(onlyLocalID: local.id)
+        await refreshProjectGraph()
+        if let linked = graphProject(for: item), let url = linked.pageID.flatMap({ URL(string: "https://www.notion.so/" + $0) }) {
+            open(url); return
+        }
+        // Existing drafts win. Newly discovered folders need their first local graph.
+        if graphProject(for: item) == nil {
+            queueProjectGraphEdits(for: item)
+            await refreshProjectGraph()
+        }
+        guard let record = graphProject(for: item), record.pageID == nil, !record.archiveRequested else {
+            throw NotionProjectSync.SyncError.unsupported("The project could not be prepared. Check its local details and Notion source.")
+        }
+        var preview = record
+        preview.local = record.local.filter { !["relation", "files"].contains($0.value["type"].string ?? "") }
+        preview.pendingUploads = nil
+        graphSyncReview = .init(presenterID: "newProject", direction: .outgoing, records: [record],
+            plan: ProjectSyncReviewPlan(records: [preview], allRecords: graphRecords, sources: graphSources), createProjectOnly: true)
+    }
+
     /// One worker prepares an immutable graph away from the UI. Requests arriving
     /// during a read invalidate it, so an older snapshot cannot undo a newer save.
     func reloadProjectGraph() {
@@ -115,7 +153,7 @@ extension AppModel {
             statusMessage = (graphReport?.failures.isEmpty == false) ? "Notion check has source failures. Review Settings → Integrations → Notion; previous snapshots are retained." : "Checked \(graphReport?.counts.count ?? 0) Notion sources; changes are ready for review."
         } catch { showSyncFailure(error.localizedDescription) }
     }
-    func bindGraphProjects() throws {
+    func bindGraphProjects(onlyLocalID: String? = nil) throws {
         let store = try ProjectGraphStore(database: database)
         for var graph in graphRecords where graph.kind == .projects && graph.pageID != nil {
             guard let source = graphSource(for: graph) else { continue }
@@ -124,6 +162,7 @@ extension AppModel {
             let local = projectStore.allRecords().first { $0.notionPageID.map(NotionImport.normalizedID) == pageID }
                 ?? projectStore.allRecords().first { !$0.hasNotionLink && !$0.lastPath.isEmpty && $0.lastPath == declaredPath }
             if let local {
+                guard onlyLocalID == nil || local.id == onlyLocalID else { continue }
                 if graph.local.isEmpty && graph.baseline.isEmpty {
                     let metadata = projectStore.metadata(for: local.id), description = projectStore.description(for: local.id)
                     var owned: [String: ProjectJSON] = [:]
@@ -166,7 +205,7 @@ extension AppModel {
             for var record in review.records where selected.contains(record.id) && record.serviceRecordID != nil { record.serviceAcknowledgementPending = true; try store.save(record) }
         }
         if review.direction == .incoming { try await coordinator.pull(ids: selected, reviewed: review.records, resolutions: resolutions) }
-        else { try await coordinator.push(ids: selected, reviewed: review.records, resolutions: resolutions) }
+        else { try await coordinator.push(ids: selected, reviewed: review.records, resolutions: resolutions, createProjectsOnly: review.createProjectOnly) }
         try await applyLocalEffects(of: selected, previous: review.records, createFiles: true)
     }
 

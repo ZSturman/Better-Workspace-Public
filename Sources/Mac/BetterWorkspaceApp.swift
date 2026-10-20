@@ -77,7 +77,7 @@ struct BetterWorkspaceApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        Window("My Workspace", id: "personal-workspace") {
+        Window("Saved personal notes", id: "personal-workspace") {
             PersonalWorkspaceView().frame(minWidth: 620, minHeight: 450)
         }.defaultSize(width: 860, height: 680)
 
@@ -159,6 +159,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        if TestIsolation.isActive, let appearance = TestIsolation.launchArgument("bwAppearance") {
+            NSApp.appearance = NSAppearance(named: appearance == "dark" ? .darkAqua : .aqua)
+        }
+        #endif
         // Read while the launch event is still current.
         let launchedAtLogin = LoginItem.wasLaunchedAtLogin()
         configureTips()
@@ -620,6 +625,20 @@ struct SettingsView: View {
                         if enabled { model.requestMobileCloudSync() }
                     }
                     .help("An optional iCloud copy of the index, so iPhone and iPad can browse and plan. Your files stay the source of truth and everything works offline.")
+                LabeledContent("iCloud environment", value: MobileCloudPublisher.cloudEnvironment)
+                if let date = model.mobileCloudLastPublished {
+                    LabeledContent("Last published", value: date.formatted(date: .abbreviated, time: .shortened))
+                } else {
+                    Text("No successful publication from this build yet.").font(.caption).foregroundStyle(.secondary)
+                }
+                if let error = model.mobileCloudSyncError {
+                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                }
+                Button(model.mobileCloudSyncInFlight ? "Syncing…" : "Sync now") { model.requestMobileCloudSync() }
+                    .disabled(!mobileCloudSyncEnabled || model.mobileCloudSyncInFlight || !model.workspaceAvailable)
+                    .accessibilityIdentifier("settings.mobileSyncNow")
+                Text("The Workspace lives on this Mac. Open Better Workspace on iPhone or iPad using the same iCloud account, and keep this Mac app running to receive saves and prepare downloads.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

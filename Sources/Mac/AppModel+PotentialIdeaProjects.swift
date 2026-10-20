@@ -16,7 +16,7 @@ extension AppModel {
 
     func ideaProjectPropertyOptions() -> [String: [String]] {
         guard let source = graphSources.first(where: { $0.kind == .projects }) else { return [:] }
-        return ["domain", "Type", "Phase"].reduce(into: [:]) { result, name in
+        return ["domain", "Type", "Status", "Phase", "Completion Model", "Maintenance Cadence"].reduce(into: [:]) { result, name in
             guard let field = source.property(named: name) else { return }
             let type = field.definition["type"].display
             result[name] = field.definition[type]["options"].array.compactMap { $0["name"].string }
@@ -53,7 +53,7 @@ extension AppModel {
             for idea in serviceIdeasByPath.values where idea.planning?.potential == .project && (serviceID == nil || serviceID == idea.id) {
                 guard let details = idea.planning?.project, details.automaticNotionSync,
                       let relative = workspaceRelativePath(for: URL(fileURLWithPath: idea.canonicalPath)),
-                      relative.hasPrefix("Ideas/"), relative.split(separator: "/").count == 2 else { continue }
+                      WorkspaceListing.isAreaChild(relative, area: "Ideas") else { continue }
                 do {
                     let existing = try IdeaProjectBridge.existing(serviceID: idea.id, path: idea.canonicalPath, records: records, source: source)
                     // Service reads can lag the acknowledged move. A stale idea

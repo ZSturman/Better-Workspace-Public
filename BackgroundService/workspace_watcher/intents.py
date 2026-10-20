@@ -13,6 +13,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from .transparent_folders import FOREIGN_NAMES
 from typing import Any, Iterator
 
 
@@ -169,6 +170,8 @@ class IntentFolderDetector:
                             dirnames.remove(name)
 
     def _should_descend(self, path: Path) -> bool:
+        if path.name in FOREIGN_NAMES:
+            return False
         if self._is_excluded(path.resolve()):
             return False
         return self.settings.follow_symlinks or not path.is_symlink()

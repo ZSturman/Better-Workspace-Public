@@ -26,7 +26,7 @@ public struct IdeaPlanning: Codable, Hashable, Sendable {
     public func validate(original: IdeaPlanning? = nil) throws {
         if let project {
             guard project.oneLiner.count <= 2000, project.summary.count <= 12000,
-                  [project.metadata.domain, project.metadata.projectType, project.metadata.phase].compactMap({ $0 }).allSatisfy({ $0.count <= 200 }),
+                  [project.metadata.domain, project.metadata.projectType, project.metadata.phase, project.metadata.status].compactMap({ $0 }).allSatisfy({ $0.utf8.count <= 200 && !$0.contains("\n") }),
                   (try? JSONEncoder().encode(project).count).map({ $0 <= 32000 }) == true else { throw MobilePlanningFiles.Error.invalid("Keep the one-liner under 2,000 characters and summary under 12,000 characters.") }
         }
         guard (1...5).contains(priority), ratings.count <= 64,
@@ -54,9 +54,10 @@ public struct MobileIdeaEnvelope: Codable {
     public var planning: IdeaPlanning?
     public var scoringPreferences: ProjectScoringPreferences?
     public var previews: [MobileFilePreview]?
+    public var createdAt: Date?
     public static func encode(_ idea: MobileIdea) -> String? {
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
-        return (try? encoder.encode(Self(attachments: idea.attachments ?? [], planning: idea.planning, scoringPreferences: idea.scoringPreferences, previews: idea.previews))).flatMap { String(data: $0, encoding: .utf8) }
+        return (try? encoder.encode(Self(attachments: idea.attachments ?? [], planning: idea.planning, scoringPreferences: idea.scoringPreferences, previews: idea.previews, createdAt: idea.createdAt))).flatMap { String(data: $0, encoding: .utf8) }
     }
     public static func decode(_ text: String?) -> Self? {
         guard let data = text?.data(using: .utf8) else { return nil }
@@ -79,7 +80,7 @@ public struct IdeaPromotionCheckpoint: Codable, Hashable, Sendable {
 public enum IdeaPromotionFiles {
     public static func move(_ original: MobileIdea, kind: IdeaPromotionKind, workspace: WorkspaceLocation, checkpoint: IdeaPromotionCheckpoint?) throws -> IdeaPromotionCheckpoint {
         let source = try MobilePlanningFiles.resolve(original.path, workspace: workspace)
-        guard original.path.split(separator: "/").count == 2, original.path.hasPrefix("Ideas/") else { throw MobilePlanningFiles.Error.invalid("Choose a top-level idea folder.") }
+        guard WorkspaceListing.isAreaChild(original.path, area: "Ideas") else { throw MobilePlanningFiles.Error.invalid("Choose a top-level idea folder.") }
         let destination = try MobilePlanningFiles.resolve(kind.area + "/" + source.lastPathComponent, workspace: workspace)
         let fm = FileManager.default
         if let checkpoint {
@@ -99,8 +100,11 @@ public enum IdeaPromotionFiles {
     /// No folder traversal, inspection of foreign metadata, overwrite or file copying.
     public static func apply(_ checkpoint: IdeaPromotionCheckpoint) throws {
         let source = URL(fileURLWithPath: checkpoint.source), destination = URL(fileURLWithPath: checkpoint.destination)
-        let workspace = WorkspaceLocation(root: source.deletingLastPathComponent().deletingLastPathComponent())
-        let resolvedSource = try MobilePlanningFiles.resolve("Ideas/" + source.lastPathComponent, workspace: workspace)
+        let workspace = WorkspaceLocation(root: destination.deletingLastPathComponent().deletingLastPathComponent())
+        guard source.canonicalPath.hasPrefix(workspace.root.canonicalPath + "/") else { throw MobilePlanningFiles.Error.conflict }
+        let sourcePath = String(source.canonicalPath.dropFirst(workspace.root.canonicalPath.count + 1))
+        guard WorkspaceListing.isAreaChild(sourcePath, area: "Ideas") else { throw MobilePlanningFiles.Error.conflict }
+        let resolvedSource = try MobilePlanningFiles.resolve(sourcePath, workspace: workspace)
         let relativeTarget = destination.deletingLastPathComponent().lastPathComponent + "/" + destination.lastPathComponent
         let resolvedTarget = try MobilePlanningFiles.resolve(relativeTarget, workspace: workspace)
         guard resolvedSource.canonicalPath == checkpoint.source, resolvedTarget.canonicalPath == checkpoint.destination,

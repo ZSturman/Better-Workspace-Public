@@ -22,7 +22,7 @@ Download **BetterWorkspace-1.0-8-mac.zip** from [Releases](https://github.com/ZS
 
 The advanced download supports macOS 14.4+ on Apple silicon and Intel. It is Developer ID signed, notarized and stapled. [Installation and first-use guide](docs/GETTING_STARTED.md).
 
-The separate sandboxed Store app supports native Mac, iPhone and iPad (macOS 14.4+, iOS/iPadOS 17+). It works independently with personal records and optional private iCloud sync. Both native Mac and iPhone/iPad 1.0 (Build 8) were submitted October 16 and are Waiting for Review, with automatic release after approval. See the [portfolio](https://zacharysturman.com/better-workspace) for public installation availability. The advanced Mac edition adds real-folder/service/automation features. Connected mobile folder features require the advanced Mac; personal workspace features do not.
+The iPhone/iPad app (iOS/iPadOS 17+) opens the same Workspace your Mac hosts, through private iCloud: browse, plan, score, capture and keep offline copies. It requires the advanced Mac app. The advanced Mac is the only Mac edition; the earlier personal-only Mac Store edition is retired. See the [portfolio](https://zacharysturman.com/better-workspace) for actual Apple review/listing availability.
 
 ## Demo
 

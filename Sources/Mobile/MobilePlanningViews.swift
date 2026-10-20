@@ -289,6 +289,7 @@ struct MobileIdeaDetailView: View {
     @State private var creatingFeature = false
     @State private var creatingProject = false
     @State private var scoring = false
+    @State private var zenScoring = false
     @State private var promotion: IdeaPromotionKind?
     private var latest: MobileIdea? { model.snapshot.ideas.first { $0.id == idea.id } }
     private var current: MobileIdea { latest ?? idea }
@@ -306,14 +307,6 @@ struct MobileIdeaDetailView: View {
                 else { Text("Add a description to develop this idea.").foregroundStyle(.secondary) }
                 TagPills(tags: model.tags(for: current.tagIDs))
             }
-            MobileIdeaPreviewsSection(idea: current)
-            if let attachments = current.attachments, !attachments.isEmpty {
-                Section {
-                    ForEach(attachments) { file in
-                        Label(file.name, systemImage: file.isDirectory ? "folder" : "doc")
-                    }
-                } header: { Text("Media & files") } footer: { Text("Original files are on your Mac.") }
-            }
             if latest != nil {
                 Section("Priority & potential") {
                     if current.planning?.needsSetup == true { Label("Set priority & score", systemImage: "sparkles").foregroundStyle(.orange) }
@@ -322,8 +315,23 @@ struct MobileIdeaDetailView: View {
                         if let potential = planning.potential { LabeledContent("Potential", value: potential.title) }
                         if let score = planning.score(preferences: current.scoringPreferences ?? .init()).projectScore { LabeledContent("Your score", value: "\(Int(score.rounded()))/100") }
                     }
+                    Button("Zen mode", systemImage: "viewfinder") { zenScoring = true }.accessibilityIdentifier("idea.zen.open")
                     Button("Priority & scoring", systemImage: "slider.horizontal.3") { scoring = true }.accessibilityIdentifier("idea.planning.edit")
                 }
+            }
+            MobileDownloadSection(entry: model.snapshot.entries.first { $0.path == current.path }
+                ?? MobileWorkspaceEntry(path: current.path, parentPath: "Ideas", name: current.title, isDirectory: false, revision: current.revision, modifiedAt: current.modifiedAt))
+            MobileIdeaPreviewsSection(idea: current)
+            if let attachments = current.attachments, !attachments.isEmpty {
+                Section {
+                    ForEach(attachments) { file in
+                        NavigationLink(value: MobileWorkspaceEntry(path: file.path, parentPath: current.path, name: file.name, isDirectory: file.isDirectory, revision: 0)) {
+                            Label(file.name, systemImage: file.isDirectory ? "folder" : "doc")
+                        }
+                    }
+                } header: { Text("Media & files") } footer: { Text("Original files are on your Mac.") }
+            }
+            if latest != nil {
                 if model.snapshot.entries.first(where: { $0.path == current.path })?.isDirectory == true {
                     Section("Promote the complete folder") {
                         ForEach(IdeaPromotionKind.allCases) { kind in Button("Promote to " + kind.title + "…") { promotion = kind }.disabled(current.serviceID == nil).accessibilityIdentifier("idea.promote." + kind.rawValue) }
@@ -346,6 +354,7 @@ struct MobileIdeaDetailView: View {
         } message: { Text("The idea and any files inside its folder move to your Mac’s recoverable Trash when online. Linked Notion pages stay in Notion.") }
         .refreshable { await model.refresh() }
         .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Edit") { editing = true }.disabled(latest == nil || (current.description == nil && current.serviceID == nil)) } }
+        .fullScreenCover(isPresented: $zenScoring) { MobileIdeaPlanningEditor(idea: current, zenMode: true) }
         .sheet(isPresented: $scoring) { MobileIdeaPlanningEditor(idea: current) }
         .confirmationDialog("Promote “\(current.title)”?", isPresented: Binding(get: { promotion != nil }, set: { if !$0 { promotion = nil } }), titleVisibility: .visible) {
             if let kind = promotion {

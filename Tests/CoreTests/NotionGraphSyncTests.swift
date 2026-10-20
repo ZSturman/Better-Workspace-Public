@@ -20,6 +20,60 @@ private final class GraphTransport: URLProtocol {
 }
 
 final class NotionGraphSyncTests: XCTestCase {
+    func testFocusedProjectCreationWritesOnlyOnePageAndRetainsRelatedDrafts() async throws {
+        var creations = 0
+        let (client, store) = try setup { request in
+            creations += 1
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/v1/pages")
+            let payload = try self.body(request)
+            XCTAssertEqual(Set(payload["properties"].object.keys), ["title", "details"])
+            return (200, ProjectJSON(["id": "created-project"]))
+        }
+        var schema = source.schema.object
+        schema["Media"] = ProjectJSON(["id": "media", "type": "files"])
+        try store.write("sources", [ProjectGraphSource(id: "s", title: "Projects", kind: .projects, schema: .object(schema))])
+        var project = ProjectGraphRecord(sourceID: "s", kind: .projects, local: ["title": text("Selected project", type: "title"), "details": text("Keep details"), "links": ProjectJSON(["type": "relation", "relation": [["id": "unsent-related"]]])])
+        project.localProjectID = "local-project"
+        project.local["media"] = ProjectJSON(["type": "files", "files": [["type": "external", "name": "Preview", "external": ["url": "https://example.com/cover.png"]]]])
+        project.pendingUploads = [.init(propertyID: "media", url: URL(fileURLWithPath: "/not-read/photo.png"), contentType: "image/png", byteCount: 1, modifiedAt: nil)]
+        let related = ProjectGraphRecord(id: "unsent-related", sourceID: "s", kind: .tasks, local: ["title": text("Unrelated task", type: "title")])
+        try store.save(project); try store.save(related)
+        let sync = NotionProjectSync(store: store, client: client)
+        try await sync.push(ids: [project.id], reviewed: [project], createProjectsOnly: true)
+        let linked = try XCTUnwrap(store.record(id: project.id))
+        XCTAssertEqual(linked.pageID, "created-project")
+        XCTAssertEqual(linked.localProjectID, project.localProjectID)
+        XCTAssertEqual(linked.pendingUploads, project.pendingUploads)
+        XCTAssertEqual(linked.local["links"], project.local["links"])
+        XCTAssertEqual(linked.local["media"], project.local["media"])
+        XCTAssertNil(linked.baseline["media"], "Deferred media must not be acknowledged as sent")
+        XCTAssertNil(try store.record(id: related.id)?.pageID)
+        do { try await sync.push(ids: [project.id], reviewed: [project], createProjectsOnly: true); XCTFail("An old review must not create twice") } catch {}
+        XCTAssertEqual(creations, 1)
+    }
+
+    func testFocusedProjectCreationRejectsStaleMissingSourceAndUncertainCreation() async throws {
+        var writes = 0
+        let (client, store) = try setup { _ in writes += 1; return (500, ProjectJSON(["message": "uncertain"])) }
+        try store.write("sources", [ProjectGraphSource(id: "s", title: "Projects", kind: .projects, schema: source.schema)])
+        var project = ProjectGraphRecord(sourceID: "missing", kind: .projects, local: ["title": text("Project", type: "title")])
+        try store.save(project)
+        let sync = NotionProjectSync(store: store, client: client)
+        do { try await sync.push(ids: [project.id], reviewed: [project], createProjectsOnly: true); XCTFail("Missing source") } catch {}
+        XCTAssertEqual(writes, 0)
+        project.sourceID = "s"; try store.save(project)
+        var changed = project; changed.local["details"] = text("Changed after review"); try store.save(changed)
+        do { try await sync.push(ids: [project.id], reviewed: [project], createProjectsOnly: true); XCTFail("Stale review") } catch {}
+        XCTAssertEqual(writes, 0)
+        try store.save(project)
+        do { try await sync.push(ids: [project.id], reviewed: [project], createProjectsOnly: true); XCTFail("Uncertain creation") } catch {}
+        let uncertain = try XCTUnwrap(store.record(id: project.id))
+        XCTAssertTrue(uncertain.ambiguousCreate)
+        do { try await sync.push(ids: [project.id], reviewed: [uncertain], createProjectsOnly: true); XCTFail("No blind retry") } catch {}
+        XCTAssertEqual(writes, 1)
+    }
+
     private let source = ProjectGraphSource(id: "s", title: "tasks", kind: .tasks, schema: ProjectJSON([
         "Task": ["id": "title", "type": "title"], "Details": ["id": "details", "type": "rich_text"], "Formula": ["id": "formula", "type": "formula"], "Features": ["id": "links", "type": "relation", "relation": ["data_source_id": "s"]]]))
     private func text(_ value: String, type: String = "rich_text") -> ProjectJSON { ProjectJSON(["id": type == "title" ? "title" : "details", "type": type, type: value.isEmpty ? [] : [["type": "text", "text": ["content": value]]]]) }

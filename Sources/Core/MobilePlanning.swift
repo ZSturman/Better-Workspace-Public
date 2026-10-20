@@ -14,7 +14,7 @@ public struct MobileIdeaAttachment: Identifiable, Hashable, Sendable, Codable {
 /// can refuse a stale edit without trusting a disposable CloudKit revision.
 public struct MobilePlanningEdit: Identifiable, Hashable, Sendable, Codable {
     /// Deletion commands move the selected item to the Mac’s recoverable Trash.
-    public enum Operation: String, Codable, Sendable { case previewIdea, saveIdeaPlanning, promoteIdea, scheduleCapture, saveProject, previewProject, saveWork, saveIdea, createIdea, createProject, trashWork, trashIdea, trashProject, trashEntry, reviewInbox, fileCapture }
+    public enum Operation: String, Codable, Sendable { case downloadFiles, previewIdea, saveIdeaPlanning, promoteIdea, scheduleCapture, saveProject, previewProject, saveWork, saveIdea, createIdea, createProject, trashWork, trashIdea, trashProject, trashEntry, reviewInbox, fileCapture }
     public let id: UUID
     public var operation: Operation
     public var title: String
@@ -173,6 +173,7 @@ public enum MobilePlanningFiles {
     /// longer looks like the original: the index has caught up to this edit or a later one.
     public static func index(_ snapshot: MobileWorkspaceSnapshot, reflects edit: MobilePlanningEdit) -> Bool {
         switch edit.operation {
+        case .downloadFiles: return true
         case .previewIdea: return true
         case .saveIdeaPlanning:
             guard let original = edit.originalIdea, let current = snapshot.ideas.first(where: { $0.path == original.path }) else { return false }
@@ -184,6 +185,7 @@ public enum MobilePlanningFiles {
         case .saveProject:
             guard let change = edit.projectEdit, let details = snapshot.entries.first(where: { $0.path == change.original.path })?.projectDetails else { return false }
             return details.ratings == change.ratings && (details.oneLiner ?? "") == change.oneLiner && (details.summary ?? "") == change.summary
+                && (change.properties?.isReflected(in: details, from: change.original) ?? true)
         case .fileCapture: return false // Settled by its explicit Mac receipt.
         case .reviewInbox:
             // Settled once the Mac publishes a digest checked after the decision that no
@@ -233,13 +235,18 @@ public enum MobilePlanningFiles {
     }
 
     public static func validate(_ edit: MobilePlanningEdit) throws {
+        if edit.operation == .downloadFiles {
+            guard let entry = edit.originalEntry, MobileDownloadBundle.safePath(entry.path), !entry.name.isEmpty else {
+                throw Error.invalid("Choose a Workspace file, folder or category to download.")
+            }
+        }
         if edit.operation == .previewIdea {
             guard let original = edit.originalIdea, MobileWorkspacePath.normalizedRelative(original.path) == original.path,
-                  original.path.hasPrefix("Ideas/"), original.path.split(separator: "/").count == 2 else { throw Error.invalid("Choose a local idea to preview.") }
+                  WorkspaceListing.isAreaChild(original.path, area: "Ideas") else { throw Error.invalid("Choose a local idea to preview.") }
         }
         if edit.operation == .saveIdeaPlanning || edit.operation == .promoteIdea {
             guard let original = edit.originalIdea, MobileWorkspacePath.normalizedRelative(original.path) == original.path,
-                  original.path.hasPrefix("Ideas/"), original.path.split(separator: "/").count == 2 else { throw Error.invalid("Choose an immediate child of Ideas.") }
+                  WorkspaceListing.isAreaChild(original.path, area: "Ideas") else { throw Error.invalid("Choose an immediate child of Ideas.") }
             if edit.operation == .saveIdeaPlanning {
                 guard let planning = edit.ideaPlanning, original.serviceID != nil else { throw Error.invalid("Wait for the updated Mac and idea service to publish this idea.") }
                 try planning.validate(original: original.planning)
@@ -257,7 +264,7 @@ public enum MobilePlanningFiles {
         }
         if edit.operation == .previewProject {
             guard let entry = edit.originalEntry, entry.parentPath == "Projects", entry.isDirectory,
-                  MobileWorkspacePath.normalizedRelative(entry.path) == entry.path, entry.path.split(separator: "/").count == 2 else {
+                  MobileWorkspacePath.normalizedRelative(entry.path) == entry.path, WorkspaceListing.isAreaChild(entry.path, area: "Projects") else {
                 throw Error.invalid("Choose a local project to preview.")
             }
         }
@@ -265,9 +272,9 @@ public enum MobilePlanningFiles {
             guard let entry = edit.originalEntry, entry.modifiedAt != nil,
                   MobileWorkspacePath.normalizedRelative(entry.path) == entry.path,
                   entry.path.split(separator: "/").count >= 2,
-                  edit.operation == .trashEntry || (entry.path.split(separator: "/").count == 2
-                    && entry.parentPath == (edit.operation == .trashIdea ? "Ideas" : "Projects")),
-                  entry.parentPath == String(entry.path.split(separator: "/").dropLast().joined(separator: "/")),
+                  edit.operation == .trashEntry || WorkspaceListing.isAreaChild(entry.path, area: edit.operation == .trashIdea ? "Ideas" : "Projects"),
+                  entry.parentPath == String(entry.path.split(separator: "/").dropLast().joined(separator: "/"))
+                    || entry.parentPath.map({ WorkspaceListing.isAreaChild(entry.path, area: $0) }) == true,
                   edit.operation != .trashProject || entry.isDirectory else {
                 throw Error.invalid("Refresh this item before deleting it.")
             }

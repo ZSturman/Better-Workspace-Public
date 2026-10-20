@@ -17,10 +17,34 @@ final class ProjectsExperienceUITests: IsolatedUITestCase {
             _ = try service.create(WorkItem(id: "chart-work-\(index)", kind: .task, title: "Recorded task \(index)", projectPath: index < 2 ? "Projects/AI Studio" : "Projects/AI Research", url: Self.fixtureRoot), in: Self.workspaceRoot.appendingPathComponent("To Do"))
         }
     }
-    private func launch(_ area: String = "Projects", extra: [String] = []) -> XCUIApplication {
-        let app = isolatedApp(arguments: ["-bwStartArea", area, "-bwWindowWidth", "820", "-bwWindowHeight", "520"] + extra)
+    private func launch(_ area: String = "Projects", width: Int = 820, height: Int = 520, extra: [String] = []) -> XCUIApplication {
+        let app = isolatedApp(arguments: ["-bwStartArea", area, "-bwWindowWidth", String(width), "-bwWindowHeight", String(height)] + extra)
         app.launch(); requireForeground(app); requireWindow(app)
         return app
+    }
+    func testDashboardHasReadableRowsAndSummariesAtNarrowAndWideSizes() throws {
+        try seedProjects()
+        let name = "A project with a deliberately long name that must wrap above its chart rather than collide with the bars"
+        let url = Self.workspaceRoot.appendingPathComponent("Projects/" + name)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        _ = try WorkItemService().create(WorkItem(id: "long-chart-task", kind: .task, title: "A real recorded task", projectPath: "Projects/" + name, url: Self.fixtureRoot), in: Self.workspaceRoot.appendingPathComponent("To Do"))
+        for (width, appearance) in [(820, "light"), (1500, "dark")] {
+            let app = launch(width: width, height: width == 820 ? 520 : 850, extra: ["-bwAppearance", appearance])
+            view(app, "Charts")
+            XCTAssertTrue(app.descendants(matching: .any)["projects.charts.summary"].firstMatch.waitForExistence(timeout: 20))
+            shot(app, "project-insights-\(width)-\(appearance)")
+            let scroll = app.scrollViews["projects.charts"].firstMatch
+            let row = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "projects.charts.row.backlog.", name)).firstMatch
+            for _ in 0..<5 {
+                if row.exists && row.isHittable { break }
+                scroll.scroll(byDeltaX: 0, deltaY: -280)
+            }
+            XCTAssertTrue(row.exists); XCTAssertTrue(row.isHittable)
+            shot(app, "project-insights-rows-\(width)-\(appearance)")
+            row.click()
+            XCTAssertTrue(app.descendants(matching: .any)["projects.workspace"].firstMatch.waitForExistence(timeout: 15))
+            app.terminate()
+        }
     }
     private func view(_ app: XCUIApplication, _ label: String) {
         let picker = app.descendants(matching: .any)["projects.presentation"].firstMatch
@@ -81,6 +105,10 @@ final class ProjectsExperienceUITests: IsolatedUITestCase {
         XCTAssertTrue(app.descendants(matching: .any)["projects.charts.customize"].firstMatch.waitForExistence(timeout: 10))
         shot(app, "projects-analytics-820")
         let openChart = app.descendants(matching: .any)["projects.charts.open.backlog"].firstMatch
+        for _ in 0..<5 {
+            if openChart.exists && openChart.isHittable { break }
+            app.scrollViews["projects.charts"].firstMatch.scroll(byDeltaX: 0, deltaY: -280)
+        }
         XCTAssertTrue(openChart.waitForExistence(timeout: 10)); openChart.click()
         let project = app.menuItems["AI Studio"].firstMatch
         XCTAssertTrue(project.waitForExistence(timeout: 5)); project.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
@@ -150,7 +178,7 @@ final class ProjectsExperienceUITests: IsolatedUITestCase {
             let search = app.searchFields.firstMatch.exists ? app.searchFields.firstMatch : app.textFields.firstMatch
             search.click(); search.typeText("Load 017")
         }
-        for (presentation, identifier) in [("Cards", "projects.portfolio"), ("Decide", "projects.decide"), ("Charts", "projects.charts.backlog"), ("Table", "projects.table")] {
+        for (presentation, identifier) in [("Cards", "projects.portfolio"), ("Decide", "projects.decide"), ("Charts", "projects.charts.summary"), ("Table", "projects.table")] {
             timed(presentation, budget: 2.5, app.descendants(matching: .any)[identifier].firstMatch) { view(app, presentation) }
         }
         let report = XCTAttachment(string: timings.joined(separator: "\n")); report.name = "projects-400-timings"; report.lifetime = .keepAlways; add(report)

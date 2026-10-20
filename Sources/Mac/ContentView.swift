@@ -15,7 +15,7 @@ struct ContentView: View {
         GeometryReader { geometry in
             shell(windowWidth: geometry.size.width)
         }
-        .sheet(item: Binding(get: { model.graphSyncReview?.presenterID == "widget" ? model.graphSyncReview : nil }, set: { model.graphSyncReview = $0 })) { review in
+        .sheet(item: Binding(get: { ["widget", "newProject"].contains(model.graphSyncReview?.presenterID ?? "") ? model.graphSyncReview : nil }, set: { model.graphSyncReview = $0 })) { review in
             ProjectSyncReviewView(review: review).environment(model)
         }
         .sheet(isPresented: $model.showingSyncCenter) { SyncCenterView().environment(model) }

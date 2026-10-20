@@ -80,6 +80,8 @@ final class AppModel {
     /// Optional projection/intent transport. It owns no Workspace data and does not
     /// construct a CloudKit container until the user enables mobile sync.
     let mobileCloudPublisher: MobileCloudPublisher
+    var mobileCloudLastPublished = TestIsolation.defaults.object(forKey: MobileCloudPublisher.lastPublishedDefaultsKey) as? Date
+    var mobileCloudSyncError: String?
     let fs = FilesystemService.shared
     let probe = ItemProbe.shared
     let measurementService = MeasurementService.shared
@@ -232,7 +234,7 @@ final class AppModel {
     @ObservationIgnored var widgetCommands: WidgetCommandStore?
     @ObservationIgnored var widgetPublishingTask: Task<Void, Never>?
     private var mobileCloudSyncTask: Task<Void, Never>?
-    private var mobileCloudSyncInFlight = false
+    var mobileCloudSyncInFlight = false
     private var mobileCloudSyncRequested = false
     private var completedInitialRefresh = false
     /// Set once the first service read has been attempted, whatever its outcome, so
@@ -2264,7 +2266,7 @@ final class AppModel {
                     ratingCoverage: score(for: item, preferences: scoringPreferences())?.coverage,
                     lastWorked: overviewFocusItems.first { $0.path == path }?.lastWorked,
                     ratings: ratingsByProject[record.id] ?? [:], scoringPreferences: scoring,
-                    needsSetup: setupProjectIDs.contains(record.id), previews: previewCache[record.id]
+                    needsSetup: setupProjectIDs.contains(record.id), previews: previewCache[record.id], projectType: metadata.projectType, createdAt: item.createdAt
                 ))
             })
             let snapshot = MobileWorkspaceLocalSnapshot(
@@ -2286,7 +2288,11 @@ final class AppModel {
                     try await mobileCloudPublisher.finishPlanning(intent, workModifiedAt: widgetCommands?.value("applied-work:" + intent.id.uuidString, as: Date.self))
                 }
             }
+            mobileCloudLastPublished = Date()
+            mobileCloudSyncError = nil
+            TestIsolation.defaults.set(mobileCloudLastPublished, forKey: MobileCloudPublisher.lastPublishedDefaultsKey)
         } catch let error as MobileCloudError {
+            mobileCloudSyncError = error.localizedDescription
             // Offline/no-account mode is expected. It is deliberately quiet so a
             // filesystem-first workspace does not look broken without iCloud.
             if case .rejected = error { lastError = error.localizedDescription }
@@ -2295,6 +2301,7 @@ final class AppModel {
             // The publisher's conversion normally maps CloudKit errors above, but
             // never make a transport failure invalidate or alter local state.
             lastError = "Mobile sync couldn't finish: \(error.localizedDescription)"
+            mobileCloudSyncError = error.localizedDescription
         }
     }
 

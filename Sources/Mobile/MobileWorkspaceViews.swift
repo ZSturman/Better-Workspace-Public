@@ -215,6 +215,7 @@ private struct MobileOverviewView: View {
                                 NotificationCenter.default.post(name: .init("BetterWorkspace.ShowWelcome"), object: nil)
                             }
                         }
+                        NavigationLink { MobileDownloadsList() } label: { Label("Downloads", systemImage: "arrow.down.circle") }
                         NavigationLink("Browse folders", value: MobileOverviewDestination.workspace)
                         NavigationLink("Filter by tags", value: MobileOverviewDestination.tags)
                         NavigationLink("Analytics", value: MobileOverviewDestination.analytics)
@@ -249,24 +250,26 @@ private struct MobileProjectsView: View {
 
 private struct MobileProjectsList: View {
     @Environment(MobileWorkspaceModel.self) private var model
-    @State private var query = ""
+    @State private var query = MobileBrowseQuery()
     @State private var newProject = false
-    private var projects: [MobileWorkspaceEntry] {
-        model.entries(in: "Projects").filter { $0.isDirectory && (query.isEmpty || $0.name.localizedCaseInsensitiveContains(query)) }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-    }
+    private var sections: [MobileBrowseSection<MobileWorkspaceEntry>] { query.projects(model.entries(in: "Projects")) }
     var body: some View {
         List {
-            if projects.isEmpty, model.syncState == .loading { MobileLoadingState(title: "Loading projects…") }
-            else if projects.isEmpty { Text("Create a project to start organizing its work.").foregroundStyle(.secondary) }
-            ForEach(projects) { project in
-                NavigationLink(value: project) { MobileProjectRow(project: project) }
-                    .accessibilityIdentifier("mobile-project-\(project.path)")
+            if sections.isEmpty, model.syncState == .loading { MobileLoadingState(title: "Loading projects…") }
+            else if sections.isEmpty { Text(model.entries(in: "Projects").isEmpty ? "Create a project to start organizing its work." : "No projects match this view. Adjust the filters or search.").foregroundStyle(.secondary) }
+            ForEach(sections) { section in
+                Section {
+                    ForEach(section.items) { project in
+                        NavigationLink(value: project) { MobileProjectRow(project: project) }
+                            .accessibilityIdentifier("mobile-project-\(project.path)")
+                    }
+                } header: { if !section.title.isEmpty { Text(section.title) } }
             }
         }
         .navigationTitle("Projects")
-        .searchable(text: $query, prompt: "Find a project")
+        .searchable(text: $query.search, prompt: "Find a project")
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) { MobileBrowseControls(query: $query, ideas: false) }
             ToolbarItem(placement: .topBarTrailing) { Button("New project", systemImage: "plus") { newProject = true } }
         }
         .sheet(isPresented: $newProject) { MobileIdeaEditor(operation: .createProject) }
@@ -308,6 +311,7 @@ struct MobileProjectDetailView: View {
     @State private var confirmingDelete = false
     @State private var creatingKind: WorkItemKind?
     @State private var editingProject = false
+    @State private var zenScoring = false
     @State private var showsAllActive = false
     @State private var showsCompleted = false
     private var current: MobileWorkspaceEntry { model.snapshot.entries.first { $0.id == project.id } ?? project }
@@ -320,10 +324,12 @@ struct MobileProjectDetailView: View {
         List {
             Section {
                 if current.projectDetails?.needsSetup == true { Label("New project created", systemImage: "sparkles") }
+                Button("Zen mode", systemImage: "viewfinder") { zenScoring = true }.accessibilityIdentifier("project.zen.open")
                 Button("Details & scoring", systemImage: "slider.horizontal.3") { editingProject = true }
                     .accessibilityIdentifier("project.score.edit")
                 if let score = current.projectDetails?.rankingScore { LabeledContent("Your score", value: "\(Int(score.rounded()))/100") }
             }
+            MobileDownloadSection(entry: current)
             MobileProjectPreviewsSection(project: current)
             upNext
             activeSection
@@ -366,6 +372,7 @@ struct MobileProjectDetailView: View {
         } message: { Text(MobileProjectDeletionActions.message) }
         .refreshable { await model.refresh() }
         .sheet(item: $creatingKind) { kind in MobileWorkEditor(projectPath: current.path, kind: kind) }
+        .fullScreenCover(isPresented: $zenScoring) { MobileProjectScoreEditor(project: current, zenMode: true) }
         .sheet(isPresented: $editingProject) { MobileProjectScoreEditor(project: current) }
     }
 
@@ -591,26 +598,32 @@ extension WorkItemsMobileView {
 
 private struct IdeasMobileView: View {
     @Environment(MobileWorkspaceModel.self) private var model
-    @State private var query = ""
+    @State private var query = MobileBrowseQuery()
+    private var sections: [MobileBrowseSection<MobileIdea>] { query.ideas(model.filteredIdeas()) }
     @State private var newIdea = false
     @State private var deletingIdea: MobileIdea?
     var body: some View {
         List {
             MobilePlanningStatusSection()
             let activity = WeeklyCounts(dates: model.filteredIdeas().compactMap(\.modifiedAt))
-            if activity.total > 0, query.isEmpty {
+            if activity.total > 0, query.search.isEmpty {
                 Section {
                     WeeklyActivityChart(counts: activity, title: "Ideas updated, last 8 weeks", color: .yellow)
                         .accessibilityIdentifier("ideas-activity")
                 }
             }
-            ForEach(model.filteredIdeas().filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) }.sorted(by: IdeaRanking.comesFirst)) { idea in
-                NavigationLink(value: idea) { MobileIdeaRow(idea: idea) }
-                    .accessibilityIdentifier("mobile-idea-\(idea.path)")
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button("Delete", systemImage: "trash", role: .destructive) { deletingIdea = idea }
+            ForEach(sections) { section in
+                Section {
+                    ForEach(section.items) { idea in
+                        NavigationLink(value: idea) { MobileIdeaRow(idea: idea) }
+                            .accessibilityIdentifier("mobile-idea-\(idea.path)")
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button("Delete", systemImage: "trash", role: .destructive) { deletingIdea = idea }
+                            }
                     }
+                } header: { if !section.title.isEmpty { Text(section.title) } }
             }
+            if sections.isEmpty, !model.filteredIdeas().isEmpty { Text("No ideas match this view. Adjust the filters or search.").foregroundStyle(.secondary) }
             if model.filteredIdeas().isEmpty, model.syncState == .loading { MobileLoadingState(title: "Loading ideas…") }
             else if model.filteredIdeas().isEmpty { Text("Record an idea. Add detail now, organize it when you are ready.").foregroundStyle(.secondary) }
         }
@@ -620,8 +633,10 @@ private struct IdeasMobileView: View {
             Button("Move to Trash", role: .destructive) { if let idea = deletingIdea { model.trash(idea) }; deletingIdea = nil }
             Button("Cancel", role: .cancel) { deletingIdea = nil }
         } message: { Text("The idea and any files inside its folder move to your Mac’s recoverable Trash when online.") }
-        .searchable(text: $query, prompt: "Find an idea")
-        .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("New idea", systemImage: "plus") { newIdea = true } } }
+        .searchable(text: $query.search, prompt: "Find an idea")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) { MobileBrowseControls(query: $query, ideas: true) }
+            ToolbarItem(placement: .topBarTrailing) { Button("New idea", systemImage: "plus") { newIdea = true } } }
         .sheet(isPresented: $newIdea) { MobileIdeaEditor() }
         .refreshable { await model.refresh() }
     }
@@ -751,9 +766,16 @@ private struct FolderContentsView: View {
     @Environment(MobileWorkspaceModel.self) private var model
     let parentPath: String?
     let title: String
+    @State private var search = ""
+    @State private var newestFirst = false
 
     private var entries: [MobileWorkspaceEntry] {
-        model.filtered(model.snapshot.entries.filter { $0.parentPath == parentPath })
+        model.filtered(model.snapshot.entries.filter { $0.parentPath == parentPath && (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search)) })
+            .sorted { lhs, rhs in
+                if newestFirst, lhs.modifiedAt != rhs.modifiedAt { return (lhs.modifiedAt ?? .distantPast) > (rhs.modifiedAt ?? .distantPast) }
+                let order = lhs.name.localizedStandardCompare(rhs.name)
+                return order == .orderedSame ? lhs.path < rhs.path : order == .orderedAscending
+            }
     }
 
     var body: some View {
@@ -762,6 +784,10 @@ private struct FolderContentsView: View {
                 SyncNotice(state: model.syncState, pendingIntentCount: model.pendingIntentCount)
             }
 
+            if let parentPath {
+                MobileDownloadSection(entry: model.snapshot.entries.first { $0.path == parentPath }
+                    ?? MobileWorkspaceEntry(path: parentPath, parentPath: nil, name: title, isDirectory: true, revision: 0))
+            }
             if model.selectedTagIDs.isEmpty == false {
                 Section("Filtering by tags") { TagFilterStrip() }
             }
@@ -788,6 +814,13 @@ private struct FolderContentsView: View {
             }
         }
         .navigationTitle(title)
+        .searchable(text: $search, prompt: "Find a file or folder")
+        .toolbar { ToolbarItem(placement: .topBarTrailing) {
+            Menu("Sort", systemImage: "arrow.up.arrow.down") {
+                Button("Name") { newestFirst = false }
+                Button("Last updated") { newestFirst = true }
+            }
+        } }
     }
 
     private var emptyDescription: String {
@@ -836,6 +869,7 @@ private struct WorkspaceEntryDetail: View {
             Section {
                 DisclosureGroup("File location") { Text(current.path).font(.footnote).textSelection(.enabled) }
             }
+            MobileDownloadSection(entry: current)
             MobileTagAssignmentSection(entry: current)
         }
         .navigationTitle(current.name)

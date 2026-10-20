@@ -51,6 +51,10 @@ final class MobileWorkspaceModel {
     private let widgetStore = WidgetSnapshotStore(appGroup: WidgetAppGroup.mobile)
     private let snapshotCache = MobileSnapshotCache(appGroup: WidgetAppGroup.mobile)
 
+    let downloadCache: MobileDownloadCache
+    private(set) var downloads: [MobileDownloadState] = []
+    private var receivingDownloads = false
+
     private(set) var snapshot = MobileWorkspaceSnapshot()
     /// Received records before optimistic phone drafts: used for history and source comparisons.
     private(set) var macWorkItems: [MobileWorkItem] = []
@@ -78,6 +82,13 @@ final class MobileWorkspaceModel {
     init(sampleSnapshot: MobileWorkspaceSnapshot? = nil) {
         isSample = sampleSnapshot != nil
         sampleDefaultsName = sampleSnapshot == nil ? nil : "BetterWorkspace.Sample.\(UUID().uuidString)"
+        let downloadRoot: URL
+        if sampleSnapshot != nil || UserDefaults.standard.bool(forKey: "BWTestMobilePlanning") {
+            downloadRoot = FileManager.default.temporaryDirectory.appendingPathComponent("bw-offline-fixture-" + UUID().uuidString)
+        } else {
+            downloadRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("WorkspaceDownloads")
+        }
+        downloadCache = MobileDownloadCache(root: downloadRoot)
         #if DEBUG
         let fixture = !isSample && UserDefaults.standard.bool(forKey: "BWTestMobilePlanning")
         #endif
@@ -103,6 +114,8 @@ final class MobileWorkspaceModel {
         }
         try? widgetCommands?.migrate(defaults: planningDefaults, outboxKey: "mobileWorkspaceIntentOutbox", stream: "workspace", planning: true)
         outbox = MobileIntentOutbox(defaults: planningDefaults, ledger: widgetCommands)
+        if !isSample, let data = planningDefaults.data(forKey: "BWOfflineDownloads"), data.count <= 4_000_000,
+           let saved = try? JSONDecoder().decode([MobileDownloadState].self, from: data) { downloads = saved }
         draftStore = MobilePlanningDraftStore(defaults: planningDefaults, ledger: widgetCommands)
         receiptCleanup = Set((planningDefaults.stringArray(forKey: "BWPlanningReceiptCleanup") ?? []).compactMap(UUID.init(uuidString:)))
         planningDrafts = draftStore.load()
@@ -227,6 +240,13 @@ final class MobileWorkspaceModel {
             snapshot = fetched
             macWorkItems = downloaded.workItems; macEntries = downloaded.entries; macIdeas = downloaded.ideas
             for receipt in receipts {
+                if let index = downloads.firstIndex(where: { $0.requestID == receipt.id }) {
+                    downloads[index].receiptReceived = true
+                    if !receipt.applied {
+                        downloads[index].error = receipt.message ?? "The Mac could not prepare this download."
+                        downloads[index].requestID = nil
+                    }
+                }
                 try? widgetCommands?.receipt(id: receipt.id, applied: receipt.applied, message: receipt.message, workModifiedAt: receipt.workModifiedAt, now: receipt.appliedAt ?? Date())
                 if receipt.applied { appliedAt[receipt.id] = appliedAt[receipt.id] ?? Date() }
                 else { planningErrors[receipt.id.uuidString] = receipt.message ?? "The Mac could not apply this change." }
@@ -241,6 +261,8 @@ final class MobileWorkspaceModel {
             }
             outbox.remove(ids: Set(receipts.map(\.id)))
             receiptCleanup.formUnion(receipts.map(\.id))
+            persistDownloads()
+            await receiveDownloads()
             persistPlanningDrafts()
             applyPlanningDrafts()
             cacheReceivedSnapshot()
@@ -310,6 +332,90 @@ final class MobileWorkspaceModel {
     func filteredWorkItems() -> [MobileWorkItem] {
         guard selectedTagIDs.isEmpty == false else { return snapshot.workItems }
         return snapshot.workItems.filter { selectedTagIDs.isSubset(of: $0.tagIDs) }
+    }
+
+    func download(for path: String) -> MobileDownloadState? { downloads.first { $0.entry.path == path } }
+
+    func setDownload(_ entry: MobileWorkspaceEntry, enabled: Bool) {
+        guard !isSample else { return }
+        if !enabled, let index = downloads.firstIndex(where: { $0.entry.path == entry.path }) {
+            if let copy = downloads[index].copy { Task { try? await downloadCache.remove(copy.id) } }
+            downloads[index].copy = nil; downloads[index].enabled = false
+            if downloads[index].requestID == nil { downloads.remove(at: index) }
+            persistDownloads(); return
+        }
+        if let index = downloads.firstIndex(where: { $0.entry.path == entry.path }), downloads[index].requestID != nil {
+            downloads[index].enabled = true; persistDownloads(); return
+        }
+        guard downloads.filter({ $0.enabled }).count < 20 || download(for: entry.path)?.enabled == true else {
+            saveMessage = "Keep up to 20 offline files, folders or categories. Remove a download first."; return
+        }
+        var compact = entry
+        // File previews never belong in a download request.
+        if var details = compact.projectDetails {
+            details.previews = nil
+            compact = MobileWorkspaceEntry(path: entry.path, parentPath: entry.parentPath, name: entry.name, isDirectory: entry.isDirectory,
+                revision: entry.revision, tagIDs: entry.tagIDs, modifiedAt: entry.modifiedAt, projectDetails: details)
+        }
+        let edit = MobilePlanningEdit(operation: .downloadFiles, title: entry.name, originalEntry: compact)
+        guard savePlanning(edit) else { return }
+        if let index = downloads.firstIndex(where: { $0.entry.path == entry.path }) {
+            downloads[index].requestID = edit.id; downloads[index].error = nil; downloads[index].receiptReceived = false
+            downloads[index].entry = compact; downloads[index].enabled = true
+        } else { downloads.append(MobileDownloadState(entry: compact, requestID: edit.id)) }
+        persistDownloads()
+    }
+
+    private func persistDownloads() {
+        guard !isSample, let data = try? JSONEncoder().encode(downloads) else { return }
+        planningDefaults.set(data, forKey: "BWOfflineDownloads")
+    }
+
+    private func receiveDownloads() async {
+        guard !receivingDownloads, !isSample else { return }
+        receivingDownloads = true; defer { receivingDownloads = false }
+        for state in downloads {
+            guard let request = state.requestID else { continue }
+            do {
+                if !state.enabled {
+                    guard state.receiptReceived else { continue }
+                    try await cloudStore.removeDownload(request)
+                    downloads.removeAll { $0.entry.path == state.entry.path && !$0.enabled && $0.requestID == request }
+                } else {
+                    let copy: MobileOfflineCopy?
+                    if state.copy?.id == request { copy = state.copy }
+                    else { copy = try await cloudStore.receiveDownload(id: request, path: state.entry.path, cache: downloadCache) }
+                    guard let copy else { continue }
+                    guard let index = downloads.firstIndex(where: { $0.entry.path == state.entry.path && $0.requestID == request }), downloads[index].enabled else {
+                        try? await downloadCache.remove(copy.id); continue
+                    }
+                    let old = downloads[index].copy
+                    downloads[index].copy = copy; downloads[index].error = nil
+                    persistDownloads()
+                    if let old, old.id != copy.id { try? await downloadCache.remove(old.id) }
+                    // Wait for the Mac's receipt before deleting its transfer asset:
+                    // an interrupted Mac may still be retrying this immutable command.
+                    if downloads.first(where: { $0.requestID == request })?.receiptReceived == true {
+                        try await cloudStore.removeDownload(request)
+                        if let current = downloads.firstIndex(where: { $0.requestID == request }) { downloads[current].requestID = nil }
+                    }
+                }
+            } catch {
+                if let index = downloads.firstIndex(where: { $0.requestID == request }) { downloads[index].error = error.localizedDescription }
+            }
+        }
+        downloads.removeAll { !$0.enabled && $0.requestID == nil }
+        persistDownloads()
+    }
+
+    var propertyOptions: [String: [String]] {
+        let projects = snapshot.entries.compactMap(\.projectDetails)
+        let ideas = snapshot.ideas.compactMap { $0.planning?.project?.metadata }
+        return ["domain": projects.compactMap(\.domain) + ideas.compactMap(\.domain),
+                "Status": projects.compactMap(\.status) + ideas.compactMap(\.status),
+                "Phase": projects.compactMap(\.phase) + ideas.compactMap(\.phase),
+                "Type": projects.compactMap(\.projectType) + ideas.compactMap(\.projectType)]
+            .mapValues { Array(Set($0)).sorted { $0.localizedStandardCompare($1) == .orderedAscending } }
     }
 
     func filteredIdeas() -> [MobileIdea] {
@@ -535,13 +641,20 @@ final class MobileWorkspaceModel {
             case .saveIdeaPlanning:
                 if let original = edit.originalIdea, let index = snapshot.ideas.firstIndex(where: { $0.path == original.path }) { snapshot.ideas[index].planning = edit.ideaPlanning }
             case .promoteIdea: break // Keep the idea visible until the Mac's move receipt.
-            case .previewIdea, .scheduleCapture, .previewProject: break
+            case .downloadFiles, .previewIdea, .scheduleCapture, .previewProject: break
             case .saveProject:
                 guard let change = edit.projectEdit, let index = snapshot.entries.firstIndex(where: { $0.path == change.original.path }) else { continue }
                 let entry = snapshot.entries[index]
                 var details = entry.projectDetails ?? change.original
                 details.ratings = change.ratings; details.needsSetup = false
                 details.oneLiner = change.oneLiner; details.summary = change.summary
+                if let properties = change.properties {
+                    let fields = properties.changedFields(from: change.original)
+                    if fields.contains("domain") { details.domain = properties.domain.isEmpty ? nil : properties.domain }
+                    if fields.contains("Status") { details.status = properties.status.isEmpty ? nil : properties.status }
+                    if fields.contains("Phase") { details.phase = properties.phase.isEmpty ? nil : properties.phase }
+                    if fields.contains("Type") { details.projectType = properties.projectType.isEmpty ? nil : properties.projectType }
+                }
                 snapshot.entries[index] = MobileWorkspaceEntry(path: entry.path, parentPath: entry.parentPath, name: entry.name, isDirectory: entry.isDirectory, revision: entry.revision, tagIDs: entry.tagIDs, modifiedAt: entry.modifiedAt, projectDetails: details)
             case .fileCapture, .reviewInbox: break // The card uses persisted drafts; keep the downloaded projection untouched.
             case .saveWork:

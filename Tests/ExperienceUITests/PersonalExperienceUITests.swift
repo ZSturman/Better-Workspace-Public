@@ -1,8 +1,112 @@
 import XCTest
 
-/// Exercises the same native personal workspace UI on Mac, iPhone and iPad.
-/// All edits are inside the public memory-only sample, never a person's records.
+/// Native experience checks. Live-device checks require explicit opt-in and discard
+/// project editor drafts; sample checks use memory-only content.
 final class PersonalExperienceUITests: XCTestCase {
+    /// Opens the live project's controls without saving an edit or requesting files.
+    func testInstalledWorkspaceZenAndSelectableProperties() throws {
+        #if os(iOS) && !targetEnvironment(simulator)
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["BW_RUN_CONNECTED_ACCEPTANCE"] == "1", "Explicit installed-phone connected acceptance only")
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication(bundleIdentifier: "com.zacharysturman.BetterWorkspace.Mobile")
+        app.launchArguments = []
+        app.launch(); app.activate()
+        defer {
+            XCUIDevice.shared.orientation = .portrait
+            app.terminate(); app.launchArguments = []; app.launch()
+        }
+        XCTAssertTrue(app.tabBars.buttons["Projects"].waitForExistence(timeout: 20))
+        app.tabBars.buttons["Projects"].tap()
+        XCTAssertTrue(app.buttons["projects.filterSort"].waitForExistence(timeout: 10))
+        let search = app.searchFields.firstMatch
+        for _ in 0..<3 {
+            if search.waitForExistence(timeout: 1) { break }
+            app.collectionViews.firstMatch.swipeDown()
+        }
+        XCTAssertTrue(search.waitForExistence(timeout: 10)); search.tap(); search.typeText("Better Workspace")
+        let project = app.buttons["mobile-project-Projects/Better Workspace"]
+        XCTAssertTrue(project.waitForExistence(timeout: 20)); project.tap()
+        app.buttons["project.zen.open"].tap()
+        XCTAssertTrue(app.staticTexts["zen.question"].waitForExistence(timeout: 10))
+        app.buttons["zen.rating.5"].tap() // Unsaved draft only; Cancel below.
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let next = app.buttons["zen.next"]
+        XCTAssertTrue(next.waitForExistence(timeout: 10)); XCTAssertTrue(next.isHittable)
+        XCTAssertLessThanOrEqual(next.frame.maxY, app.frame.maxY)
+        let landscape = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        landscape.name = "installed-phone-zen-landscape"; landscape.lifetime = .keepAlways; add(landscape)
+        XCUIDevice.shared.orientation = .portrait
+        app.buttons["scoring.zen.toggle"].tap()
+        let domain = app.buttons["project.property.domain"]
+        XCTAssertTrue(domain.waitForExistence(timeout: 10)); domain.tap()
+        app.buttons["Add new domain…"].tap()
+        XCTAssertTrue(app.alerts.textFields.firstMatch.waitForExistence(timeout: 5))
+        app.alerts.buttons["Cancel"].tap()
+        let oneLiner = app.textFields["project.score.oneLiner"].exists
+            ? app.textFields["project.score.oneLiner"] : app.textViews["project.score.oneLiner"]
+        oneLiner.tap()
+        let done = app.buttons["project.score.keyboardDone"]
+        XCTAssertTrue(done.waitForExistence(timeout: 5)); XCTAssertTrue(done.isHittable); done.tap()
+        app.buttons["Cancel"].tap()
+        XCTAssertTrue(app.buttons["project.zen.open"].waitForExistence(timeout: 10))
+        #else
+        throw XCTSkip("Installed physical iPhone acceptance only")
+        #endif
+    }
+
+    /// Read-only acceptance against the installed phone app. The runner is installed
+    /// separately; never replace TestFlight just to verify the connected index.
+    func testInstalledConnectedWorkspaceRefreshAndOfflineCache() throws {
+        #if os(iOS) && !targetEnvironment(simulator)
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["BW_RUN_CONNECTED_ACCEPTANCE"] == "1", "Explicit installed-phone connected acceptance only")
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication(bundleIdentifier: "com.zacharysturman.BetterWorkspace.Mobile")
+        app.launchArguments = []
+        app.launch(); app.activate()
+        let connected = app.buttons["Mac Workspace"].firstMatch
+        // Older installed builds have a workspace switch; current builds open it directly.
+        if connected.waitForExistence(timeout: 3) { connected.tap() }
+        XCTAssertTrue(app.tabBars.buttons["Overview"].waitForExistence(timeout: 20))
+        app.tabBars.buttons["Overview"].tap()
+        let refresh = app.buttons["Refresh workspace index"].firstMatch
+        XCTAssertTrue(refresh.waitForExistence(timeout: 20)); refresh.tap()
+        let synced = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value BEGINSWITH %@", "Synced"), object: refresh)
+        XCTAssertEqual(XCTWaiter.wait(for: [synced], timeout: 90), .completed)
+        app.tabBars.buttons["Projects"].tap()
+        let search = app.searchFields.firstMatch
+        for _ in 0..<3 {
+            if search.waitForExistence(timeout: 1) { break }
+            app.collectionViews.firstMatch.swipeDown()
+        }
+        XCTAssertTrue(search.waitForExistence(timeout: 10))
+        search.tap(); search.typeText("Better Workspace")
+        let project = app.buttons["mobile-project-Projects/Better Workspace"].firstMatch
+        XCTAssertTrue(project.waitForExistence(timeout: 25), "The advanced Mac's actual project must be in the received index")
+        let online = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        online.name = "installed-phone-connected-projects"; online.lifetime = .keepAlways; add(online)
+        app.terminate()
+        app.launchArguments = ["-mobileCloudDisabled", "YES"]
+        app.launch()
+        app.tabBars.buttons["Projects"].tap()
+        for _ in 0..<3 {
+            if search.waitForExistence(timeout: 1) { break }
+            app.collectionViews.firstMatch.swipeDown()
+        }
+        XCTAssertTrue(search.waitForExistence(timeout: 10))
+        search.tap(); search.typeText("Better Workspace")
+        XCTAssertTrue(project.waitForExistence(timeout: 20), "The disk cache must survive a relaunch with transport disabled")
+        let cached = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        cached.name = "installed-phone-cached-projects"; cached.lifetime = .keepAlways; add(cached)
+        app.terminate()
+        app.launchArguments = []
+        app.launch()
+        #else
+        throw XCTSkip("Installed physical iPhone acceptance only")
+        #endif
+    }
+
     func testPersonalStoreScreenshots() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["BW_CAPTURE_PERSONAL_SCREENSHOTS"] == "1", "Explicit private-sample screenshot capture only")
         continueAfterFailure = false

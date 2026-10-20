@@ -3,6 +3,34 @@ import Foundation
 /// Analytics consumes the same filtered records as the table. It never infers effort
 /// from commits, directory mtimes, normalized scores, or a missing observation.
 public enum ProjectAnalytics {
+    /// Untruncated totals for the same filtered scope as the chart rankings.
+    public struct Summary: Sendable, Equatable {
+        public let projectCount: Int
+        public let openWork: Double?
+        public let workCoverage: Int
+        public let reviewCount: Int
+        public let observedHours: Double?
+        public let observationCoverage: Int
+    }
+
+    public static func summary(_ records: [ProjectQueryRecord], days: Int = 30, activeOnly: Bool = true) -> Summary {
+        var seen = Set<String>()
+        let scoped = records.filter { seen.insert($0.id).inserted && (!activeOnly || !ProjectMetadata(status: $0.value("status")).isTerminal) }
+        func measurements(_ key: String) -> [Double] {
+            scoped.compactMap { row in
+                guard let value = row.values[key].flatMap(Double.init), value.isFinite, value >= 0 else { return nil }
+                return value
+            }
+        }
+        let work = measurements("openWork"), hours = measurements("hours\(days)")
+        let reviewIDs = Set([Metric.stalled, .valueIdle].flatMap {
+            bars(scoped, metric: $0, days: days, limit: scoped.count, activeOnly: false).map(\.id)
+        })
+        return Summary(projectCount: scoped.count, openWork: work.isEmpty ? nil : work.reduce(0, +),
+                       workCoverage: work.count, reviewCount: reviewIDs.count,
+                       observedHours: hours.isEmpty ? nil : hours.reduce(0, +), observationCoverage: hours.count)
+    }
+
     public enum Metric: String, Codable, CaseIterable, Sendable {
         case backlog, nearDone, stalled, valueIdle, attention, domains, idle
         public static let defaultOrder: [Metric] = [.backlog, .nearDone, .stalled, .valueIdle, .attention, .domains]
@@ -94,7 +122,7 @@ public enum ProjectAnalytics {
                 guard let value, value > 0 else { return nil }
                 let note: String?
                 switch metric {
-                case .nearDone: note = row.values["openWork"].map { "\($0) open" }
+                case .nearDone: note = "\(row.value("completedWork")) completed · \(row.value("openWork")) open"
                 case .valueIdle, .stalled:
                     let bound = row.values["bound:lastWorked"] == "lower"
                     note = number(row, "sort:lastWorked").map { bound ? "no observed work for at least \(Int($0)) days" : "last observed \(Int($0)) days ago" }

@@ -1,9 +1,8 @@
 import SwiftUI
 
-/// Personal work is independent; the existing Mac index/command path stays intact.
+/// Mobile is a window onto the Mac-owned Workspace. Existing personal storage is retained.
 struct MobileExperienceRoot: View {
     @Environment(MobileWorkspaceModel.self) private var model
-    @Binding var experience: String
     @Binding var selectedTab: MobileWorkspaceTab
     let captureRequest: Int
     @AppStorage("workspaceWelcomeCompleted") private var welcomed = false
@@ -11,16 +10,7 @@ struct MobileExperienceRoot: View {
     @State private var showsSample = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            Picker("Workspace", selection: $experience) {
-                Text("My Workspace").tag("personal")
-                Text("Mac Workspace").tag("connected")
-            }
-            .pickerStyle(.segmented).padding(.horizontal).padding(.vertical, 6)
-            .accessibilityIdentifier("workspace.experience")
-            if experience == "personal" { PersonalWorkspaceView() }
-            else { MobileWorkspaceRootView(selectedTab: $selectedTab, captureRequest: captureRequest) }
-        }
+        MobileWorkspaceRootView(selectedTab: $selectedTab, captureRequest: captureRequest)
         .task {
             // Existing connected users retain their home; fixtures never show a modal.
             if !welcomed && model.snapshot.entries.isEmpty && !model.isSample &&
@@ -31,15 +21,13 @@ struct MobileExperienceRoot: View {
         }
         .sheet(isPresented: $showsWelcome) {
             WorkspaceWelcomeView(platform: .mobile, startPersonal: {
-                experience = "personal"; finishWelcome()
-            }, connect: { experience = "connected"; finishWelcome() }, exploreSample: {
+                finishWelcome()
+            }, connect: nil, exploreSample: {
                 finishWelcome(); showsSample = true
             })
         }
         .fullScreenCover(isPresented: $showsSample) { MobileSampleWorkspaceView() }
         .onReceive(NotificationCenter.default.publisher(for: .init("BetterWorkspace.ShowWelcome"))) { _ in showsWelcome = true }
-        .onChange(of: captureRequest) { _, _ in experience = "connected" }
-        .onChange(of: model.widgetNavigation) { _, route in if route != nil { experience = "connected" } }
     }
 
     private func finishWelcome() { welcomed = true; showsWelcome = false }

@@ -11,6 +11,7 @@ from typing import Any
 
 from .core_events import EventTypes, WorkspaceEvent
 from .core_store import CoreStore
+from .transparent_folders import visible_children
 from .intents import IntentFolderDetector
 from .item_records import ItemMetadataError, ItemRecord
 from .private_items import load_record, record_payload, prior_promoted_record, save_indexed_record
@@ -48,7 +49,7 @@ class IntentIndexer:
             counters["folders"] += 1
             if not folder_row:
                 self._event(EventTypes.INTENT_DISCOVERED, folder_id, {"path": str(folder.path), "name": folder.name}); counters["events"] += 1
-            for child in sorted(folder.path.iterdir(), key=lambda candidate: candidate.name.casefold()):
+            for child in visible_children(folder.path, self.detector.settings.excluded_names):
                 if child.is_symlink() or child.name.startswith("."):
                     continue
                 path = str(child.resolve())

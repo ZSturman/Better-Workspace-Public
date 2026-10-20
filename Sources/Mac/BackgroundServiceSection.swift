@@ -10,8 +10,8 @@ struct BackgroundServiceSection: View {
         VStack(alignment: .leading, spacing: Theme.Space.snug) {
             Text("Advanced workspace services notice work sessions, draft the work log, "
                  + "store idea scores and resurface ideas while you work. Starting them "
-                 + "enables a login item. My Workspace works independently; browsing folders "
-                 + "also remains available without these services. Idea metadata and observed "
+                 + "enables a login item. Browsing folders remains available without these "
+                 + "services. Idea metadata and observed "
                  + "sessions require the service.")
                 .font(.caption)
                 .foregroundStyle(.secondary)

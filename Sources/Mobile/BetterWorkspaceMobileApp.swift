@@ -9,7 +9,6 @@ struct BetterWorkspaceMobileApp: App {
     /// Overview is the mobile home, even when the Mac was last showing a folder.
     @State private var selectedTab: MobileWorkspaceTab = .overview
     @State private var captureRequest = 0
-    @AppStorage("workspaceExperience") private var experience = "connected"
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -29,7 +28,7 @@ struct BetterWorkspaceMobileApp: App {
             } else if NotebookReleaseAcceptance.isBackendTest {
                 PersonalWorkspaceView(sample: true)
             } else if let model, let captureModel {
-                MobileExperienceRoot(experience: $experience, selectedTab: $selectedTab, captureRequest: captureRequest)
+                MobileExperienceRoot(selectedTab: $selectedTab, captureRequest: captureRequest)
                     .environment(model)
                     .environment(captureModel)
                     .onChange(of: scenePhase) { _, phase in
@@ -62,11 +61,9 @@ struct BetterWorkspaceMobileApp: App {
     private func open(_ url: URL) {
         guard url.scheme == "betterworkspace-mobile" else { return }
         if let route = WidgetRoute(url: url) {
-            experience = "connected"
             model?.widgetNavigation = route
             return
         }
-        if ["work", "ideas", "projects"].contains(url.host ?? "") { experience = "connected" }
         switch url.host {
         case "work": selectedTab = .work
         case "ideas": selectedTab = .ideas
@@ -83,8 +80,7 @@ struct BetterWorkspaceMobileApp: App {
     /// Straight to a focused capture field: the fewest taps between a thought and Save.
     private func startCapture(asIdea: Bool) {
         // A cold-launch request can arrive before the root installs onChange.
-        // Select its owning experience here, before changing the destination.
-        experience = "connected"
+        // Select the destination before changing the request.
         selectedTab = .capture
         if asIdea { captureModel?.selectedCaptureKind = .idea }
         captureRequest += 1

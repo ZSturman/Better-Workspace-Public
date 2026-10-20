@@ -343,13 +343,13 @@ private struct ProjectWorkspaceDetails: View {
         ScrollView { VStack(alignment: .leading, spacing: Theme.Space.base) {
             WorkspaceCard(title: "About") {
                 DetailText("One-line summary", value: $description.oneLiner); DetailText("Description", value: $description.summary, multiline: true)
-                DetailText("Status", value: $metadata.status); DetailText("Phase", value: $metadata.phase)
-                DetailText("Type", value: $metadata.projectType); DetailText("Domain", value: $metadata.domain)
+                choice("Status", path: \.status, option: "Status"); choice("Phase", path: \.phase, option: "Phase")
+                choice("Type", path: \.projectType, option: "Type"); choice("Domain", path: \.domain, option: "domain")
             }
             DisclosureGroup("Lifecycle") { WorkspaceCard(title: "") {
-                DetailText("Completion model", value: $metadata.completionModel)
+                choice("Completion model", path: \.completionModel, option: "Completion Model")
                     .help("How the project ends: finite, maintained, ongoing, versioned…")
-                DetailText("Maintenance cadence", value: $metadata.maintenanceCadence)
+                choice("Maintenance cadence", path: \.maintenanceCadence, option: "Maintenance Cadence")
             } }
             DisclosureGroup("Current work") { WorkspaceCard(title: "") {
                 DetailText("Working on", string: commaBinding(\.currentWork)).help("Kinds of work under way, separated by commas")
@@ -400,6 +400,11 @@ private struct ProjectWorkspaceDetails: View {
             .padding(.horizontal, Theme.Space.loose).padding(.vertical, 10)
         }.onAppear { load() }
         .sheet(isPresented: $showingSuggestions, onDismiss: { load() }) { ProjectMetadataSuggestionSheet(project: project) }
+    }
+    private func choice(_ title: String, path: WritableKeyPath<ProjectMetadata, String?>, option: String) -> some View {
+        let values = model.projects().compactMap { model.projectMetadata(for: $0)[keyPath: path] }
+        return WorkspaceChoiceField(title, selection: Binding(get: { metadata[keyPath: path] ?? "" },
+            set: { metadata[keyPath: path] = $0.isEmpty ? nil : $0 }), suggestions: values + (model.ideaProjectPropertyOptions()[option] ?? []), identifier: "project.details." + option, store: TestIsolation.defaults)
     }
     private var hasUnsavedDetails: Bool {
         description != (model.projectDescription(for: project) ?? ProjectDescription()) || metadata != model.projectMetadata(for: project) || related != Set(model.relatedProjects(for: project).compactMap { model.projectRecord(for: $0)?.id })

@@ -45,7 +45,7 @@ public enum NoiseFilter {
     /// - Parameter showHidden: when true, ordinary dotfiles are kept, but other
     ///   applications' metadata is still suppressed.
     public static func isHidden(name: String, showHidden: Bool) -> Bool {
-        if isForeignMetadata(name: name) { return true }
+        if isForeignMetadata(name: name) || foreignTopLevelDirectories.contains(name) { return true }
         if showHidden { return false }
         return name.hasPrefix(".")
     }

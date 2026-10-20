@@ -5,11 +5,14 @@ import BetterWorkspaceCore
 struct WorkspacePrivacyView: View {
     var body: some View {
         Form {
-            Section("My Workspace") {
-                Text("Projects, tasks, ideas and documents you create in My Workspace stay in a separate private app database. They work offline and do not require the advanced Mac app or its background service. The private sample uses memory only and discards its edits when closed.")
+            #if os(macOS)
+            Section("Saved personal notes") {
+                Text("Previously saved personal projects, tasks, ideas and documents stay in a separate private app database. They work offline and do not require the advanced Mac app or its background service. The private sample uses memory only and discards its edits when closed.")
                 Text(WorkspaceNotebookPersistence.isCloudSyncEnabled ? "Personal records also synchronize through your private iCloud account when available. Use the same Apple account on your devices. Transfers can take a few minutes; the workspace shows account and transfer status. The developer cannot access your private iCloud database." : "Personal iCloud synchronization is not enabled in this edition yet. Your records remain on this device.")
             }
-            Section("Your workspace") {
+            #endif
+            Section("Workspace") {
+                Text("The Workspace lives on your Mac. Mobile keeps its last received index, pending saves and explicitly requested offline downloads in private app storage. Removing a download removes only the device copy. Hidden files and other tools’ metadata are excluded from downloads.")
                 Text("Better Workspace stores your files in folders you control. Tags, indexes, settings and sync receipts stay in private app storage. The app includes no advertising, tracking or developer analytics service.")
             }
             Section("Across devices") {
@@ -19,6 +22,9 @@ struct WorkspacePrivacyView: View {
                 Text("On Mac, connecting Notion can send the content you choose to that service. Agent tasks and AI requests go to the provider you select. Review the provider’s privacy terms before sharing sensitive content.")
             }
             Section("Privacy & support") {
+                #if os(iOS)
+                MobileLegacyNotesExportButton()
+                #endif
                 Link("Privacy policy", destination: URL(string: "https://zacharysturman.com/better-workspace/privacy")!)
                 Link("Setup & support", destination: URL(string: "https://zacharysturman.com/better-workspace/support")!)
                 Text("Deleting the app does not delete your workspace folders, iCloud files or Notion pages. Manage those separately in Finder, Files, iCloud and Notion.")

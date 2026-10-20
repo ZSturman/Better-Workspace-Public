@@ -169,7 +169,7 @@ public enum MobileWorkspaceProjection {
                 path: path, title: detail?.title ?? item.displayTitle, revision: 0,
                 tagIDs: Set(snapshot.tagsByPath[item.url.canonicalPath, default: []].map(\.id)),
                 modifiedAt: item.rawModifiedAt, description: detail?.description,
-                attachments: detail?.attachments, serviceID: detail?.serviceID, planning: detail?.planning, scoringPreferences: detail?.scoringPreferences, previews: detail?.previews
+                attachments: detail?.attachments, serviceID: detail?.serviceID, planning: detail?.planning, scoringPreferences: detail?.scoringPreferences, previews: detail?.previews, createdAt: item.createdAt
             )))
         }
         return candidates.sorted {
@@ -199,6 +199,7 @@ public final class MobileCloudProjectionState: @unchecked Sendable {
         public let candidate: MobileCloudPublicationCandidate
         public let revision: Int64
         public let changed: Bool
+        fileprivate let acknowledgementFingerprint: String
     }
 
     public struct Plan: Sendable {
@@ -208,8 +209,12 @@ public final class MobileCloudProjectionState: @unchecked Sendable {
 
     private let db: Database
     private let lock = NSLock()
+    private let destination: String?
 
-    public init(database: Database) { self.db = database }
+    public init(database: Database, destination: String? = nil) {
+        self.db = database
+        self.destination = destination
+    }
 
     public func prepare(_ candidates: [MobileCloudPublicationCandidate]) throws -> Plan {
         lock.lock(); defer { lock.unlock() }
@@ -221,9 +226,14 @@ public final class MobileCloudProjectionState: @unchecked Sendable {
         let wanted = Set(candidates.map { "\($0.scope)\u{1F}\($0.recordKey)" })
         let records = candidates.map { candidate -> Prepared in
             let key = "\(candidate.scope)\u{1F}\(candidate.recordKey)"
-            guard let old = existing[key] else { return Prepared(candidate: candidate, revision: 1, changed: true) }
-            return Prepared(candidate: candidate, revision: old.0 == candidate.fingerprint ? old.1 : old.1 + 1,
-                            changed: old.0 != candidate.fingerprint)
+            // A legacy acknowledgement or another CloudKit environment cannot prove
+            // this destination has the record. Preserve revisions when republishing.
+            let fingerprint = destination.map { $0 + "\u{1E}" + candidate.fingerprint } ?? candidate.fingerprint
+            guard let old = existing[key] else {
+                return Prepared(candidate: candidate, revision: 1, changed: true, acknowledgementFingerprint: fingerprint)
+            }
+            return Prepared(candidate: candidate, revision: old.0 == fingerprint ? old.1 : old.1 + 1,
+                            changed: old.0 != fingerprint, acknowledgementFingerprint: fingerprint)
         }
         let stale = rows.compactMap { row -> (scope: String, recordKey: String)? in
             wanted.contains("\(row.0)\u{1F}\(row.1)") ? nil : (row.0, row.1)
@@ -239,7 +249,7 @@ public final class MobileCloudProjectionState: @unchecked Sendable {
             ON CONFLICT(scope, record_key) DO UPDATE SET fingerprint = excluded.fingerprint,
                 revision = excluded.revision, updated_at = excluded.updated_at
             """, [.text(prepared.candidate.scope), .text(prepared.candidate.recordKey),
-                  .text(prepared.candidate.fingerprint), .int(prepared.revision),
+                  .text(prepared.acknowledgementFingerprint), .int(prepared.revision),
                   .double(Date().timeIntervalSince1970)])
     }
 
@@ -251,13 +261,17 @@ public final class MobileCloudProjectionState: @unchecked Sendable {
 
     public func needsInitialReconciliation() throws -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return try db.query("SELECT 1 FROM mobile_cloud_sync_state WHERE state_key = ?", [.text("initial_projection_reconciled")], row: { _ in true }).isEmpty
+        return try db.query("SELECT 1 FROM mobile_cloud_sync_state WHERE state_key = ?", [.text(reconciliationKey)], row: { _ in true }).isEmpty
     }
 
     public func markInitialReconciled() throws {
         lock.lock(); defer { lock.unlock() }
         try db.run("INSERT OR REPLACE INTO mobile_cloud_sync_state (state_key, updated_at) VALUES (?,?)",
-                   [.text("initial_projection_reconciled"), .double(Date().timeIntervalSince1970)])
+                   [.text(reconciliationKey), .double(Date().timeIntervalSince1970)])
+    }
+
+    private var reconciliationKey: String {
+        "initial_projection_reconciled" + (destination.map { ":" + $0 } ?? "")
     }
 
     public func isHandled(_ id: UUID) throws -> Bool {
@@ -320,6 +334,15 @@ public struct MobileCloudDiagnostics: Sendable {
 /// sync leaves every local file and local database row exactly as they were.
 public actor MobileCloudPublisher {
     public static let enabledDefaultsKey = "macCloudPublisherEnabled"
+    public static var cloudEnvironment: String {
+        #if os(macOS)
+        guard let task = SecTaskCreateFromSelf(nil) else { return "Unspecified" }
+        return SecTaskCopyValueForEntitlement(task, "com.apple.developer.icloud-container-environment" as CFString, nil) as? String ?? "Unspecified"
+        #else
+        return "Mobile"
+        #endif
+    }
+    public static var lastPublishedDefaultsKey: String { "mobileCloudLastPublished." + cloudEnvironment }
     private let containerIdentifier: String
     private let defaults: UserDefaults
     private let state: MobileCloudProjectionState
@@ -327,7 +350,7 @@ public actor MobileCloudPublisher {
 
     public init(database: Database, containerIdentifier: String = MobileCloudSchema.containerIdentifier,
                 defaults: UserDefaults = TestIsolation.defaults) {
-        self.state = MobileCloudProjectionState(database: database)
+        self.state = MobileCloudProjectionState(database: database, destination: containerIdentifier + ":" + Self.cloudEnvironment)
         self.containerIdentifier = containerIdentifier
         self.defaults = defaults
     }
@@ -441,6 +464,17 @@ public actor MobileCloudPublisher {
         do { try await database.deleteRecord(withID: CKRecord.ID(recordName: recordName)) }
         catch let error as CKError where error.code == .unknownItem { return }
         catch { throw Self.cloudError(error) }
+    }
+
+    public func publishDownload(file: URL, requestID: UUID, path: String) async throws {
+        let database = try await database()
+        let record = CKRecord(recordType: MobileCloudSchema.downloadRecordType,
+            recordID: CKRecord.ID(recordName: "download-" + requestID.uuidString))
+        record["path"] = path
+        record["bundle"] = CKAsset(fileURL: file)
+        let results = try await database.modifyRecords(saving: [record], deleting: [], savePolicy: .allKeys, atomically: true)
+        guard let result = results.saveResults[record.recordID] else { throw MobilePlanningFiles.Error.invalid("The offline transfer was not accepted by iCloud.") }
+        _ = try result.get()
     }
 
     public func finishPlanning(_ intent: MobileWorkspaceIntent, error: String? = nil, workModifiedAt: Date? = nil) async throws {

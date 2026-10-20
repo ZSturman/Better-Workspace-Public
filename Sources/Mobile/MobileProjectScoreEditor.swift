@@ -6,17 +6,28 @@ struct MobileProjectScoreEditor: View {
     @Environment(MobileWorkspaceModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     let project: MobileWorkspaceEntry
+    @State private var zen: Bool
+    init(project: MobileWorkspaceEntry, zenMode: Bool = false) { self.project = project; _zen = State(initialValue: zenMode) }
     @State private var ratings: [String: Int] = [:]
     @State private var oneLiner = ""
     @State private var summary = ""
+    @State private var properties = MobileProjectProperties(MobileProjectDetails(path: ""))
     @State private var original: MobileProjectDetails?
     private enum NotesField: Hashable { case oneLiner, summary }
     @FocusState private var notesField: NotesField?
 
     var body: some View {
         NavigationStack {
+            Group {
+            if zen {
+                MobileScoringWizard(title: project.name, ratings: $ratings, preferences: original?.scoringPreferences ?? .init())
+            } else {
             Form {
                 Section("Project details") {
+                    WorkspaceChoiceField("Domain", selection: $properties.domain, suggestions: model.propertyOptions["domain"] ?? [], identifier: "project.property.domain", store: model.overviewDefaults)
+                    WorkspaceChoiceField("Status", selection: $properties.status, suggestions: model.propertyOptions["Status"] ?? [], identifier: "project.property.status", store: model.overviewDefaults)
+                    WorkspaceChoiceField("Phase", selection: $properties.phase, suggestions: model.propertyOptions["Phase"] ?? [], identifier: "project.property.phase", store: model.overviewDefaults)
+                    WorkspaceChoiceField("Type", selection: $properties.projectType, suggestions: model.propertyOptions["Type"] ?? [], identifier: "project.property.type", store: model.overviewDefaults)
                     TextField("One-liner", text: $oneLiner, axis: .vertical).focused($notesField, equals: .oneLiner)
                         .accessibilityIdentifier("project.score.oneLiner")
                     TextField("Summary", text: $summary, axis: .vertical).lineLimit(3...8).focused($notesField, equals: .summary)
@@ -56,9 +67,12 @@ struct MobileProjectScoreEditor: View {
                 }
                 if let message = model.saveMessage { Section { Text(message).font(.caption) } }
             }
+            }
+            }
             .navigationTitle("Details & scoring").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Done") { notesField = nil }.accessibilityIdentifier("project.score.keyboardDone") }
+                ToolbarItem(placement: .topBarTrailing) { Button(zen ? "Show form" : "Zen mode", systemImage: zen ? "list.bullet" : "viewfinder") { notesField = nil; zen.toggle() }.labelStyle(.iconOnly).accessibilityIdentifier("scoring.zen.toggle") }
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
@@ -66,13 +80,14 @@ struct MobileProjectScoreEditor: View {
                         // Keep command payloads compact: previews are disposable, not edit originals.
                         var baseline = original; baseline.previews = nil
                         let change = MobileProjectEdit(original: baseline, ratings: ratings,
-                            oneLiner: oneLiner.trimmingCharacters(in: .whitespacesAndNewlines), summary: summary.trimmingCharacters(in: .whitespacesAndNewlines))
+                            oneLiner: oneLiner.trimmingCharacters(in: .whitespacesAndNewlines), summary: summary.trimmingCharacters(in: .whitespacesAndNewlines), properties: properties)
                         if model.savePlanning(MobilePlanningEdit(operation: .saveProject, title: project.name, projectEdit: change)) { dismiss() }
                     }.disabled(original?.ratings == nil).accessibilityIdentifier("project.score.save")
                 }
             }
             .onAppear {
                 original = project.projectDetails
+                properties = MobileProjectProperties(project.projectDetails ?? MobileProjectDetails(path: project.path))
                 ratings = original?.ratings ?? [:]; oneLiner = original?.oneLiner ?? ""; summary = original?.summary ?? ""
             }
         }

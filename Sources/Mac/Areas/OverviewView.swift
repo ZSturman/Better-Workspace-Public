@@ -67,7 +67,6 @@ struct OverviewView: View {
                     HStack {
                         AreaHeader(title: "Overview", subtitle: nil, symbol: "rectangle.3.group")
                         Menu {
-                            Button("My Workspace", systemImage: "square.and.pencil") { openWindow(id: "personal-workspace") }
                             Button("Customize Overview", systemImage: "slider.horizontal.3") { showsCustomization = true }
                             Button("Welcome & capabilities", systemImage: "questionmark.circle") { showsWelcome = true }
                         } label: { Image(systemName: "slider.horizontal.3") }
@@ -83,7 +82,7 @@ struct OverviewView: View {
         .sheet(isPresented: $showsCustomization) { OverviewCustomizationView(encoded: $layoutValue, supported: supportedSections) }
         .sheet(isPresented: $showsWelcome) {
             WorkspaceWelcomeView(platform: .advancedMac, startPersonal: {
-                showsWelcome = false; openWindow(id: "personal-workspace")
+                showsWelcome = false
             }, connect: { showsWelcome = false }, exploreSample: nil)
         }
         .task { @MainActor in model.prepareOverviewInbox() }

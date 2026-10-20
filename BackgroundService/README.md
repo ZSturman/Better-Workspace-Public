@@ -5,7 +5,9 @@ log, idea metadata and resurfacing, notification delivery. See
 `../docs/BACKGROUND_SERVICE.md` for what it owns and how the app talks to it.
 
 Idea planning now stores priority, shared project ratings and a potential destination
-in private item records. `/v1/ideas/register` registers an immediate Ideas file/folder
+in private item records. Underscore grouping directories are now transparent in idea
+and project discovery; real paths and inode identities are retained, and metadata and
+symlinks are pruned. `/v1/ideas/register` registers a visible Ideas file/folder
 without adding sidecars; planning updates check original values. `/v1/ideas/{id}/relocate`
 acknowledges a confirmed same-volume move made by the Mac, retaining private decisions
 and remote links. It does not move files or archive Notion pages. Background indexing

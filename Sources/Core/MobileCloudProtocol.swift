@@ -15,6 +15,7 @@ public enum MobileCloudSchema {
     public static let ideaRecordType = "BWIdea"
     public static let tagAssignmentChangeRecordType = "BWTagAssignmentChange"
     public static let captureIntentRecordType = "BWCaptureIntent"
+    public static let downloadRecordType = "BWWorkspaceDownload"
 
     /// Every one of these record types is fetched with `TRUEPREDICATE`. CloudKit
     /// therefore needs a `QUERYABLE` index on its system `recordName` field for each
@@ -82,9 +83,9 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
     public let path: String
     public var oneLiner: String?
     public var summary: String?
-    public let domain: String?
-    public let status: String?
-    public let phase: String?
+    public var domain: String?
+    public var status: String?
+    public var phase: String?
     public let githubURL: String?
     public let websiteURL: String?
     public let resourceCount: Int
@@ -104,9 +105,11 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
     public var scoringPreferences: ProjectScoringPreferences?
     public var needsSetup: Bool?
     public var previews: [MobileFilePreview]?
+    public var projectType: String?
+    public var createdAt: Date?
 
     private enum CodingKeys: String, CodingKey {
-        case ratings, scoringPreferences, needsSetup, previews
+        case ratings, scoringPreferences, needsSetup, previews, projectType, createdAt
         case path, oneLiner, summary, domain, status, phase, githubURL, websiteURL, assessment, projectID, serviceID, manualScore, ratingCoverage, lastWorked
         case resourceCount, collectionCount, mediaCount, taskCount, featureCount, milestoneCount, workLogCount
     }
@@ -117,7 +120,8 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
                 domain: String? = nil, status: String? = nil, phase: String? = nil, githubURL: String? = nil,
                 websiteURL: String? = nil, resourceCount: Int = 0, collectionCount: Int = 0,
                 mediaCount: Int = 0, taskCount: Int = 0, featureCount: Int = 0,
-                milestoneCount: Int = 0, workLogCount: Int = 0, assessment: MobileProjectAssessment? = nil, projectID: String? = nil, serviceID: String? = nil, manualScore: Double? = nil, ratingCoverage: Double? = nil, lastWorked: Date? = nil, ratings: [String: Int]? = nil, scoringPreferences: ProjectScoringPreferences? = nil, needsSetup: Bool? = nil, previews: [MobileFilePreview]? = nil) {
+                milestoneCount: Int = 0, workLogCount: Int = 0, assessment: MobileProjectAssessment? = nil, projectID: String? = nil, serviceID: String? = nil, manualScore: Double? = nil, ratingCoverage: Double? = nil, lastWorked: Date? = nil, ratings: [String: Int]? = nil, scoringPreferences: ProjectScoringPreferences? = nil, needsSetup: Bool? = nil, previews: [MobileFilePreview]? = nil, projectType: String? = nil, createdAt: Date? = nil) {
+        self.projectType = projectType; self.createdAt = createdAt
         self.ratings = ratings; self.scoringPreferences = scoringPreferences; self.needsSetup = needsSetup; self.previews = previews
         self.path = MobileWorkspacePath.normalizedRelative(path) ?? path
         self.oneLiner = oneLiner
@@ -163,7 +167,9 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
             ratings: try values.decodeIfPresent([String: Int].self, forKey: .ratings),
             scoringPreferences: try values.decodeIfPresent(ProjectScoringPreferences.self, forKey: .scoringPreferences),
             needsSetup: try values.decodeIfPresent(Bool.self, forKey: .needsSetup),
-            previews: try values.decodeIfPresent([MobileFilePreview].self, forKey: .previews)
+            previews: try values.decodeIfPresent([MobileFilePreview].self, forKey: .previews),
+            projectType: try values.decodeIfPresent(String.self, forKey: .projectType),
+            createdAt: try values.decodeIfPresent(Date.self, forKey: .createdAt)
         )
     }
 
@@ -192,6 +198,8 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
         try values.encodeIfPresent(scoringPreferences, forKey: .scoringPreferences)
         try values.encodeIfPresent(needsSetup, forKey: .needsSetup)
         try values.encodeIfPresent(previews, forKey: .previews)
+        try values.encodeIfPresent(projectType, forKey: .projectType)
+        try values.encodeIfPresent(createdAt, forKey: .createdAt)
     }
 }
 
@@ -290,10 +298,12 @@ public struct MobileIdea: Identifiable, Hashable, Sendable, Codable {
     public var planning: IdeaPlanning?
     public var scoringPreferences: ProjectScoringPreferences?
     public var previews: [MobileFilePreview]?
+    public var createdAt: Date?
     public var id: String { path }
 
     public init(path: String, title: String, revision: Int64, tagIDs: Set<String> = [], modifiedAt: Date? = nil,
-                description: String? = nil, attachments: [MobileIdeaAttachment]? = nil, serviceID: String? = nil, planning: IdeaPlanning? = nil, scoringPreferences: ProjectScoringPreferences? = nil, previews: [MobileFilePreview]? = nil) {
+                description: String? = nil, attachments: [MobileIdeaAttachment]? = nil, serviceID: String? = nil, planning: IdeaPlanning? = nil, scoringPreferences: ProjectScoringPreferences? = nil, previews: [MobileFilePreview]? = nil, createdAt: Date? = nil) {
+        self.createdAt = createdAt
         self.planning = planning; self.scoringPreferences = scoringPreferences; self.previews = previews
         self.description = description
         self.attachments = attachments
@@ -612,6 +622,27 @@ public actor MobileCloudStore {
         }
     }
 
+    /// Direct record lookup: downloading originals never expands the index query.
+    public func receiveDownload(id: UUID, path: String, cache: MobileDownloadCache) async throws -> MobileOfflineCopy? {
+        if let installed = await cache.load(id), installed.path == path { return installed }
+        let database = try await database()
+        let record: CKRecord
+        do { record = try await database.record(for: CKRecord.ID(recordName: "download-" + id.uuidString)) }
+        catch let error as CKError where error.code == .unknownItem { return nil }
+        guard record.recordType == MobileCloudSchema.downloadRecordType, record["path"] as? String == path,
+              let asset = record["bundle"] as? CKAsset, let url = asset.fileURL else {
+            throw MobilePlanningFiles.Error.invalid("The Mac download is incomplete. Request an update.")
+        }
+        defer { withExtendedLifetime(record) {} }
+        return try await cache.install(asset: url, id: id, expectedPath: path)
+    }
+
+    public func removeDownload(_ id: UUID) async throws {
+        let database = try await database()
+        do { _ = try await database.deleteRecord(withID: CKRecord.ID(recordName: "download-" + id.uuidString)) }
+        catch let error as CKError where error.code == .unknownItem { return }
+    }
+
     public func planningReceipts(for ids: [UUID]) async throws -> [MobilePlanningReceipt] {
         guard !ids.isEmpty else { return [] }
         let database = try await database()
@@ -734,7 +765,7 @@ public actor MobileCloudStore {
                           tagIDs: Set(record["tagIDs"] as? [String] ?? []), modifiedAt: record["modifiedAt"] as? Date,
                           description: record["description"] as? String,
                           attachments: envelope?.attachments,
-                          serviceID: record["serviceID"] as? String, planning: envelope?.planning, scoringPreferences: envelope?.scoringPreferences, previews: envelope?.previews)
+                          serviceID: record["serviceID"] as? String, planning: envelope?.planning, scoringPreferences: envelope?.scoringPreferences, previews: envelope?.previews, createdAt: envelope?.createdAt)
     }
 
     /// These responses can mean an invalid field *or* a missing dashboard index,

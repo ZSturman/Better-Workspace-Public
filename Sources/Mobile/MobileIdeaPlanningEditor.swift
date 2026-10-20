@@ -6,15 +6,22 @@ struct MobileIdeaPlanningEditor: View {
     @Environment(\.dismiss) private var dismiss
     let idea: MobileIdea
     @State private var planning = IdeaPlanning()
+    @State private var zen: Bool
+    init(idea: MobileIdea, zenMode: Bool = false) { self.idea = idea; _zen = State(initialValue: zenMode) }
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                IdeaPlanningForm(planning: $planning, preferences: idea.scoringPreferences ?? .init())
+                if zen {
+                    MobileScoringWizard(title: idea.title, ratings: $planning.ratings, preferences: idea.scoringPreferences ?? .init())
+                } else {
+                    IdeaPlanningForm(planning: $planning, preferences: idea.scoringPreferences ?? .init(), projectOptions: model.propertyOptions, choiceDefaults: model.overviewDefaults)
+                }
                 if let message = model.saveMessage { Text(message).font(.caption).foregroundStyle(.secondary).padding() }
                 if idea.serviceID == nil { Text("The updated Mac and idea service must publish this idea before its scores can be saved.").font(.caption).padding() }
             }
             .navigationTitle("Priority & scoring").navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button(zen ? "Show form" : "Zen mode", systemImage: zen ? "list.bullet" : "viewfinder") { zen.toggle() }.labelStyle(.iconOnly).accessibilityIdentifier("scoring.zen.toggle") }
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
