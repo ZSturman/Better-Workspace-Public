@@ -38,7 +38,7 @@ def main():
         shutil.copy2(ROOT / relative, target)
     for name in ['README.md', 'AGENTS.md']:
         shutil.copy2(ROOT / 'docs/public-source' / name, destination / name)
-    for name in ['GETTING_STARTED.md', 'RELEASE_NOTES_1.0.md']:
+    for name in ['GETTING_STARTED.md', 'RELEASE_NOTES_1.0.md', 'RELEASE_NOTES_1.0.5.md']:
         target = destination / 'docs' / name
         target.parent.mkdir(exist_ok=True)
         shutil.copy2(ROOT / 'docs' / name, target)

@@ -29,7 +29,16 @@ Download **BetterWorkspace-1.0.5-57-mac.zip** from [Releases](https://github.com
 
 The advanced download supports macOS 14.4+ on Apple silicon and Intel. It is Developer ID signed, notarized and stapled. [Installation and first-use guide](docs/GETTING_STARTED.md).
 
-The development iPhone/iPad app (iOS/iPadOS 17+) now opens a local portable workspace without requiring a Mac. The shared editor supports projects, tasks, features, milestones, goals, ideas, folders and notes. Existing notebook records are imported additively. Connecting devices presents a recoverable merge preview and preserves concurrent edits for review. The Phase 1 core milestone is reached and Phase 2 macOS features are implemented. This update has **not passed its release gate**: isolated Production cloud checks and normal three-device linking/content/conflict checks have passed, while full filesystem, upgrade, installed-widget/integration and physical network-reconnect acceptance remain incomplete. Published downloads and screenshots from earlier releases do not demonstrate this new transport. The advanced Mac remains a direct download; the personal-only Mac Store edition is retired.
+The iPhone/iPad app (iOS/iPadOS 17+) works independently with local portable
+projects, tasks, features, milestones, goals, ideas, folders and notes. Private
+iCloud connects approved devices through a recoverable merge preview and preserves
+concurrent edits. Earlier notebook records are imported additively. Core transport
+and normal three-device delivery have passed focused checks; broader filesystem
+structural actions, upgrade, widget and network-recovery acceptance remain
+follow-ups. The advanced Mac remains a direct download; the personal-only Mac Store
+edition is retired. Mobile 1.0.5 (57) is in the internal TestFlight group and submitted
+to the App Store, Waiting for Review with automatic release after approval.
+[Current release notes](docs/RELEASE_NOTES_1.0.5.md).
 
 In development builds, open **Devices & recovery** on each device and connect using
 the same private iCloud account. Merge choices appear near the top, and approved

@@ -13,9 +13,14 @@ unchanged.
 Validation: 21 Core ingest checks; Mac picker, image capture, failed-video
 removal/retry and Finder-link checks; real-movie computer capture with byte-exact
 readback; two isolated capture/keyboard/landscape checks on each connected iPhone
-and iPad; 28 Finder routing/exchange checks. System banner display and the status
-item click itself were not automated. Wider installer, widget and network-recovery
+and iPad; 28 Finder routing/exchange checks. The owner confirmed the system save notification. The status
+item click itself was not automated. Wider installer, widget and network-recovery
 acceptance remains separate. Drafts remain in memory; save before quitting.
 
 The Mac download is universal, Developer ID signed, notarized and stapled.
 The mobile release is delivered separately through TestFlight/App Store Connect.
+
+Mobile 1.0.5 (57) is available in the existing internal TestFlight group and is
+Waiting for Review on the App Store, with automatic release after approval.
+Both direct Mac downloads are published: [Better Workspace](https://github.com/ZSturman/Better-Workspace-Public/releases/tag/v1.0.5)
+and [Finder development preview](https://github.com/ZSturman/Finder-Workspace-Extensions-Public/releases/tag/v0.1.1).
