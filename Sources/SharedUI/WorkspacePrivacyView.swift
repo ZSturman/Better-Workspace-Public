@@ -5,6 +5,7 @@ import BetterWorkspaceCore
 struct WorkspacePrivacyView: View {
     var body: some View {
         Form {
+            ConnectedAppsSettings()
             #if os(macOS)
             Section("Saved personal notes") {
                 Text("Previously saved personal projects, tasks, ideas and documents stay in a separate private app database. They work offline and do not require the advanced Mac app or its background service. The private sample uses memory only and discards its edits when closed.")
@@ -12,11 +13,11 @@ struct WorkspacePrivacyView: View {
             }
             #endif
             Section("Workspace") {
-                Text("The Workspace lives on your Mac. Mobile keeps its last received index, pending saves and explicitly requested offline downloads in private app storage. Removing a download removes only the device copy. Hidden files and other tools’ metadata are excluded from downloads.")
+                Text("Projects, plans, ideas and notes save on this device and remain available offline. Connecting another device combines its workspace after you review the merge, with recovery history retained.")
                 Text("Better Workspace stores your files in folders you control. Tags, indexes, settings and sync receipts stay in private app storage. The app includes no advertising, tracking or developer analytics service.")
             }
             Section("Across devices") {
-                Text("When you enable workspace publishing on your Mac, its index and selected previews sync through your private iCloud account. Captures use iCloud Drive. Planning changes wait for your Mac to apply them and return a receipt.")
+                Text("Optional Mac files stay in folders you control. Mobile retains the last received Mac index and explicitly requested offline copies. Removing a download removes only the device copy. Changes to Mac-owned files wait for the Mac to apply them and return a receipt. Captures use iCloud Drive; workspace connections use your private iCloud account.")
             }
             Section("Optional integrations") {
                 Text("On Mac, connecting Notion can send the content you choose to that service. Agent tasks and AI requests go to the provider you select. Review the provider’s privacy terms before sharing sensitive content.")

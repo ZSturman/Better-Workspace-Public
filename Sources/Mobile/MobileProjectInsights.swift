@@ -181,7 +181,7 @@ struct MobileProjectInsightsView: View {
                     BarMark(x: .value("Stage", stage.displayName), y: .value("Open", items.filter { $0.status != .completed && $0.stage == stage }.count))
                 }.frame(height: 170).accessibilityIdentifier("project.insights.stages")
             }
-            Section { Text("Work Log and service measurement charts require the Mac's local records and are available in Mac Insights.").font(.caption).foregroundStyle(.secondary) }
+            Section { NavigationLink("Work logs & sessions") { ProjectWorkHistoryView(history: project.projectDetails?.history) } }
         }.navigationTitle("Insights")
     }
 }
@@ -189,6 +189,7 @@ struct MobileProjectInsightsView: View {
 #if DEBUG
 /// Isolated UI fixture; never published or applied to the person's workspace.
 enum MobileParityFixture {
+    static let history = try! JSONDecoder().decode(ProjectWorkHistory.self, from: Data(#"{"totalLogs":1,"totalSessions":1,"logs":[{"id":"fixture-log","projectID":"fixture-service","projectName":"Example","dateKey":"2026-10-21","status":"prepared","activeMinutes":20,"elapsedMinutes":35,"sessionCount":1,"summary":"Reviewed the sync queue.","files":[],"syncedToNotion":false,"reconstructedSessionCount":0,"sessionIDs":["fixture-session"],"startedAt":814269600,"endedAt":814271700}],"sessions":[{"id":"fixture-session","projectID":"fixture-service","projectName":"Example","startedAt":814269600,"endedAt":814271700,"activeSeconds":1200,"files":["View.swift"],"gitSubject":"Improve the queue"}]}"#.utf8))
     static let assessment = try! JSONDecoder().decode(MobileProjectAssessment.self, from: Data(#"{"assessedAt":"2026-10-09T12:00:00Z","classification":"Active project","recommendation":"Clarify the next screen before expanding scope.","scores":{"FunctionalHealth":7,"Maintainability":8,"TestConfidence":6,"Documentation":7,"Completion":6,"CurrentUtility":8,"Uniqueness":7,"FuturePotential":8,"EaseOfProgress":9,"TechnicalRisk":3},"workPriorityScore":88,"validationCoverage":"Targeted tests","confidence":"Medium"}"#.utf8))
     static let action = try! JSONDecoder().decode(WorkItemActionMetadata.self, from: Data(#"{"version":1,"fingerprint":"fixture","priority":"P1","actionScore":88,"delegation":"AGENT","tags":["Design"],"requirements":["SwiftUI"],"agentExecutability":90,"humanInvolvement":10,"estimatedEffort":"Small","category":"UI","reason":"The empty state needs a clear next action.","evidence":["Existing screen review"],"agentSubtasks":["Sketch the empty state"],"userSubtasks":[],"blockedBy":[],"isNextWork":true,"isNextAgentAction":true,"isNextUserAction":false}"#.utf8))
 }

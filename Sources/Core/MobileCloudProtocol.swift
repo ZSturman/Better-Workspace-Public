@@ -105,10 +105,15 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
     public var scoringPreferences: ProjectScoringPreferences?
     public var needsSetup: Bool?
     public var previews: [MobileFilePreview]?
+    public var notionURL: String?
+    public var portfolio: ProjectPortfolioDetails?
     public var projectType: String?
     public var createdAt: Date?
+    public var portfolioPriority: Int?
+    public var history: ProjectWorkHistory?
 
     private enum CodingKeys: String, CodingKey {
+        case portfolio, notionURL, history, portfolioPriority
         case ratings, scoringPreferences, needsSetup, previews, projectType, createdAt
         case path, oneLiner, summary, domain, status, phase, githubURL, websiteURL, assessment, projectID, serviceID, manualScore, ratingCoverage, lastWorked
         case resourceCount, collectionCount, mediaCount, taskCount, featureCount, milestoneCount, workLogCount
@@ -120,7 +125,10 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
                 domain: String? = nil, status: String? = nil, phase: String? = nil, githubURL: String? = nil,
                 websiteURL: String? = nil, resourceCount: Int = 0, collectionCount: Int = 0,
                 mediaCount: Int = 0, taskCount: Int = 0, featureCount: Int = 0,
-                milestoneCount: Int = 0, workLogCount: Int = 0, assessment: MobileProjectAssessment? = nil, projectID: String? = nil, serviceID: String? = nil, manualScore: Double? = nil, ratingCoverage: Double? = nil, lastWorked: Date? = nil, ratings: [String: Int]? = nil, scoringPreferences: ProjectScoringPreferences? = nil, needsSetup: Bool? = nil, previews: [MobileFilePreview]? = nil, projectType: String? = nil, createdAt: Date? = nil) {
+                milestoneCount: Int = 0, workLogCount: Int = 0, assessment: MobileProjectAssessment? = nil, projectID: String? = nil, serviceID: String? = nil, manualScore: Double? = nil, ratingCoverage: Double? = nil, lastWorked: Date? = nil, ratings: [String: Int]? = nil, scoringPreferences: ProjectScoringPreferences? = nil, needsSetup: Bool? = nil, previews: [MobileFilePreview]? = nil, projectType: String? = nil, createdAt: Date? = nil, portfolio: ProjectPortfolioDetails? = nil, notionURL: String? = nil, history: ProjectWorkHistory? = nil, portfolioPriority: Int? = nil) {
+        self.portfolioPriority = portfolioPriority
+        self.history = history
+        self.notionURL = notionURL; self.portfolio = portfolio
         self.projectType = projectType; self.createdAt = createdAt
         self.ratings = ratings; self.scoringPreferences = scoringPreferences; self.needsSetup = needsSetup; self.previews = previews
         self.path = MobileWorkspacePath.normalizedRelative(path) ?? path
@@ -169,7 +177,11 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
             needsSetup: try values.decodeIfPresent(Bool.self, forKey: .needsSetup),
             previews: try values.decodeIfPresent([MobileFilePreview].self, forKey: .previews),
             projectType: try values.decodeIfPresent(String.self, forKey: .projectType),
-            createdAt: try values.decodeIfPresent(Date.self, forKey: .createdAt)
+            createdAt: try values.decodeIfPresent(Date.self, forKey: .createdAt),
+            portfolio: try values.decodeIfPresent(ProjectPortfolioDetails.self, forKey: .portfolio),
+            notionURL: try values.decodeIfPresent(String.self, forKey: .notionURL),
+            history: try values.decodeIfPresent(ProjectWorkHistory.self, forKey: .history),
+            portfolioPriority: try values.decodeIfPresent(Int.self, forKey: .portfolioPriority)
         )
     }
 
@@ -198,6 +210,10 @@ public struct MobileProjectDetails: Identifiable, Hashable, Sendable, Codable {
         try values.encodeIfPresent(scoringPreferences, forKey: .scoringPreferences)
         try values.encodeIfPresent(needsSetup, forKey: .needsSetup)
         try values.encodeIfPresent(previews, forKey: .previews)
+        try values.encodeIfPresent(portfolioPriority, forKey: .portfolioPriority)
+        try values.encodeIfPresent(history, forKey: .history)
+        try values.encodeIfPresent(notionURL, forKey: .notionURL)
+        try values.encodeIfPresent(portfolio, forKey: .portfolio)
         try values.encodeIfPresent(projectType, forKey: .projectType)
         try values.encodeIfPresent(createdAt, forKey: .createdAt)
     }
@@ -250,6 +266,10 @@ public struct MobileWorkItem: Identifiable, Hashable, Sendable, Codable {
     public var tagIDs: Set<String>
     /// Nil for older publishers or a note too large for the phone editor.
     public var body: String?
+    /// Exact local journal head for standalone widget actions; never a Mac path.
+    public var workspaceRevisionID: UUID?
+    /// Canonical portable folder parent, separate from the advanced project link.
+    public var workspaceFolderID: UUID?
 
     public var actionMetadata: WorkItemActionMetadata?
     public var dependencyIDs: [String]?
@@ -264,8 +284,10 @@ public struct MobileWorkItem: Identifiable, Hashable, Sendable, Codable {
                 tagIDs: Set<String> = [], body: String? = nil,
                 actionMetadata: WorkItemActionMetadata? = nil, dependencyIDs: [String]? = nil,
                 featureIDs: [String]? = nil, milestoneIDs: [String]? = nil,
-                createdAt: Date? = nil, modifiedAt: Date? = nil, completedAt: Date? = nil, importedNotionPageID: String? = nil) {
+                createdAt: Date? = nil, modifiedAt: Date? = nil, completedAt: Date? = nil, importedNotionPageID: String? = nil, workspaceRevisionID: UUID? = nil, workspaceFolderID: UUID? = nil) {
         self.importedNotionPageID = importedNotionPageID
+        self.workspaceRevisionID = workspaceRevisionID
+        self.workspaceFolderID = workspaceFolderID
         self.createdAt = createdAt; self.modifiedAt = modifiedAt; self.completedAt = completedAt
         self.featureIDs = featureIDs
         self.milestoneIDs = milestoneIDs
@@ -620,6 +642,42 @@ public actor MobileCloudStore {
         } catch {
             throw Self.cloudError(error)
         }
+    }
+
+    /// Uses the deployed offline-transfer record type. Read only the path when
+    /// checking status, so retries and receipt checks never download the attachment.
+    public func submitIdeaCapture(_ intent: MobileWorkspaceIntent, file: URL, title: String) async throws -> String? {
+        guard let name = MobileIdeaCapture.transferName(for: intent) else { throw MobileCloudError.malformedRecord("idea transfer") }
+        let database = try await database()
+        let id = CKRecord.ID(recordName: name)
+        let commandID = CKRecord.ID(recordName: intent.id.uuidString)
+        let existing = try await database.records(for: [id, commandID], desiredKeys: ["path"])
+        switch existing[id] {
+        case .success(let record):
+            guard record.recordType == MobileCloudSchema.downloadRecordType else { throw MobileCloudError.malformedRecord("idea transfer") }
+            let path = record["path"] as? String
+            let receipt = MobileIdeaCapture.receipt(name)
+            if path == receipt { return title }
+            if let path, path.hasPrefix(receipt + "/") {
+                let filedName = String(path.dropFirst(receipt.count + 1))
+                guard MobileWorkspacePath.normalizedRelative(filedName) == filedName, !filedName.contains("/") else {
+                    throw MobileCloudError.malformedRecord("idea receipt")
+                }
+                return filedName
+            }
+            guard path == name else { throw MobileCloudError.malformedRecord("idea transfer") }
+            if case .success = existing[commandID] { return nil }
+        case .failure(let error as CKError) where error.code == .unknownItem:
+            let record = CKRecord(recordType: MobileCloudSchema.downloadRecordType, recordID: id)
+            record["path"] = name
+            record["bundle"] = CKAsset(fileURL: file)
+            do { _ = try await database.save(record) }
+            catch let error as CKError where error.code == .serverRecordChanged { break }
+        case .failure(let error): throw error
+        case nil: throw MobileCloudError.unavailable("iCloud did not return the idea transfer status.")
+        }
+        try await submit(intent)
+        return nil
     }
 
     /// Direct record lookup: downloading originals never expands the index query.

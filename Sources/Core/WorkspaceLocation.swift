@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// Resolves the on-disk locations this app reads from and (for ingest only) writes to.
 ///
@@ -62,6 +63,21 @@ public struct WorkspaceLocation: Sendable {
         guard path.hasPrefix(rootPath + "/") else { return nil }
         let first = path.dropFirst(rootPath.count + 1).split(separator: "/", maxSplits: 1).first
         return first.map(String.init)
+    }
+
+    /// Whether a change at `url` can alter its area's listing. A listed item shows its
+    /// child count and newest child date, so only the item, a direct child, or a grandchild
+    /// (which changes its folder's date) matter; `_` containers are not a level and hidden
+    /// children are not counted. Builds and caches deep inside a project do not, and must
+    /// not re-list every project (October 26: 100–300% CPU while an agent worked in one).
+    public func changeAltersAreaListing(_ url: URL) -> Bool {
+        let rootPath = root.canonicalPath
+        let path = url.canonicalPath
+        guard path.hasPrefix(rootPath + "/") else { return true }
+        let parts = path.dropFirst(rootPath.count + 1).split(separator: "/").dropFirst().map(String.init).filter { !$0.hasPrefix("_") }
+        guard parts.count > 1 else { return true }
+        if NoiseFilter.isHidden(name: parts[1], showHidden: false) { return false }
+        return parts.count <= 3
     }
 
     /// The purpose-built area a URL belongs to, if its folder has one.
@@ -193,18 +209,18 @@ public struct IngestLocation: Sendable {
 
     /// Registers this app as a user of the shared iCloud container.
     ///
-    /// macOS reaches the inbox by plain path, which is fast and needs no round trip —
-    /// but a process that only reads that path is invisible to the sync machinery.
-    /// Nothing tells the system the container is in use, and it stops being kept
-    /// current: captures made on the phone stay on the phone, files written on the Mac
-    /// never leave it, and neither side shows an error because each one can still read
-    /// its own copy perfectly well. Asking for the container once is what registers it.
+    /// macOS lists the Inbox by path. Register separately so the system knows the
+    /// app uses the shared container even when it has no open Inbox window.
     ///
-    /// Deliberately returns nothing and is never awaited on a launch path:
-    /// `url(forUbiquityContainerIdentifier:)` can block for seconds, which is why
-    /// `resolve()` still picks the location by path.
+    /// Never awaited on the launch path. A mounted folder can outlive authorization,
+    /// so report a failed registration even when the plain path is readable.
     public static func registerUbiquityContainer(identifier: String = ubiquityContainerID) {
-        _ = FileManager.default.url(forUbiquityContainerIdentifier: identifier)
+        let log = Logger(subsystem: "com.zacharysturman.BetterWorkspace", category: "Inbox")
+        if FileManager.default.url(forUbiquityContainerIdentifier: identifier) == nil {
+            log.error("iCloud Drive did not grant access to the shared Inbox container.")
+        } else {
+            log.info("Registered the shared Inbox with iCloud Drive.")
+        }
     }
 
     /// Creates the inbox directory if needed. This is the only directory this app

@@ -28,11 +28,11 @@ struct GraphSelectedProjectView: View {
                 } label: { Image(systemName: "ellipsis") }
                 ProjectZenButton(project: current)
             }.padding(14)
-            ProjectSectionPicker(selection: $section, sections: ProjectSection.allCases.filter { $0 != .insights })
+            ProjectSectionPicker(selection: $section, sections: ProjectSection.allCases.filter { $0 != .insights && $0 != .activity })
             Divider()
             Group {
                 switch section {
-                case .tasks, .insights: ProjectPlanView(local: nil, graph: current)
+                case .tasks, .insights, .activity: ProjectPlanView(local: nil, graph: current)
                 case .details: ProjectGraphRecordEditor(record: current, embedded: true)
                 case .media: ProjectMediaGallery(project: current)
                 case .portfolio: ProjectPortfolioPresentation(project: current)

@@ -51,6 +51,13 @@ public struct CaptureDraftEntry: Identifiable, Sendable {
     }
 }
 
+extension CaptureDraftEntry {
+    /// A photo or file rather than written text.
+    var isAttachment: Bool {
+        switch content { case .data, .file: return true; case .markdown, .link: return false }
+    }
+}
+
 public struct CaptureBatchResult: Sendable {
     public struct Saved: Sendable {
         public let id: UUID
@@ -158,6 +165,41 @@ extension MobileCaptureService {
                 } else { throw CaptureError.emptyBundle }
                 result.saved.append(.init(id: entry.id, url: url))
             } catch { result.failures.append(.init(id: entry.id, message: error.localizedDescription)) }
+        }
+        return result
+    }
+
+    /// Several entries saved as one capture: a folder with the note and every file,
+    /// which the Mac files as a single idea (`Idea/Idea.md` + `Attachments/`). Used for
+    /// ideas, so a note shared with two photos is one idea rather than three.
+    public func captureTogether(_ entries: [CaptureDraftEntry], title: String = "") -> CaptureBatchResult {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard entries.count > 1 || (title.isEmpty == false && entries.contains(where: \.isAttachment)) else { return capture(entries) }
+        var result = CaptureBatchResult()
+        let staging = FileManager.default.temporaryDirectory.appendingPathComponent("bw-capture-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: staging) }
+        do {
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+            var note = "", attachments: [URL] = []
+            for entry in entries {
+                switch entry.content {
+                case .markdown, .link:
+                    if note.isEmpty, let document = try entry.document { note = String(decoding: document.data, as: UTF8.self) }
+                case .data(let data, let ext):
+                    let url = CaptureNaming.uniqueURL(in: staging, base: CaptureNaming.safeFilename(entry.title.isEmpty ? "Attachment" : entry.title), extension: ext)
+                    try data.write(to: url, options: .withoutOverwriting); attachments.append(url)
+                case .file(let source):
+                    let name = entry.title.isEmpty ? source.deletingPathExtension().lastPathComponent : entry.title
+                    let url = CaptureNaming.uniqueURL(in: staging, base: CaptureNaming.safeFilename(name), extension: source.pathExtension)
+                    try FileManager.default.copyItem(at: source, to: url); attachments.append(url)
+                }
+            }
+            // A titled idea with only files still gets a note, which names its folder.
+            if note.isEmpty && title.isEmpty == false { note = "# " + title }
+            let url = try captureBundle(note: note, attachmentURLs: attachments)
+            result.saved = [.init(id: entries[0].id, url: url)]
+        } catch {
+            result.failures = entries.map { .init(id: $0.id, message: error.localizedDescription) }
         }
         return result
     }

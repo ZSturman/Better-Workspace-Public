@@ -251,6 +251,52 @@ final class WorkItemTests: XCTestCase {
         XCTAssertEqual(indexed.first?.url.canonicalPath, first.canonicalPath)
     }
 
+    func testBackupCopyNeverRepresentsALiveWorkItemWithTheSameID() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bw-backup-work-item-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = WorkItemService(), id = UUID().uuidString.lowercased()
+        func write(_ relative: String, title: String, status: String) throws -> URL {
+            let url = root.appendingPathComponent(relative)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "---\nbetter-workspace: 1\nid: \(id)\nkind: task\ntitle: \"\(title)\"\nstatus: \(status)\nstage: next\npriority: medium\n---\n".write(to: url, atomically: true, encoding: .utf8)
+            return url
+        }
+        _ = try write("Backups/To-Do-pre-simplification-2026-10-20/A old.bw.md", title: "Old", status: "open")
+        let live = try write("To Do/Z live.bw.md", title: "Live", status: "completed")
+        let indexed = service.items(under: root)
+        XCTAssertEqual(indexed.count, 1)
+        XCTAssertEqual(indexed.first?.url.canonicalPath, live.canonicalPath)
+        XCTAssertEqual(indexed.first?.status, .completed)
+        // An incremental upsert of the snapshot (e.g. a write into it) still loses to the live record.
+        let snapshot = try XCTUnwrap(service.read(at: root.appendingPathComponent("Backups/To-Do-pre-simplification-2026-10-20/A old.bw.md")))
+        XCTAssertEqual(WorkItemService.merged(indexed, upserting: [snapshot], removingPaths: []).map(\.url.canonicalPath), [live.canonicalPath])
+        // With the live file gone, the snapshot is the only copy and is still listed.
+        try FileManager.default.removeItem(at: live)
+        XCTAssertEqual(service.items(under: root).first?.title, "Old")
+    }
+
+    func testMixedCaseUUIDWorkItemIDsHaveOneRepresentative() {
+        let id = UUID()
+        let lower = WorkItem(id: id.uuidString.lowercased(), kind: .task, title: "Lower", url: URL(fileURLWithPath: "/w/To Do/A.bw.md"))
+        let upper = WorkItem(id: id.uuidString, kind: .task, title: "Upper", url: URL(fileURLWithPath: "/w/To Do/B.bw.md"))
+        let other = WorkItem(id: "legacy-id", kind: .task, title: "Legacy", url: URL(fileURLWithPath: "/w/To Do/C.bw.md"))
+        let indexed = WorkItemService.indexed([upper, lower, other])
+        XCTAssertEqual(indexed.count, 2)
+        XCTAssertTrue(indexed.contains { $0.title == "Lower" }, "Path order still decides between two live copies")
+        XCTAssertEqual(WorkItemService.indexed([other, WorkItem(id: "LEGACY-ID", kind: .task, title: "Other", url: URL(fileURLWithPath: "/w/To Do/D.bw.md"))]).count, 2,
+                       "Non-UUID ids keep exact identity")
+    }
+
+    func testBulkMergeOfLiveRecordsReplacesEveryBackupRepresentative() {
+        let ids = (0..<500).map { _ in UUID().uuidString.lowercased() }
+        let snapshots = ids.map { WorkItem(id: $0, kind: .task, title: "Old", url: URL(fileURLWithPath: "/w/Backups/S/\($0).bw.md")) }
+        let live = ids.map { WorkItem(id: $0, kind: .task, title: "New", status: .completed, url: URL(fileURLWithPath: "/w/To Do/\($0).bw.md")) }
+        let merged = WorkItemService.merged(WorkItemService.indexed(snapshots), upserting: live, removingPaths: [])
+        XCTAssertEqual(merged.count, ids.count)
+        XCTAssertTrue(merged.allSatisfy { $0.title == "New" && $0.status == .completed })
+    }
+
     func testUpdateRefusesToOverwriteAnExternalEdit() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("bw-work-item-conflict-\(UUID().uuidString)")
@@ -585,7 +631,9 @@ final class IngestServiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: item.url.path), "Source must be gone")
         XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
         XCTAssertEqual(destination.deletingLastPathComponent().lastPathComponent, "Ideas")
-        XCTAssertEqual(destination.lastPathComponent, "Tailscale Alternatives.md")
+        XCTAssertEqual(destination.lastPathComponent, "Tailscale Alternatives")
+        let note = destination.appendingPathComponent("Tailscale Alternatives.md")
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "# Research alternatives to Tailscale Funnel\n\n")
         XCTAssertEqual(h.tagStore.tags(for: destination).map(\.name), ["Research"],
                        "Tags must survive the classification move")
 
@@ -649,14 +697,140 @@ final class IngestServiceTests: XCTestCase {
         let h = try makeHarness()
         defer { try? FileManager.default.removeItem(at: h.root) }
 
-        let existing = h.workspace.url(for: .ideas).appendingPathComponent("Taken.md")
+        let existing = h.workspace.url(for: .references).appendingPathComponent("Taken.md")
         try "already here".write(to: existing, atomically: true, encoding: .utf8)
 
         _ = try h.ingest.captureText("Taken")
         let pending = await h.ingest.pendingItems(fsService: FilesystemService()) ?? []
-        XCTAssertThrowsError(try h.ingest.classify(pending[0], into: .ideas, renamingTo: "Taken"))
+        XCTAssertThrowsError(try h.ingest.classify(pending[0], into: .references, renamingTo: "Taken"))
         XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "already here",
                        "An existing Workspace item must never be overwritten")
+    }
+
+    func testIdeaCaptureFilesOneFolderWithNoteAndAttachmentsWithoutReplacingExistingIdea() throws {
+        let h = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: h.root) }
+        let existing = h.workspace.url(for: .ideas).appendingPathComponent("Sketch")
+        try FileManager.default.createDirectory(at: existing, withIntermediateDirectories: false)
+        let original = existing.appendingPathComponent("Sketch.md")
+        try Data("Existing idea".utf8).write(to: original)
+        let image = Data([1, 2, 3])
+        let note = try XCTUnwrap(CaptureDraftEntry.note(title: "", markdown: "Sketch\n\nKeep the draft.", url: ""))
+        let item = try h.ingest.captureIdea(title: "", note: note,
+            attachments: [.init(title: "Screenshot", content: .data(image, extension: "png"))])
+        let filed = try h.ingest.classify(item, into: .ideas, renamingTo: nil)
+
+        XCTAssertEqual(filed.lastPathComponent, "Sketch 2")
+        XCTAssertEqual(try String(contentsOf: original, encoding: .utf8), "Existing idea")
+        XCTAssertEqual(try String(contentsOf: filed.appendingPathComponent("Sketch.md"), encoding: .utf8),
+                       "Sketch\n\nKeep the draft.\n\n![Screenshot](<Attachments/Screenshot.png>)\n")
+        XCTAssertEqual(try Data(contentsOf: filed.appendingPathComponent("Attachments/Screenshot.png")), image)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: filed.path)), ["Sketch.md", "Attachments"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: item.url.path))
+    }
+
+    func testIdeaCaptureCopiesVideoBytesAndKeepsOriginal() throws {
+        let h = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: h.root) }
+        let source = h.root.appendingPathComponent("Video reference.mov")
+        let bytes = Data([0, 0, 0, 20] + Array("ftypqt  ".utf8))
+        try bytes.write(to: source)
+        let note = CaptureDraftEntry.note(title: "Video idea", markdown: "Keep my notes", url: "")
+        let item = try h.ingest.captureIdea(title: "Video idea", note: note,
+            attachments: [.init(title: "Reference", content: .file(source))])
+        XCTAssertEqual(try Data(contentsOf: source), bytes)
+        XCTAssertEqual(try Data(contentsOf: item.url.appendingPathComponent("Attachments/Reference.mov")), bytes)
+        XCTAssertTrue(try String(contentsOf: item.url.appendingPathComponent("Video idea.md"), encoding: .utf8)
+            .contains("[Reference](<Attachments/Reference.mov>)"))
+    }
+
+    func testFailedVideoIdeaNamesAttachmentAndPublishesNothing() throws {
+        let h = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: h.root) }
+        let missing = h.root.appendingPathComponent("Missing video.mov")
+        let note = CaptureDraftEntry.note(title: "Video idea", markdown: "Keep my notes", url: "")
+        XCTAssertThrowsError(try h.ingest.captureIdea(title: "Video idea", note: note,
+            attachments: [.init(title: "Reference", content: .file(missing))])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Missing video.mov"), error.localizedDescription)
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: h.ingest.location.inbox.path), [])
+    }
+
+    func testFilingAnImageAsAnIdeaKeepsTheInboxSourceUntilTheFolderIsComplete() throws {
+        let h = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: h.root) }
+        let bytes = Data([1, 2, 3])
+        let item = try h.ingest.importData(bytes, preferredName: "Screenshot", extension: "png")
+        let ideas = h.workspace.url(for: .ideas)
+        h.ingest.copyItem = { _, _ in throw CocoaError(.fileWriteOutOfSpace) }
+        XCTAssertThrowsError(try h.ingest.classify(item, into: .ideas, renamingTo: nil))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: ideas.path), [])
+        XCTAssertEqual(try Data(contentsOf: item.url), bytes)
+
+        h.ingest.copyItem = { try FileManager.default.copyItem(at: $0, to: $1) }
+        let filed = try h.ingest.classify(item, into: .ideas, renamingTo: nil)
+        XCTAssertEqual(try Data(contentsOf: filed.appendingPathComponent("Attachments/Screenshot.png")), bytes)
+        XCTAssertEqual(try String(contentsOf: filed.appendingPathComponent("Screenshot.md"), encoding: .utf8),
+                       "# Screenshot\n\n![Screenshot](<Attachments/Screenshot.png>)\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: item.url.path))
+    }
+
+    /// A phone capture bundle (`Note.md` + photos) becomes the same idea layout as a
+    /// Mac capture; a folder that is not a capture bundle keeps its own shape.
+    func testPhoneBundleFiledAsAnIdeaTakesTheIdeaLayout() async throws {
+        let h = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: h.root) }
+        let inbox = h.root.appendingPathComponent("Inbox", isDirectory: true)
+        func pending(_ url: URL) async throws -> IngestItem {
+            let items = await h.ingest.pendingItems(fsService: FilesystemService()) ?? []
+            return try XCTUnwrap(items.first { $0.url.lastPathComponent == url.lastPathComponent })
+        }
+        let phone = MobileCaptureService(inbox: inbox)
+        let photo = h.root.appendingPathComponent("IMG_0001.heic")
+        try Data([9, 9]).write(to: photo)
+        let bundle = try phone.captureBundle(note: "Garden studio\n\nTimber frame, north light.", attachmentURLs: [photo])
+        let item = try await pending(bundle)
+        let filed = try h.ingest.classify(item, into: .ideas, renamingTo: nil)
+        XCTAssertEqual(filed.lastPathComponent, "Garden studio")
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: filed.path)), ["Garden studio.md", "Attachments"])
+        XCTAssertEqual(try Data(contentsOf: filed.appendingPathComponent("Attachments/IMG_0001.heic")), Data([9, 9]))
+        let note = try String(contentsOf: filed.appendingPathComponent("Garden studio.md"), encoding: .utf8)
+        XCTAssertTrue(note.contains("Timber frame, north light."))
+        XCTAssertTrue(note.hasSuffix("![IMG_0001](<Attachments/IMG_0001.heic>)\n"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.path))
+
+        let folder = inbox.appendingPathComponent("Research", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder.appendingPathComponent("papers"), withIntermediateDirectories: true)
+        try Data("a".utf8).write(to: folder.appendingPathComponent("papers/a.txt"))
+        let research = try await pending(folder)
+        let kept = try h.ingest.classify(research, into: .ideas, renamingTo: nil)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: kept.appendingPathComponent("papers/a.txt").path))
+    }
+
+    /// Share sheet and Shortcuts ideas: a note and two photos are one capture, and a
+    /// titled idea with only photos is named by its title.
+    func testIdeaSharedWithPhotosIsOneCapture() throws {
+        let inbox = FileManager.default.temporaryDirectory.appendingPathComponent("bw-together-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: inbox) }
+        let phone = MobileCaptureService(inbox: inbox)
+        let note = try XCTUnwrap(CaptureDraftEntry.note(title: "", markdown: "Porch swing\n\nCedar.", url: ""))
+        let photos = [CaptureDraftEntry(title: "IMG_1", content: .data(Data([1]), extension: "jpg")),
+                      CaptureDraftEntry(title: "IMG_1", content: .data(Data([2]), extension: "jpg"))]
+        let together = phone.captureTogether([note] + photos)
+        XCTAssertEqual(together.saved.count, 1); XCTAssertTrue(together.failures.isEmpty)
+        let bundle = together.saved[0].url
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: bundle.path).filter { !$0.hasPrefix(".") }), ["Note.md", "IMG_1.jpg", "IMG_1 2.jpg"])
+        XCTAssertNotNil(MobileCaptureBundleReceipt.children(at: bundle))
+
+        let titled = phone.captureTogether([photos[0]], title: "Kitchen shelf")
+        XCTAssertEqual(titled.saved.first?.url.lastPathComponent, "Kitchen shelf")
+        XCTAssertEqual(phone.captureTogether([note]).saved.first?.url.pathExtension, "md", "A note alone stays a note")
+    }
+
+    func testIdeaNoteLinksOnlyAttachmentsItDoesNotAlreadyMention() {
+        XCTAssertEqual(IdeaFolderLayout.note(nil, title: "Plan", attachments: []), "# Plan\n")
+        XCTAssertEqual(IdeaFolderLayout.note("See ![x](<Attachments/a b.png>)", title: "Plan", attachments: ["a b.png", "spec.pdf"]),
+                       "See ![x](<Attachments/a b.png>)\n\n[spec](<Attachments/spec.pdf>)\n")
     }
 
     func testCaptureNeverCollides() throws {

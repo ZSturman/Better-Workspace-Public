@@ -6,7 +6,7 @@ public enum MobileBrowseGroup: String, CaseIterable, Identifiable, Codable {
     public var title: String { self == .none ? "None" : rawValue.capitalized }
 }
 public enum MobileBrowseSort: String, CaseIterable, Identifiable, Codable {
-    case recommended, score, dateAdded, modified, name
+    case recommended, score, dateAdded, modified, name, domain, status
     public var id: String { rawValue }
     public var title: String {
         switch self {
@@ -15,6 +15,8 @@ public enum MobileBrowseSort: String, CaseIterable, Identifiable, Codable {
         case .dateAdded: "Date added"
         case .modified: "Last updated"
         case .name: "Name"
+        case .domain: "Domain"
+        case .status: "Status"
         }
     }
 }
@@ -34,17 +36,24 @@ public struct MobileBrowseQuery: Codable, Equatable {
     public var potential = ""
     public var status = ""
     public var phase = ""
+    public var projectType: String?
+    public var featured: Bool?
     public init() {}
 
     public func ideas(_ values: [MobileIdea]) -> [MobileBrowseSection<MobileIdea>] {
         let filtered = values.filter { idea in
             let metadata = idea.planning?.project?.metadata
             return (search.isEmpty || [idea.title, idea.description ?? ""].contains { $0.localizedCaseInsensitiveContains(search) })
-                && (domain.isEmpty || metadata?.domain == domain)
+                && matchesProperty(domain, metadata?.domain)
                 && (potential.isEmpty || (idea.planning?.potential?.rawValue ?? "unclassified") == potential)
-                && (status.isEmpty || metadata?.status == status) && (phase.isEmpty || metadata?.phase == phase)
+                && matchesProperty(status, metadata?.status) && matchesProperty(phase, metadata?.phase)
         }.sorted { lhs, rhs in
             if sort == .recommended { return IdeaRanking.comesFirst(lhs, rhs) }
+            if sort == .domain || sort == .status {
+                let a = ProjectProperties.queryRecord(id: lhs.id, name: lhs.title, metadata: lhs.planning?.project?.metadata ?? .init(), portfolio: .init())
+                let b = ProjectProperties.queryRecord(id: rhs.id, name: rhs.title, metadata: rhs.planning?.project?.metadata ?? .init(), portfolio: .init())
+                return ProjectViewQuery.orderedBefore(a, b, sorts: [.init(field: sort.rawValue, ascending: ascending)])
+            }
             return compare(lhs, rhs, name: { $0.title }, number: { $0.planning?.score(preferences: $0.scoringPreferences ?? .init()).projectScore },
                 date: { sort == .dateAdded ? $0.createdAt : $0.modifiedAt })
         }
@@ -62,10 +71,17 @@ public struct MobileBrowseQuery: Codable, Equatable {
         let filtered = values.filter { entry in
             let details = entry.projectDetails
             return entry.isDirectory && (search.isEmpty || entry.name.localizedCaseInsensitiveContains(search))
-                && (domain.isEmpty || details?.domain == domain) && (status.isEmpty || details?.status == status)
-                && (phase.isEmpty || details?.phase == phase)
+                && matchesProperty(domain, details?.domain) && matchesProperty(status, details?.status)
+                && matchesProperty(phase, details?.phase)
+                && (projectType == nil || ProjectProperties.types(details?.projectType).contains { TagMatching.equivalent($0, projectType!) })
+                && (featured == nil || (details?.editablePortfolio.featured ?? false) == featured)
         }.sorted { lhs, rhs in
-            compare(lhs, rhs, name: { $0.name }, number: { $0.projectDetails?.rankingScore },
+            if sort == .domain || sort == .status {
+                let a = ProjectProperties.queryRecord(id: lhs.id, name: lhs.name, metadata: .init(domain: lhs.projectDetails?.domain, status: lhs.projectDetails?.status), portfolio: .init())
+                let b = ProjectProperties.queryRecord(id: rhs.id, name: rhs.name, metadata: .init(domain: rhs.projectDetails?.domain, status: rhs.projectDetails?.status), portfolio: .init())
+                return ProjectViewQuery.orderedBefore(a, b, sorts: [.init(field: sort.rawValue, ascending: ascending)])
+            }
+            return compare(lhs, rhs, name: { $0.name }, number: { $0.projectDetails?.rankingScore },
                 date: { sort == .dateAdded ? $0.projectDetails?.createdAt : $0.modifiedAt })
         }
         return sections(filtered) { entry in
@@ -76,6 +92,9 @@ public struct MobileBrowseQuery: Codable, Equatable {
             default: ""
             }
         }
+    }
+    private func matchesProperty(_ selected: String, _ value: String?) -> Bool {
+        selected.isEmpty || ProjectPropertyFilter(field: "", values: [selected]).matches([value.flatMap { $0.isEmpty ? nil : $0 } ?? "Not set"])
     }
     private func sections<Item: Identifiable>(_ items: [Item], key: (Item) -> String) -> [MobileBrowseSection<Item>] {
         let grouped = Dictionary(grouping: items, by: key)

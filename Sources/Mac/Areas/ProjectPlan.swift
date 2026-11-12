@@ -98,7 +98,8 @@ extension AppModel {
 
     private func planEntry(_ item: WorkItem) -> ProjectPlanEntry {
         let id = ProjectGraph.normalizedID
-        let detail = item.isOpen ? [item.stage.displayName, item.priority == .medium ? nil : "\(item.priority.rawValue.capitalized) priority"]
+        let detail = item.isOpen ? [item.stage.displayName, item.priority == .medium ? nil : "\(item.priority.rawValue.capitalized) priority",
+                                    item.responsibilityLabel.map { "For \($0)" }]
             .compactMap { $0 }.joined(separator: " · ") : ""
         return ProjectPlanEntry(
             origin: .work(item), id: item.id, title: item.title, kind: item.kind, isDone: !item.isOpen,

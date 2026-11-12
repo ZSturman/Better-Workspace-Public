@@ -72,3 +72,19 @@ final class ProjectRecordProfileTests: XCTestCase {
         XCTAssertEqual(ProjectEntityKind.tasks.singular, "Task")
     }
 }
+
+
+extension ProjectRecordProfileTests {
+    func testProjectPromotesFlagsEmptyClassificationsAndCustomURLFields() {
+        let project = source("project", .projects, [
+            "Name": ["id": "title", "type": "title"],
+            "domain": ["id": "d", "type": "select", "select": ["options": []]],
+            "Type": ["id": "t", "type": "multi_select", "multi_select": ["options": []]],
+            "Featured": ["id": "f", "type": "checkbox"], "In Showcase": ["id": "s", "type": "checkbox"],
+            "Public": ["id": "p", "type": "checkbox"], "Repo Link": ["id": "r", "type": "url"],
+            "Custom portfolio": ["id": "c", "type": "url"]])
+        let profile = ProjectRecordProfile.make(kind: .projects, source: project, sources: [project])
+        XCTAssertEqual(Set(profile.essentials.map(\.name)), ["domain", "Type", "Featured", "In Showcase", "Public", "Repo Link", "Custom portfolio"])
+        XCTAssertTrue(profile.advanced.isEmpty)
+    }
+}

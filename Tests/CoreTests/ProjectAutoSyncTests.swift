@@ -105,7 +105,11 @@ final class ProjectAutoSyncTests: XCTestCase {
     ]
     private var store: ProjectGraphStore!
     private var client: NotionClient!
-    private var source: ProjectGraphSource { ProjectGraphSource(id: "tasks", title: "Tasks", kind: .tasks, schema: ProjectJSON(schema)) }
+    /// The fixture's one data source; its kind decides what a pass may receive.
+    private var sourceKind: ProjectEntityKind = .tasks
+    private var source: ProjectGraphSource { ProjectGraphSource(id: "tasks", title: "Tasks", kind: sourceKind, schema: ProjectJSON(schema)) }
+    private func use(_ kind: ProjectEntityKind) throws { sourceKind = kind; try store.write("sources", [source]) }
+    private func setPolicy(_ policy: ProjectSyncTriage.Policy) throws { try store.write(ProjectSyncTriage.Policy.key, policy) }
 
     override func setUpWithError() throws {
         FakeNotion.reset(schema)
@@ -116,6 +120,95 @@ final class ProjectAutoSyncTests: XCTestCase {
     }
 
     // MARK: Fixture helpers
+
+    func testWorkspaceWinsUndatedConflictAndSecondPassIsQuiet() async throws {
+        try use(.projects)
+        try setPolicy(.init(receiveNotionChanges: true, preferWorkspaceChanges: true))
+        let record = try synced("p1", title: "Project", details: "Before")
+        try localEdit(record, "Details", ProjectServiceBridge.text("Workspace"), at: nil)
+        notionEdit("p1", "Details", rich("Notion"))
+        let report = try await run()
+        XCTAssertEqual(notionValue("p1", "Details"), "Workspace")
+        XCTAssertEqual(report.sent.count, 1)
+        XCTAssertTrue(report.failed.isEmpty)
+        let count = writes.count
+        let second = try await run()
+        XCTAssertEqual(writes.count, count)
+        XCTAssertTrue(second.sent.isEmpty)
+    }
+
+    func testNewerNotionConflictIsReceivedForPrivateProjectMetadata() async throws {
+        try use(.projects)
+        try setPolicy(.init(receiveNotionChanges: true, preferWorkspaceChanges: true))
+        let record = try synced("p1", title: "Project", details: "Before")
+        try localEdit(record, "Details", ProjectServiceBridge.text("Workspace"), at: .distantPast)
+        notionEdit("p1", "Details", rich("Newer Notion"))
+        let report = try await run()
+        XCTAssertEqual(try localValue(record, "Details"), "Newer Notion")
+        XCTAssertEqual(report.received.count, 1)
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testNewerWorkspaceConflictSendsAutomatically() async throws {
+        try use(.projects)
+        try setPolicy(.init(receiveNotionChanges: true, preferWorkspaceChanges: true))
+        let record = try synced("p1", title: "Project", details: "Before")
+        try localEdit(record, "Details", ProjectServiceBridge.text("Latest Workspace"), at: .distantFuture)
+        notionEdit("p1", "Details", rich("Notion"))
+        let report = try await run()
+        XCTAssertEqual(notionValue("p1", "Details"), "Latest Workspace")
+        XCTAssertEqual(report.sent.count, 1)
+    }
+
+    func testUnrelatedNewerPageTimestampDoesNotDiscardOutgoingWorkspaceEdit() async throws {
+        try use(.projects)
+        try setPolicy(.init(receiveNotionChanges: true, preferWorkspaceChanges: true))
+        let record = try synced("p1", title: "Project", details: "Kept in Notion")
+        try localEdit(record, "Details", ProjectServiceBridge.text("Older Workspace"), at: .distantPast)
+        let report = try await run()
+        XCTAssertEqual(try localValue(record, "Details"), "Older Workspace")
+        XCTAssertEqual(notionValue("p1", "Details"), "Older Workspace")
+        XCTAssertEqual(report.sent.count, 1, "Notion did not change this field; its page timestamp cannot date an unrelated field")
+    }
+
+    func testStaleAutomaticReceiveRetainsWorkspaceValueAndBaseline() async throws {
+        try use(.projects)
+        let policy = ProjectSyncTriage.Policy(receiveNotionChanges: true, preferWorkspaceChanges: true)
+        try setPolicy(policy)
+        let record = try synced("p1", title: "Project", details: "Before")
+        try localEdit(record, "Details", ProjectServiceBridge.text("Workspace"), at: .distantPast)
+        notionEdit("p1", "Details", rich("Notion at planning"))
+        _ = try await NotionProjectSync(store: store, client: client).check(seeds: [.projects: "tasks"])
+        let before = try XCTUnwrap(store.record(id: record.id))
+        let items = ProjectSyncTriage.items(records: [before], sources: [source], policy: policy)
+        notionEdit("p1", "Details", rich("Changed again after planning"))
+        let report = try await ProjectAutoSync(store: store, client: client).apply(items)
+        let after = try XCTUnwrap(store.record(id: record.id))
+        XCTAssertEqual(after.local, before.local)
+        XCTAssertEqual(after.baseline, before.baseline)
+        XCTAssertEqual(report.failed.count, 1)
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testStaleMixedRecordRetainsBothLocalDraftsAndBaseline() async throws {
+        try use(.projects)
+        let policy = ProjectSyncTriage.Policy(receiveNotionChanges: true, preferWorkspaceChanges: true)
+        try setPolicy(policy)
+        let record = try synced("p1", title: "Project", details: "Before")
+        try localEdit(record, "Details", ProjectServiceBridge.text("Workspace draft"), at: .distantPast)
+        try localEdit(record, "Task", ProjectServiceBridge.text("Workspace title"), at: .distantFuture)
+        notionEdit("p1", "Details", rich("Notion at planning"))
+        _ = try await NotionProjectSync(store: store, client: client).check(seeds: [.projects: "tasks"])
+        let before = try XCTUnwrap(store.record(id: record.id))
+        let items = ProjectSyncTriage.items(records: [before], sources: [source], policy: policy)
+        notionEdit("p1", "Details", rich("Changed again after planning"))
+        let report = try await ProjectAutoSync(store: store, client: client).apply(items)
+        let after = try XCTUnwrap(store.record(id: record.id))
+        XCTAssertEqual(after.local, before.local)
+        XCTAssertEqual(after.baseline, before.baseline)
+        XCTAssertEqual(report.failed.count, 1)
+        XCTAssertTrue(writes.isEmpty)
+    }
 
     private func rich(_ text: String, type: String = "rich_text") -> [String: Any] {
         ["type": type, type: text.isEmpty ? [] : [["type": "text", "text": ["content": text], "plain_text": text]]]
@@ -148,7 +241,7 @@ final class ProjectAutoSyncTests: XCTestCase {
         try store.save(current)
     }
     private func run(at now: Date = Date()) async throws -> ProjectAutoSync.Report {
-        try await ProjectAutoSync(store: store, client: client, fileExists: { _ in true }).run(seeds: [.tasks: "tasks"], now: now)
+        try await ProjectAutoSync(store: store, client: client, fileExists: { _ in true }).run(seeds: [sourceKind: "tasks"], now: now)
     }
     private func notionValue(_ id: String, _ name: String) -> String {
         FakeNotion.with { server in ProjectJSON((server.pages[id]!["properties"] as! [String: Any])[name]!).display }
@@ -160,17 +253,50 @@ final class ProjectAutoSyncTests: XCTestCase {
 
     // MARK: Two-way
 
-    func testNotionEditsAreReceivedAndLocalEditsSent() async throws {
+    func testNotionEditsWaitForReviewAndLinkedLocalEditsAreSent() async throws {
         let first = try synced("p1", title: "Wire the buzzer", details: "before")
         let second = try synced("p2", title: "Calibrate")
         notionEdit("p1", "Details", rich("changed in Notion"))
         try localEdit(second, "Task", ProjectJSON([["type": "text", "text": ["content": "Calibrate the sensor"]]]))
         let report = try await run()
-        XCTAssertEqual(try localValue(first, "Details"), "changed in Notion")
+        XCTAssertEqual(try localValue(first, "Details"), "before")
         XCTAssertEqual(notionValue("p2", "Task"), "Calibrate the sensor")
-        XCTAssertEqual(Set(report.received), [first.id]); XCTAssertEqual(Set(report.sent), [second.id])
+        XCTAssertTrue(report.received.isEmpty); XCTAssertEqual(Set(report.sent), [second.id]); XCTAssertEqual(report.attention, 1)
         XCTAssertEqual(writes, ["PATCH pages/p2"], "Only the record edited here is written")
-        XCTAssertTrue(try ProjectSyncTriage.items(records: store.records(), sources: [source]).isEmpty, "Everything is in step afterwards")
+        XCTAssertEqual(try ProjectSyncTriage.items(records: store.records(), sources: [source]).map(\.id), [first.id], "Notion's changes remain available for a reviewed Get")
+    }
+
+    func testIncomingFieldCannotBeAcceptedBySendingAnotherField() async throws {
+        let record = try synced("mixed", title: "Base", details: "Local original")
+        notionEdit("mixed", "Details", rich("Needs confirmation"))
+        try localEdit(record, "Task", ProjectJSON([["type": "text", "text": ["content": "Local title"]]]))
+        let report = try await run()
+        XCTAssertEqual(try localValue(record, "Details"), "Local original")
+        XCTAssertEqual(try localValue(record, "Task"), "Local title")
+        XCTAssertTrue(report.received.isEmpty); XCTAssertTrue(writes.isEmpty)
+        XCTAssertEqual(report.attention, 1)
+    }
+
+    func testFinderProjectMoveQueuesOnlyLocationTitleAndIdeaStatus() throws {
+        var schema = self.schema
+        schema["Local Directory"] = ["id": "directory", "type": "rich_text", "rich_text": [:]]
+        schema["Status"] = ["id": "status", "type": "select", "select": ["options": [["name": "Plan"], ["name": "Idea"]]]]
+        let source = ProjectGraphSource(id: "projects", title: "Projects", kind: .projects, schema: ProjectJSON(schema))
+        var record = ProjectGraphRecord(pageID: "linked-project", sourceID: source.id, kind: .projects)
+        record.localProjectID = "stable-project"; record.localPath = "/Workspace/Projects/Before"
+        record.set("Task", value: ProjectServiceBridge.text("Before"), source: source)
+        record.set("Details", value: ProjectServiceBridge.text("Retain unrelated draft"), source: source)
+        try store.save(record)
+        try store.reflectFinderProjectLocation(projectID: "stable-project", path: "/Workspace/Ideas/After", title: "After", renamed: true, isIdea: true, source: source)
+        let updated = try XCTUnwrap(store.record(id: record.id))
+        XCTAssertEqual(updated.pageID, record.pageID); XCTAssertEqual(updated.localProjectID, record.localProjectID)
+        XCTAssertEqual(updated.localPath, "/Workspace/Ideas/After")
+        XCTAssertEqual(updated.value("Task", source: source).display, "After")
+        XCTAssertEqual(updated.value("Status", source: source).display, "Idea")
+        XCTAssertEqual(updated.value("Local Directory", source: source).display, "/Workspace/Ideas/After")
+        XCTAssertEqual(updated.local["details"], record.local["details"])
+        XCTAssertEqual(updated.remote, record.remote); XCTAssertEqual(updated.baseline, record.baseline)
+        XCTAssertTrue(writes.isEmpty)
     }
 
     func testARunWithNothingChangedWritesNothing() async throws {
@@ -179,13 +305,13 @@ final class ProjectAutoSyncTests: XCTestCase {
         XCTAssertTrue(writes.isEmpty)
     }
 
-    func testANewRecordIsCreatedOnceAcrossRepeatedRuns() async throws {
+    func testANewRecordWaitsForReviewedCreationAcrossRepeatedRuns() async throws {
         var draft = ProjectGraphRecord(sourceID: "tasks", kind: .tasks)
         draft.set("Task", value: ProjectJSON([["type": "text", "text": ["content": "Made here"]]]), source: source)
         try store.save(draft)
         _ = try await run(); _ = try await run(); _ = try await run()
-        XCTAssertEqual(writes.filter { $0 == "POST pages" }.count, 1)
-        XCTAssertNotNil(try store.record(id: draft.id)?.pageID)
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertNil(try store.record(id: draft.id)?.pageID)
     }
 
     // MARK: Never silently
@@ -234,14 +360,191 @@ final class ProjectAutoSyncTests: XCTestCase {
         XCTAssertNotEqual(try store.record(id: record.id)?.acknowledgedArchived, true, "Not accepted on its own")
     }
 
-    func testEqualSpellingsSettleWithoutWritingEitherSide() async throws {
+    func testEqualSpellingsSettleHereWithoutWritingNotion() async throws {
         let record = try synced("p1", title: "Case", status: "Done")
         notionEdit("p1", "Status", select("Plan"))
         try localEdit(record, "Status", ProjectJSON(["name": "plan"]), at: nil)
-        _ = try await run()
-        XCTAssertTrue(writes.isEmpty)
-        XCTAssertEqual(try localValue(record, "Status"), "Plan")
+        let report = try await run()
+        XCTAssertTrue(writes.isEmpty, "Notion keeps its spelling; nothing is sent")
+        XCTAssertEqual(report.settled, 1); XCTAssertEqual(report.attention, 0)
+        XCTAssertEqual(try localValue(record, "Status"), "Plan", "This Mac takes Notion's canonical spelling")
         XCTAssertTrue(try ProjectSyncTriage.items(records: store.records(), sources: [source]).isEmpty)
+        _ = try await run()
+        XCTAssertTrue(writes.isEmpty, "A settled difference does not come back")
+    }
+
+    // MARK: October 27 backlog: routine changes are not decisions
+
+    func testAnEmptySeededFieldKeepsNotionsValueWithoutAsking() async throws {
+        let record = try synced("p1", title: "Seeded", details: "Notion's text")
+        try localEdit(record, "Details", ProjectJSON([]), at: nil)
+        let item = try item(record)
+        XCTAssertEqual(item.fields.first?.recommended, .notion)
+        XCTAssertEqual(item.bucket, .automatic)
+        let report = try await run()
+        XCTAssertTrue(writes.isEmpty, "An empty value seeded here never erases Notion's")
+        XCTAssertEqual(report.settled, 1); XCTAssertEqual(report.attention, 0)
+        XCTAssertEqual(try localValue(record, "Details"), "Notion's text")
+    }
+
+    func testAReviewedUseNotionStillReceivesSoLocalEffectsRun() async throws {
+        let record = try synced("p1", title: "Task", status: "Plan")
+        notionEdit("p1", "Status", select("Done"))
+        try store.ingest(pages: [ProjectJSON(FakeNotion.with { $0.pages["p1"]! })], source: source)
+        let report = try await ProjectAutoSync(store: store, client: client, fileExists: { _ in true })
+            .apply([try item(record)], choices: [record.id: ["status": .notion]])
+        XCTAssertEqual(report.received, [record.id], "Reported as received, so the caller rewrites the task's file")
+        XCTAssertNil(report.settled)
+    }
+
+    func testAnAutomaticSettleNeverPullsEvenWithAHiddenNotionField() async throws {
+        let record = try synced("p1", title: "Case", status: "Done")
+        notionEdit("p1", "Status", select("Plan"))
+        notionEdit("p1", "Score", ["type": "formula", "formula": ["type": "number", "number": 7]])
+        try localEdit(record, "Status", ProjectJSON(["name": "plan"]), at: nil)
+        let report = try await run()
+        XCTAssertEqual(report.settled, 1)
+        XCTAssertTrue(report.received.isEmpty, "A task's file is never rewritten by a background settle")
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testAnUnreadableHealthRecordNeverFailsAPass() async throws {
+        let record = try synced("p1", title: "Healthy", details: "a")
+        try store.write(ProjectSyncHealth.key, ["not": "health"])
+        try localEdit(record, "Details", ProjectJSON([["type": "text", "text": ["content": "b"]]]))
+        let report = try await run()
+        XCTAssertEqual(report.sent, [record.id])
+        XCTAssertNotNil(try store.read(ProjectSyncHealth.key, as: ProjectSyncHealth.self), "Started afresh")
+    }
+
+    func testAMovedProjectWithANewNotionLinkSyncsBothWaysOnlyUnderThePolicy() async throws {
+        try use(.projects)
+        let record = try synced("p1", title: "Welch Labs Clone", details: "before")
+        notionEdit("p1", "Details", rich("new work-log link"))
+        try localEdit(record, "Status", ProjectJSON(["name": "Done"]))
+        let manual = try await run()
+        XCTAssertEqual(manual.attention, 1, "Receiving is off: the incoming value waits")
+        XCTAssertTrue(writes.isEmpty)
+        try setPolicy(.init(receiveNotionChanges: true))
+        _ = try await run(at: Date().addingTimeInterval(120)); _ = try await run(at: Date().addingTimeInterval(240))
+        XCTAssertEqual(notionValue("p1", "Status"), "Done", "This Mac's dated edit was sent")
+        XCTAssertEqual(try localValue(record, "Details"), "new work-log link", "Notion's routine value was taken")
+        XCTAssertTrue(try ProjectSyncTriage.items(records: store.records(), sources: [source]).isEmpty)
+    }
+
+    func testServiceOwnedWorkLogsAreNotReceivedRoutinely() async throws {
+        try use(.workLogs)
+        try setPolicy(.init(receiveNotionChanges: true))
+        var record = try synced("w1", title: "Better Workspace · 2026-10-12", details: "before")
+        record.serviceRecordID = "day-12"; try store.save(record)
+        notionEdit("w1", "Details", rich("edited in Notion"))
+        let report = try await run()
+        XCTAssertTrue(report.received.isEmpty)
+        XCTAssertEqual(try localValue(record, "Details"), "before")
+    }
+
+    func testAFileInBackupsNeverUpdatesNotionOnItsOwn() async throws {
+        var record = try synced("p1", title: "Backed up", details: "live")
+        record.localPath = "/Workspace/Backups/To-Do-pre-simplification/Backed up.bw.md"; try store.save(record)
+        try localEdit(record, "Details", ProjectJSON([["type": "text", "text": ["content": "from the copy"]]]))
+        try setPolicy(.init(heldPaths: ["/Workspace/Backups/"]))
+        let item = try XCTUnwrap(ProjectSyncTriage.items(records: store.records(), sources: [source], policy: .init(heldPaths: ["/Workspace/Backups/"])).first)
+        XCTAssertEqual(item.bucket, .decision); XCTAssertTrue(item.reason.hasPrefix("In Backups"))
+        let report = try await run()
+        XCTAssertTrue(writes.isEmpty, "A snapshot copy does not overwrite the live page")
+        XCTAssertEqual(report.attention, 1)
+        XCTAssertFalse(ProjectSyncTriage.Policy(heldPaths: ["/Workspace/Backups/"]).holds("/Workspace/BackupsOld/x.bw.md"))
+    }
+
+    func testAnIntentionalClearHereIsStillSent() async throws {
+        let record = try synced("p1", title: "Cleared", details: "old text")
+        try localEdit(record, "Details", ProjectJSON([]))
+        _ = try await run()
+        XCTAssertEqual(notionValue("p1", "Details"), "", "A dated clear made here is the person's edit")
+    }
+
+    func testRoutineNotionChangeWaitsAsOneReceiveUntilThePolicyAllowsIt() async throws {
+        try use(.workLogs)
+        let record = try synced("w1", title: "Session", details: "before")
+        notionEdit("w1", "Details", rich("written by the work-log writer"))
+        let manual = try await run()
+        XCTAssertTrue(manual.received.isEmpty); XCTAssertEqual(manual.attention, 0, "A one-sided Notion change is not a decision")
+        XCTAssertEqual(manual.receivable, 1)
+        XCTAssertEqual(try localValue(record, "Details"), "before")
+        try setPolicy(.init(receiveNotionChanges: true))
+        let automatic = try await run()
+        XCTAssertEqual(automatic.received, [record.id]); XCTAssertEqual(automatic.attention, 0)
+        XCTAssertEqual(try localValue(record, "Details"), "written by the work-log writer")
+        XCTAssertTrue(writes.isEmpty, "Receiving never writes Notion")
+        XCTAssertTrue(try ProjectSyncTriage.items(records: store.records(), sources: [source]).isEmpty)
+    }
+
+    func testNewNotionWorkLogsAreAcceptedOnlyUnderThePolicy() async throws {
+        try use(.workLogs)
+        FakeNotion.with { $0.pages["new"] = ["id": "new", "in_trash": false, "last_edited_time": "2027-01-15T00:00:00.000Z",
+                                             "properties": ["Task": ["id": "title", "type": "title", "title": [["type": "text", "text": ["content": "Daily Work Session"], "plain_text": "Daily Work Session"]]]]] }
+        let manual = try await run()
+        XCTAssertEqual(manual.receivable, 1); XCTAssertEqual(manual.attention, 0)
+        try setPolicy(.init(receiveNotionChanges: true))
+        let automatic = try await run()
+        XCTAssertEqual(automatic.received.count, 1)
+        XCTAssertTrue(try ProjectSyncTriage.items(records: store.records(), sources: [source]).isEmpty)
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testAutomaticReceivingNeverTakesConflictsOrFileBackedRecords() async throws {
+        try setPolicy(.init(receiveNotionChanges: true))
+        // Tasks rewrite .bw.md files when received: a reviewed Get stays required.
+        let task = try synced("t1", title: "Task", details: "before")
+        notionEdit("t1", "Details", rich("changed in Notion"))
+        let report = try await run()
+        XCTAssertTrue(report.received.isEmpty); XCTAssertEqual(report.attention, 1)
+        XCTAssertEqual(try localValue(task, "Details"), "before")
+        // A conflict on a receivable kind still waits, with both versions intact.
+        try use(.workLogs)
+        let log = try synced("w1", title: "Log", details: "base")
+        notionEdit("w1", "Details", rich("notion version"))
+        try localEdit(log, "Details", ProjectJSON([["type": "text", "text": ["content": "local version"]]]), at: nil)
+        let conflict = try await run()
+        XCTAssertFalse(conflict.received.contains(log.id))
+        XCTAssertEqual(try localValue(log, "Details"), "local version"); XCTAssertEqual(notionValue("w1", "Details"), "notion version")
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testAOneSidedNotionLinkChangeIsTakenNotMerged() throws {
+        try use(.projects)
+        var record = ProjectGraphRecord(pageID: "p", sourceID: "tasks", kind: .projects)
+        let links = { (ids: [String]) in ProjectJSON(["type": "relation", "relation": ids.map { ["id": $0] }]) }
+        record.local = ["links": links(["a", "b"])]; record.baseline = record.local; record.remote = ["links": links(["a"])]
+        try store.save(record)
+        let field = try XCTUnwrap(item(record).fields.first)
+        XCTAssertEqual(field.state, .incoming)
+        XCTAssertEqual(field.recommended, .notion, "A union would bring back the link Notion removed")
+        XCTAssertEqual(field.bucket, .automatic)
+        XCTAssertTrue(ProjectAutoSyncPlanner.receivesRoutinely(try item(record)))
+    }
+
+    func testServiceDraftsStayWithTheServiceUnlessOffered() throws {
+        try use(.workLogs)
+        var draft = ProjectGraphRecord(sourceID: "tasks", kind: .workLogs); draft.serviceRecordID = "day-1"
+        draft.set("Task", value: ProjectServiceBridge.text("Better Workspace · 2026-10-27"), source: source, changedAt: nil)
+        try store.save(draft)
+        let kept = try item(draft)
+        XCTAssertEqual(kept.category, .serviceRecord); XCTAssertEqual(kept.bucket, .obsolete)
+        XCTAssertTrue(ProjectAutoSyncPlanner.plan([kept], deferred: [:], failures: [:]).attention.isEmpty)
+        let offered = try XCTUnwrap(ProjectSyncTriage.items(records: store.records(), sources: [source], policy: .init(offerServiceRecords: true)).first)
+        XCTAssertEqual(offered.bucket, .decision, "Offered records still need a person to send them")
+    }
+
+    func testAServiceRecalculationOfASentLogDoesNotAskUnlessOffered() throws {
+        try use(.workLogs)
+        var record = try synced("w1", title: "Better Workspace · 2026-10-12", details: "246 changes")
+        record.serviceRecordID = "day-12"; try store.save(record)
+        try localEdit(record, "Details", ProjectServiceBridge.text("126 changes"), at: nil)
+        XCTAssertEqual(try item(record).bucket, .obsolete)
+        let offered = try XCTUnwrap(ProjectSyncTriage.items(records: store.records(), sources: [source], policy: .init(offerServiceRecords: true)).first)
+        XCTAssertEqual(offered.category, .serviceRecord); XCTAssertEqual(offered.bucket, .decision)
+        XCTAssertEqual(try localValue(record, "Details"), "126 changes", "The recalculation is kept here either way")
     }
 
     func testDeferredDifferenceIsSkippedUntilItChanges() async throws {
@@ -294,6 +597,13 @@ final class ProjectAutoSyncTests: XCTestCase {
         XCTAssertEqual(notionValue("p1", "Details"), "written offline")
     }
 
+    func testAFailureForARecordThatNoLongerDiffersIsForgotten() async throws {
+        try synced("p1", title: "Settled elsewhere")
+        try store.write(ProjectAutoSync.failuresKey, ["gone": ProjectAutoSyncPlanner.Failure(attempts: 2, nextAttempt: .distantPast, message: "stale")])
+        _ = try await run()
+        XCTAssertEqual(try store.read(ProjectAutoSync.failuresKey, as: [String: ProjectAutoSyncPlanner.Failure].self), [:])
+    }
+
     func testRepeatedFailuresAskForAttention() {
         let record = ProjectGraphRecord(pageID: "p", sourceID: "tasks", kind: .tasks)
         let item = ProjectSyncTriage.Item(record: record, category: .localEdit, bucket: .automatic, fields: [], projectIDs: [], reason: "")
@@ -304,7 +614,7 @@ final class ProjectAutoSyncTests: XCTestCase {
 
     // MARK: Large backlogs and what never moves on its own
 
-    func testALargeBacklogOfNotionRecordsIsReceivedInOneBatch() async throws {
+    func testALargeNotionBacklogIsDetectedWithoutApplyingIt() async throws {
         FakeNotion.with { server in
             for index in 0..<300 {
                 server.pages["n\(index)"] = ["id": "n\(index)", "in_trash": false, "last_edited_time": "2027-01-15T00:00:00.000Z",
@@ -312,7 +622,8 @@ final class ProjectAutoSyncTests: XCTestCase {
             }
         }
         let report = try await run()
-        XCTAssertEqual(report.received.count, 300)
+        XCTAssertTrue(report.received.isEmpty)
+        XCTAssertEqual(report.attention, 300)
         XCTAssertLessThan(FakeNotion.with { $0.requests.count }, 20, "One query per read, not one request per page")
         XCTAssertTrue(writes.isEmpty)
     }

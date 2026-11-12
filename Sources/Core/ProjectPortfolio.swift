@@ -47,6 +47,9 @@ public enum ProjectPortfolio {
         if let dueDate = action.dueDate {
             factors.append("Due \(dueDate.formatted(date: .abbreviated, time: .omitted))")
         }
+        if let score = winner.score?.projectScore {
+            factors.append("Your project score \(Int(score.rounded())) · \(winner.score?.answeredCount ?? 0) ratings")
+        } else { factors.append("Project not manually scored") }
         if let score = doNextScore(winner.score, preferences: preferences) {
             factors.append("Do Next score \(Int(score.rounded()))")
         } else {
@@ -58,7 +61,7 @@ public enum ProjectPortfolio {
             factors.append("Ready Now score unavailable (no readiness rating)")
         }
         return Recommendation(candidate: winner,
-                              explanation: "Ordered by stage → local portfolio priority → work-item priority → due date → Do Next → Ready Now → name.",
+                              explanation: "Ordered by stage → local portfolio priority → work-item priority → due date → manual project score → Do Next → Ready Now → name.",
                               factors: factors)
     }
 
@@ -110,6 +113,9 @@ public enum ProjectPortfolio {
             case (nil, _?): return false
             default: break
             }
+            let aManual = lhs.score?.projectScore ?? -.infinity
+            let bManual = rhs.score?.projectScore ?? -.infinity
+            if aManual != bManual { return aManual > bManual }
             let aScore = doNextScore(lhs.score, preferences: preferences) ?? -.infinity
             let bScore = doNextScore(rhs.score, preferences: preferences) ?? -.infinity
             if aScore != bScore { return aScore > bScore }

@@ -91,12 +91,14 @@ private struct QuickCaptureWidgetView: View {
             }
             .accessibilityLabel("New capture")
             .widgetURL(CaptureLink.capture)
+            .containerBackground(.clear, for: .widget)
         case .accessoryRectangular:
             VStack(alignment: .leading, spacing: 2) {
                 Label("Capture", systemImage: "square.and.pencil").font(.headline)
                 Text(statusLine).font(.caption)
             }
             .widgetURL(CaptureLink.capture)
+            .containerBackground(.clear, for: .widget)
         case .systemMedium:
             medium
         default:

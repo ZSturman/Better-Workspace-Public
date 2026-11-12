@@ -26,6 +26,10 @@ final class UXWalkthroughTests: IsolatedUITestCase {
         workspaceRoot.appendingPathComponent(name, isDirectory: true)
     }
 
+    /// The header's skipped count, not the skipped item's own "UXWalk Skipped …" title.
+    private static let skippedNotice = NSPredicate(format:
+        "(label CONTAINS[c] 'skipped' OR value CONTAINS[c] 'skipped') AND NOT (label CONTAINS 'UXWalk' OR value CONTAINS 'UXWalk')")
+
     private static func names(in area: String) -> [String] {
         (try? FileManager.default.contentsOfDirectory(atPath: Self.area(area).path)) ?? []
     }
@@ -111,7 +115,8 @@ final class UXWalkthroughTests: IsolatedUITestCase {
         XCTAssertEqual(ideasAfter.count, ideasBefore + 1, "Filing should add exactly one Idea")
         let landedIdea = ideasAfter.first { $0.hasPrefix("UXWalk Idea") }
         XCTAssertNotNil(landedIdea, "The filed note must exist in the isolated Workspace/Ideas")
-        XCTAssertEqual(landedIdea, "\(ideaTitle).md", "Filename on disk must match what the UI showed")
+        XCTAssertEqual(landedIdea, ideaTitle, "Folder name on disk must match what the UI showed")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: Self.workspaceRoot.appendingPathComponent("Ideas/\(ideaTitle)/\(ideaTitle).md").path))
         print("UX FILED IDEA -> \(landedIdea ?? "nil")")
 
         // ---- A second item into a different destination ----
@@ -138,7 +143,7 @@ final class UXWalkthroughTests: IsolatedUITestCase {
         // (An earlier version asserted "Un-skip" is on screen, which only held when the
         // queue had exactly one item. The fixture deliberately includes another item.)
         XCTAssertTrue(app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS[c] 'skipped' OR value CONTAINS[c] 'skipped'")).firstMatch.waitForExistence(timeout: 10),
+            Self.skippedNotice).firstMatch.waitForExistence(timeout: 10),
             "The header should report how many items are skipped")
 
         let skippedChip = app.descendants(matching: .any)
@@ -152,7 +157,7 @@ final class UXWalkthroughTests: IsolatedUITestCase {
 
         app.buttons["Un-skip"].firstMatch.click()
         XCTAssertTrue(app.buttons["Skip"].firstMatch.waitForExistence(timeout: 10))
-        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'skipped' OR value CONTAINS[c] 'skipped'")).firstMatch.exists)
+        XCTAssertFalse(app.staticTexts.matching(Self.skippedNotice).firstMatch.exists)
         app.buttons["Skip"].firstMatch.click()
 
         // ---- Every discovered area ----

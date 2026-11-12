@@ -36,32 +36,45 @@ enum PlatformCaptureBackend {
             if let tag = existing ?? model.createTag(named: entity.name), tags.contains(tag) == false { tags.append(tag) }
         }
 
-        var entries: [CaptureDraftEntry] = []
-        if let note = CaptureDraftEntry.note(id: UUID(), title: request.title ?? "", markdown: request.text ?? "",
-                                             url: request.link ?? "") {
-            entries.append(note)
-        }
-        for file in request.files {
+        let note = CaptureDraftEntry.note(title: request.title ?? "", markdown: request.text ?? "", url: request.link ?? "")
+        let attachments = request.files.enumerated().map { index, file in
             let base = (file.filename as NSString).deletingPathExtension
-            let named = entries.isEmpty ? (request.title ?? "") : ""
-            entries.append(CaptureDraftEntry(title: named.isEmpty ? base : named,
-                                             content: .data(file.data, extension: (file.filename as NSString).pathExtension)))
+            let named = note == nil && index == 0 ? (request.title ?? "") : ""
+            return CaptureDraftEntry(title: named.isEmpty ? base : named,
+                                     content: .data(file.data, extension: (file.filename as NSString).pathExtension))
         }
-        guard entries.isEmpty == false else { throw CaptureIntentError.nothingToCapture }
+        guard note != nil || !attachments.isEmpty else { throw CaptureIntentError.nothingToCapture }
 
         let service = model.ingest
+        if request.asIdea || destination?.name == WorkspaceArea.ideas.directoryName {
+            let title = request.title ?? ""
+            let item = try await Task.detached(priority: .userInitiated) {
+                try service.captureIdea(title: title, note: note, attachments: attachments)
+            }.value
+            do {
+                let filed = try await model.fileAsIdea(item, tagIDs: Set(tags.map(\.id)))
+                CaptureSaveNotifications.ideaSaved(title: item.title, originalKept: filed.originalKept)
+                await model.refreshIngest()
+                await model.refresh(area: .ideas)
+                model.noteFiled(into: WorkspaceArea.ideas.directoryName)
+                return filed.originalKept ? "Saved to Ideas. The original copy is still in the Inbox."
+                    : RecentCaptureHistory.savedMessage(count: 1, destinationName: WorkspaceArea.ideas.directoryName)
+            } catch {
+                await model.refreshIngest()
+                throw error
+            }
+        }
+        let entries = (note.map { [$0] } ?? []) + attachments
         var count = 0
         for entry in entries {
             let item = try await Task.detached(priority: .userInitiated) { try service.capture(entry) }.value
-            if let destination, model.isWorkQueue(destination), request.asIdea == false {
+            if let destination, model.isWorkQueue(destination) {
                 _ = try await model.promoteCapture(item, toQueue: destination, tagIDs: Set(tags.map(\.id)))
                 count += 1
                 continue
             }
             for tag in tags { model.tagStore.assign(tagID: tag.id, to: item.url, area: nil) }
-            if request.asIdea {
-                try model.fileAsIdea(item, tagIDs: Set(tags.map(\.id)))
-            } else if let destination {
+            if let destination {
                 _ = try await Task.detached(priority: .userInitiated) {
                     let unique = CaptureNaming.uniqueURL(in: destination.url,
                         base: item.url.deletingPathExtension().lastPathComponent, extension: item.url.pathExtension)
@@ -76,9 +89,7 @@ enum PlatformCaptureBackend {
             model.noteFiled(into: destination.name)
             await model.refresh(areaNamed: destination.name)
         }
-        if request.asIdea { await model.refresh(area: .ideas) }
-        let place = request.asIdea ? WorkspaceArea.ideas.directoryName : destination?.name
-        return RecentCaptureHistory.savedMessage(count: count, destinationName: place)
+        return RecentCaptureHistory.savedMessage(count: count, destinationName: destination?.name)
     }
 
     static func clipboardRequest() async -> CaptureIntentRequest? {

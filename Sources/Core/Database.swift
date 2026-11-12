@@ -132,6 +132,42 @@ public final class Database: @unchecked Sendable {
 
     deinit { if let handle { sqlite3_close_v2(handle) } }
 
+    // MARK: - Derived-value caches
+
+    /// Identifies the committed contents this connection can see. It changes when this
+    /// connection writes anything (`total_changes`) or another connection commits
+    /// (`data_version`), so an equal stamp means no table has changed since.
+    ///
+    /// A rollback does not move `total_changes`, so rows read inside an open transaction
+    /// may never have existed: such a stamp is `provisional` and must not be cached.
+    public struct ChangeStamp: Equatable, Sendable {
+        let local: Int64
+        let external: Int64
+        public let provisional: Bool
+    }
+
+    public func changeStamp() throws -> ChangeStamp {
+        lock.lock(); defer { lock.unlock() }
+        let external = try query("PRAGMA data_version") { $0.int(0) }.first ?? 0
+        return ChangeStamp(local: sqlite3_total_changes64(handle), external: external,
+                           provisional: sqlite3_get_autocommit(handle) == 0)
+    }
+
+    /// Values decoded from this connection's rows, shared by every store object made over
+    /// it. Each owner keeps one slot and validates it against `changeStamp()` and the
+    /// rows themselves; nothing here is a second source of truth.
+    public final class Memo: @unchecked Sendable {
+        private let lock = NSLock()
+        private var slots: [String: AnyObject] = [:]
+        public func slot<T: AnyObject>(_ key: String, make: () -> T) -> T {
+            lock.lock(); defer { lock.unlock() }
+            if let existing = slots[key] as? T { return existing }
+            let created = make(); slots[key] = created
+            return created
+        }
+    }
+    public let memo = Memo()
+
     // MARK: - Schema
 
     private func migrate() throws {
@@ -410,6 +446,12 @@ public final class Database: @unchecked Sendable {
         public func optionalString(_ i: Int32) -> String? {
             guard sqlite3_column_type(statement, i) != SQLITE_NULL else { return nil }
             return string(i)
+        }
+        /// The column's bytes, without building a `String` (text is UTF-8 here).
+        public func data(_ i: Int32) -> Data {
+            // SQLite's documented order: the pointer first, then its length.
+            guard let bytes = sqlite3_column_blob(statement, i) else { return Data() }
+            return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, i)))
         }
         public func int(_ i: Int32) -> Int64 { sqlite3_column_int64(statement, i) }
         public func double(_ i: Int32) -> Double { sqlite3_column_double(statement, i) }

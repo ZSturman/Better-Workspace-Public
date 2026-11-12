@@ -19,6 +19,11 @@ public struct ProjectGraphSnapshot: Sendable {
     public let syncReport: ProjectAutoSync.Report?
     public let actionReport: ProjectAutoSync.Report?
     public let lastChangesReport: ProjectAutoSync.Report?
+    public let policy: ProjectSyncTriage.Policy
+    public let health: ProjectSyncHealth?
+    /// Equal for two snapshots of identical stored content from the same store, so a
+    /// reader can skip republishing (and every view keyed on the graph rebuilding).
+    public internal(set) var contentID = 0
 
     init(records allRecords: [ProjectGraphRecord], state: [String: String]) throws {
         func read<T: Decodable>(_ key: String, _ type: T.Type) throws -> T? {
@@ -46,7 +51,10 @@ public struct ProjectGraphSnapshot: Sendable {
         }
         incomingIDs = incoming; outgoingIDs = outgoing
         report = try read("report", ProjectSyncReport.self)
-        triage = ProjectSyncTriage.items(records: records, sources: sources)
+        policy = try read(ProjectSyncTriage.Policy.key, ProjectSyncTriage.Policy.self) ?? .init()
+        // Diagnosis only: an unreadable record must never stop the graph from loading.
+        health = (try? read(ProjectSyncHealth.key, ProjectSyncHealth.self)) ?? nil
+        triage = ProjectSyncTriage.items(records: records, sources: sources, policy: policy)
         deferred = try read(ProjectAutoSync.deferredKey, [String: String].self) ?? [:]
         failures = try read(ProjectAutoSync.failuresKey, [String: ProjectAutoSyncPlanner.Failure].self) ?? [:]
         syncReport = try read(ProjectAutoSync.reportKey, ProjectAutoSync.Report.self)

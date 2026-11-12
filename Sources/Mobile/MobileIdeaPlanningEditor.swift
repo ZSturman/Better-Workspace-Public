@@ -6,6 +6,8 @@ struct MobileIdeaPlanningEditor: View {
     @Environment(\.dismiss) private var dismiss
     let idea: MobileIdea
     @State private var planning = IdeaPlanning()
+    /// The revision the draft was loaded from; `idea` follows refreshes while this is open.
+    @State private var original: MobileIdea?
     @State private var zen: Bool
     init(idea: MobileIdea, zenMode: Bool = false) { self.idea = idea; _zen = State(initialValue: zenMode) }
     var body: some View {
@@ -27,11 +29,11 @@ struct MobileIdeaPlanningEditor: View {
                     Button("Save") {
                         var value = planning; value.needsSetup = false
                         if value.potential == .project && value.project == nil { value.project = .init(oneLiner: idea.description ?? "") }
-                        var original = idea; original.previews = nil
-                        if model.savePlanning(MobilePlanningEdit(operation: .saveIdeaPlanning, title: idea.title, originalIdea: original, ideaPlanning: value)) { dismiss() }
+                        var baseline = original ?? idea; baseline.previews = nil
+                        if model.savePlanning(MobilePlanningEdit(operation: .saveIdeaPlanning, title: idea.title, originalIdea: baseline, ideaPlanning: value)) { dismiss() }
                     }.disabled(idea.serviceID == nil).accessibilityIdentifier("idea.planning.save")
                 }
-            }.onAppear { planning = idea.planning ?? IdeaPlanning() }
+            }.onAppear { original = idea; planning = idea.planning ?? IdeaPlanning() }
         }
     }
 }

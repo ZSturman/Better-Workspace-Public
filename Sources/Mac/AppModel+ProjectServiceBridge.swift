@@ -23,9 +23,14 @@ extension AppModel {
             }
             var records = storedRecords
             let localProjects = projectStore.allRecords()
-            func initial(_ kind: ProjectEntityKind, id: String, pageID: String?, source: ProjectGraphSource) -> ProjectGraphRecord {
+            // A record the service already linked to Notion (or one already here) is kept
+            // current. A new Notion draft is made only when the person asked for service
+            // records in Notion: otherwise every observed day became a review item, and a
+            // discarded draft came back on the next refresh.
+            let offers = syncPolicy.offerServiceRecords
+            func initial(_ kind: ProjectEntityKind, id: String, pageID: String?, source: ProjectGraphSource) -> ProjectGraphRecord? {
                 records.first { $0.kind == kind && ($0.serviceRecordID == id || (pageID != nil && $0.pageID.map(ProjectGraph.normalizedID) == pageID.map(ProjectGraph.normalizedID))) }
-                    ?? .init(id: "service:\(kind.rawValue):\(id)", pageID: pageID, sourceID: source.id, kind: kind)
+                    ?? (offers || pageID != nil ? .init(id: "service:\(kind.rawValue):\(id)", pageID: pageID, sourceID: source.id, kind: kind) : nil)
             }
             func save(_ record: ProjectGraphRecord) throws {
                 if records.first(where: { $0.id == record.id }) != record { try store.save(record); records.removeAll { $0.id == record.id }; records.append(record) }
@@ -45,16 +50,18 @@ extension AppModel {
                     }
                     // Do not discard unresolved service project associations.
                     if linked.count == idea.relatedProjects.count { values["projects"] = ProjectJSON(linked.map { ["id": $0] }) }
-                    try save(ProjectServiceBridge.applying(values, serviceID: idea.id, to: initial(.ideas, id: idea.id, pageID: idea.notionPageID, source: source), source: source))
+                    guard let record = initial(.ideas, id: idea.id, pageID: idea.notionPageID, source: source) else { continue }
+                    try save(ProjectServiceBridge.applying(values, serviceID: idea.id, to: record, source: source))
                 }
             }
             if let source = graphSources.first(where: { $0.kind == .workLogs }) {
                 for log in workLogs {
+                    guard let record = initial(.workLogs, id: log.id, pageID: log.notionPageID, source: source) else { continue }
                     var values: [String: ProjectJSON] = ["entry": ProjectServiceBridge.text("\(log.projectName) · \(log.dateKey)"),
                         "date": ProjectJSON(["start": String(log.dateKey.prefix(10))]), "active seconds": .number(log.activeMinutes * 60),
                         "sessions_count": .number(Double(log.sessionCount)), "progress_summary": ProjectServiceBridge.text(log.summary)]
                     if let projectID = log.projectID, let local = localProjects.first(where: { $0.watcherID == projectID }), let project = graphProjectsByLocalID[local.id] { values["project"] = ProjectJSON([["id": project.pageID ?? project.id]]) }
-                    try save(ProjectServiceBridge.applying(values, serviceID: log.id, to: initial(.workLogs, id: log.id, pageID: log.notionPageID, source: source), source: source))
+                    try save(ProjectServiceBridge.applying(values, serviceID: log.id, to: record, source: source))
                 }
             }
             if graphRecords != records { reloadProjectGraph() }

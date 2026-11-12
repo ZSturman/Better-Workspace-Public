@@ -20,6 +20,7 @@ struct ProjectSyncReviewView: View {
     private var visible: [ProjectSyncReviewPlan.Entry] {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
         return review.plan.entries.filter { entry in
+            !model.syncApplyingIDs.contains(entry.id) &&
             (type == "all" || entry.record.kind.rawValue == type) &&
             (project == "all" || (project == "unassigned" ? entry.projectIDs.isEmpty : entry.projectIDs.contains(project))) &&
             (query.isEmpty || ([entry.record.title, entry.record.kind.title] + entry.projectNames).contains { $0.localizedCaseInsensitiveContains(query) })
@@ -293,7 +294,7 @@ struct NotionProjectIntegrationView: View {
                 Toggle("Check for changes in the background every 15 minutes", isOn: $background)
                     .font(.caption)
             }
-            Button("Open Sync Center") { model.showingSyncCenter = true }
+            NotionSyncControls()
             DisclosureGroup("Sources and import results") {
                 ForEach(model.graphSources) { source in
                     HStack { Text(source.title); Spacer(); Text("\(model.graphReport?.counts[source.title] ?? 0) records").foregroundStyle(.secondary) }

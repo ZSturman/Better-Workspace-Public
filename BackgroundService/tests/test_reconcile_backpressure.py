@@ -128,6 +128,7 @@ def test_changes_that_can_alter_the_index_still_reconcile(tmp_path):
     runtime = _runtime(tmp_path)
     runtime._reconcile("startup")  # learns that [[Ideas]] is an intent folder
     reasons = _counting(runtime)
+    runtime._FILESYSTEM_RECONCILE_COOLDOWN = 0  # This test isolates the event filter.
     runtime.coalescer.has_queued_work = lambda: False
 
     runtime._on_settled(_settled("Somewhere/[[Later]]", is_directory=True))
@@ -143,6 +144,48 @@ def test_changes_that_can_alter_the_index_still_reconcile(tmp_path):
     runtime._on_settled(_settled("Foo/[[Drafts]]", kind="moved", is_directory=True, prev_path="node_modules/[[Drafts]]"))
 
     assert len(reasons) == 9
+
+
+def test_busy_workspace_defers_full_walks_without_losing_the_trailing_reconcile(tmp_path, monkeypatch):
+    (tmp_path / "Projects/Foo").mkdir(parents=True)
+    runtime = _runtime(tmp_path)
+    reasons = _counting(runtime)
+    runtime.coalescer.has_queued_work = lambda: False
+    now = 100.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+
+    runtime._on_settled(_settled("Projects/Foo/First", is_directory=True))
+    now += 1
+    runtime._on_settled(_settled("Projects/Foo/Second", is_directory=True))
+    runtime._tick_once()
+    assert reasons == ["filesystem:created"]
+    assert runtime._reconcile_pending == "filesystem:created"
+
+    now += runtime._FILESYSTEM_RECONCILE_MIN_COOLDOWN
+    runtime._tick_once()
+    assert reasons == ["filesystem:created", "filesystem:created"]
+    assert runtime._reconcile_pending is None
+
+
+def test_reconcile_cooldown_scales_with_the_cost_of_the_walk(tmp_path, monkeypatch):
+    runtime = _runtime(tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    def slow_walk(reason):
+        clock[0] += 4.0  # a four-second full walk
+    runtime._reconcile = slow_walk
+    runtime._reconcile_pending = "filesystem:created"
+    runtime._run_pending_reconcile()
+    assert runtime._next_filesystem_reconcile == 104.0 + 20.0
+
+    def huge_walk(reason):
+        clock[0] += 30.0
+    runtime._reconcile = huge_walk
+    clock[0] = runtime._next_filesystem_reconcile
+    runtime._reconcile_pending = "filesystem:created"
+    runtime._run_pending_reconcile()
+    assert runtime._next_filesystem_reconcile == clock[0] + runtime._FILESYSTEM_RECONCILE_COOLDOWN
 
 
 def test_restating_an_unchanged_state_writes_nothing(tmp_path):

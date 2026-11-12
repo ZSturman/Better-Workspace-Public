@@ -35,6 +35,11 @@ public struct WorkItemActionMetadata: Codable, Hashable, Sendable {
     public var isAgentReady: Bool { delegation != "USER" && agentExecutability > 0 && !agentSubtasks.isEmpty && blockedBy.isEmpty }
     public var needsUser: Bool { delegation != "AGENT" && !userSubtasks.isEmpty }
     public var legacyPriority: WorkItemPriority { priority == "P3" ? .low : priority == "P2" ? .medium : .high }
+    /// Who does the work, in the words people use: Me (needs the person), Agent (can be
+    /// delegated to a coding agent) or Either.
+    public var responsibilityLabel: String? {
+        switch delegation { case "USER": return "Me"; case "AGENT": return "Agent"; case "USER + AGENT": return "Either"; default: return nil }
+    }
 }
 
 extension WorkItem {
@@ -57,6 +62,7 @@ extension WorkItem {
         }
     }
     public var actionPriorityLabel: String { actionMetadata?.priority ?? priority.rawValue.capitalized }
+    public var responsibilityLabel: String? { actionMetadata?.responsibilityLabel }
 }
 
 public struct ProjectAuditAssessment: Codable, Hashable, Sendable {
@@ -137,8 +143,8 @@ public enum MobileActionProjection {
 }
 
 extension WorkItemRecommendation {
-    public static func nextMobileAction(in items: [MobileWorkItem], allItems: [MobileWorkItem]? = nil, audience: WorkActionAudience = .all, projectScores: [String: Double] = [:]) -> MobileWorkItem? {
-        let selected = nextAction(in: items.map(portableForRecommendation), allItems: (allItems ?? items).map(portableForRecommendation), audience: audience, projectScores: projectScores)
+    public static func nextMobileAction(in items: [MobileWorkItem], allItems: [MobileWorkItem]? = nil, audience: WorkActionAudience = .all, projectScores: [String: Double] = [:], projectPriorities: [String: Int] = [:]) -> MobileWorkItem? {
+        let selected = nextAction(in: items.map(portableForRecommendation), allItems: (allItems ?? items).map(portableForRecommendation), audience: audience, projectScores: projectScores, projectPriorities: projectPriorities)
         return items.first { $0.id == selected?.id }
     }
 

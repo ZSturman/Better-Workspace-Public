@@ -156,18 +156,36 @@ final class ShareCaptureModel {
         guard saving == false, isEmpty == false else { return }
         saving = true
         defer { saving = false }
-        guard let inbox = await Self.inbox() else {
-            error = "iCloud Drive is not available to Better Workspace. Open the app to finish setting up the Inbox."
-            return
-        }
         var entries: [CaptureDraftEntry] = []
         if let note = CaptureDraftEntry.note(id: UUID(), title: title, markdown: text, url: link) { entries.append(note) }
         for file in files {
             entries.append(CaptureDraftEntry(title: entries.isEmpty && title.isEmpty == false ? title : file.name,
                                              content: .data(file.data, extension: file.ext)))
         }
-        let service = MobileCaptureService(inbox: inbox)
-        let result = await Task.detached(priority: .userInitiated) { service.capture(entries) }.value
+        if asIdea && queue.supportsCloudIdeas {
+            let queue = self.queue
+            let title = self.title
+            let allTagIDs = tagIDs.union(queue.tags(named: newTagNames).map(\.id))
+            do {
+                _ = try await Task.detached(priority: .userInitiated) {
+                    try queue.saveIdea(entries, title: title, tagIDs: allTagIDs)
+                }.value
+            } catch {
+                self.error = error.localizedDescription
+                return
+            }
+            savedMessage = "Idea saved. Waiting for Mac sync."
+            await flush()
+            finish()
+            return
+        }
+        guard let inbox = await Self.inbox() else {
+            error = "iCloud Drive is not available to Better Workspace. Open the app to finish setting up the Inbox."
+            return
+        }
+        let service = MobileCaptureService(inbox: inbox), together = asIdea, title = title
+        // An idea keeps its note and files together; other shares stay separate items.
+        let result = await Task.detached(priority: .userInitiated) { together ? service.captureTogether(entries, title: title) : service.capture(entries) }.value
         guard result.saved.isEmpty == false else {
             error = result.failures.first?.message ?? "Nothing could be saved."
             return
@@ -178,6 +196,14 @@ final class ShareCaptureModel {
         for saved in result.saved {
             queue.record(savedURL: saved.url, destination: destination, kind: kind, tagIDs: allTagIDs)
         }
+        await flush()
+        savedMessage = MobileCaptureQueue.savedMessage(count: result.saved.count, destination: destination, kind: kind)
+        error = result.failures.isEmpty ? nil : result.failures.map(\.message).joined(separator: "\n")
+        try? await Task.sleep(for: .milliseconds(700))
+        finish()
+    }
+
+    private func flush() async {
         // Best effort, bounded: the share sheet should close promptly.
         let queue = self.queue
         await withTaskGroup(of: Void.self) { group in
@@ -186,10 +212,6 @@ final class ShareCaptureModel {
             await group.next()
             group.cancelAll()
         }
-        savedMessage = MobileCaptureQueue.savedMessage(count: result.saved.count, destination: destination, kind: kind)
-        error = result.failures.isEmpty ? nil : result.failures.map(\.message).joined(separator: "\n")
-        try? await Task.sleep(for: .milliseconds(700))
-        finish()
     }
 
     private static func inbox() async -> URL? {

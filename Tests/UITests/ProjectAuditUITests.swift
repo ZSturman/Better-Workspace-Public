@@ -22,6 +22,7 @@ final class ProjectAuditUITests: IsolatedUITestCase {
         app.launch(); requireWindow(app)
         let row = app.staticTexts.matching(NSPredicate(format: "value == %@", "Fixture project")).firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 10)); row.doubleClick()
+        showProjectTasks(app)
         XCTAssertTrue(app.descendants(matching: .any)["projects.nextAction"].firstMatch.waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts["WORKSPACE AUDIT"].firstMatch.exists)
         let scroll = app.scrollViews.matching(NSPredicate(format: "identifier == %@", "projects.plan")).firstMatch

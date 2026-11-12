@@ -21,10 +21,19 @@ final class MobileWorkspaceUITests: XCTestCase {
 
     func testMobileFirstDestinationsRemainReachableOffline() {
         let app = launchOffline()
-        for area in ["Overview", "Projects", "Work", "Ideas", "Ingest"] {
+        // Since October 23 Projects and Work share Planning, beside Workspace.
+        for area in ["Overview", "Workspace", "Planning", "Ideas", "Ingest"] {
             let destination = app.workspaceDestination(area)
             XCTAssertTrue(destination.exists, "Missing \(area) destination")
             destination.tap()
+            // A first launch offers the Workspace welcome; it covers the tab bar.
+            if area == "Workspace", app.buttons["unified.welcome.local"].waitForExistence(timeout: 3) {
+                app.buttons["unified.welcome.local"].tap()
+            }
+        }
+        for view in ["Projects", "Work"] {
+            app.openPlanning(view)
+            XCTAssertTrue(app.navigationBars[view].waitForExistence(timeout: 10), "Planning shows \(view)")
         }
         XCTAssertFalse(app.buttons["Library"].exists)
     }

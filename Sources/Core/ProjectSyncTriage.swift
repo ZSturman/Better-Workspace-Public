@@ -8,6 +8,36 @@ import Foundation
 /// from older metadata at first import carry neither. Nothing here writes; it only says
 /// what each difference is and what would resolve it. See docs/NOTION_SYNC.md.
 public enum ProjectSyncTriage {
+    /// The person's explicit choices about what may move without them. Stored in the
+    /// graph state (`ProjectSyncPolicy.key`) so automatic passes and the Sync Center agree.
+    public struct Policy: Codable, Sendable, Equatable {
+        public static let key = "syncPolicy"
+        /// Take one-sided Notion changes on existing records (and new Notion records that
+        /// never create a local file) in automatic passes. Off unless the person turns it on.
+        public var receiveNotionChanges = false
+        /// Owner policy: newest known edit wins; tied/unknown times prefer Workspace.
+        public var preferWorkspaceChanges = false
+        /// Offer ideas and daily work logs observed by the background service as Notion
+        /// drafts. Off: they stay with the service, which keeps them; nothing is lost.
+        public var offerServiceRecords = false
+        /// Folders (canonical paths ending in "/") whose files never update Notion on their
+        /// own: the Workspace's Backups area holds snapshots, and a copy there must not
+        /// overwrite a live page (October 29: four backed-up tasks were about to).
+        public var heldPaths: [String] = []
+        public init(receiveNotionChanges: Bool = false, offerServiceRecords: Bool = false, heldPaths: [String] = [], preferWorkspaceChanges: Bool = false) {
+            self.receiveNotionChanges = receiveNotionChanges; self.offerServiceRecords = offerServiceRecords; self.heldPaths = heldPaths
+            self.preferWorkspaceChanges = preferWorkspaceChanges
+        }
+        public func holds(_ path: String) -> Bool { heldPaths.contains { path.hasPrefix($0) } }
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            receiveNotionChanges = try container.decodeIfPresent(Bool.self, forKey: .receiveNotionChanges) ?? false
+            preferWorkspaceChanges = try container.decodeIfPresent(Bool.self, forKey: .preferWorkspaceChanges) ?? false
+            offerServiceRecords = try container.decodeIfPresent(Bool.self, forKey: .offerServiceRecords) ?? false
+            heldPaths = try container.decodeIfPresent([String].self, forKey: .heldPaths) ?? []
+        }
+    }
+
     public enum Bucket: Int, Comparable, CaseIterable, Codable, Sendable {
         /// Can sync without asking: one side changed, or the change is clearly the person's own.
         case automatic
@@ -138,7 +168,7 @@ public enum ProjectSyncTriage {
 
     public static func isEmpty(_ value: ProjectJSON) -> Bool { value.comparable == .null }
 
-    static func field(_ change: ProjectFieldChange, record: ProjectGraphRecord, source: ProjectGraphSource, unavailableReferences: Set<String> = []) -> FieldDiff {
+    static func field(_ change: ProjectFieldChange, record: ProjectGraphRecord, source: ProjectGraphSource, unavailableReferences: Set<String> = [], policy: Policy = .init()) -> FieldDiff {
         let name = source.name(for: change.id)
         let references = (change.local["relation"].array + change.remote["relation"].array).compactMap { $0["id"].string }.map(ProjectGraph.normalizedID)
         let blocked = references.contains(where: unavailableReferences.contains) ? "Includes archived or deleted links; review these in Notion." : nil
@@ -151,7 +181,22 @@ public enum ProjectSyncTriage {
                       newer: newer, recommended: recommended, bucket: bucket, note: note, mergeBlockedReason: blocked)
         }
         if let blocked, change.state != .equal && change.state != .incoming { return diff(.decision, nil, blocked) }
-        if blocked == nil, change.state != .equal, record.pageID != nil, (!record.baseline.isEmpty || !isEmpty(change.local)),
+        if policy.preferWorkspaceChanges, record.serviceRecordID == nil,
+           change.state == .conflict || change.state == .outgoing {
+            // Finder category is structural evidence, independent of a page timestamp.
+            if record.finderProjectAbsent == true, name == "Status" { return diff(.automatic, .local, "No longer in Projects; keep Idea status") }
+            // An empty undated import was never a Workspace edit.
+            if localAt == nil, isEmpty(change.local), change.state == .outgoing {
+                return diff(.automatic, .notion, "Nothing here to send; Notion keeps its value")
+            }
+            let winner: Side = change.state == .conflict ? (newer ?? .local) : .local
+            return diff(.automatic, winner, winner == .notion ? "Notion has the newer edit time" : "Workspace takes priority unless Notion changed this field more recently")
+        }
+        // A union only makes sense when this Mac's side differs from the last agreed
+        // value. A one-sided Notion change (a new work-log link) is simply Notion's, and a
+        // union there would bring back values Notion removed.
+        if blocked == nil, change.state == .conflict || change.state == .outgoing, record.pageID != nil,
+           (!record.baseline.isEmpty || !isEmpty(change.local)),
            mergedValue(local: change.local, notion: change.remote) != nil {
             return diff(.reconcilable, .merge, "Keep values from both sides")
         }
@@ -159,13 +204,18 @@ public enum ProjectSyncTriage {
         case .equal:
             return diff(.automatic, .notion)
         case .incoming:
-            // Notion changed and this Mac did not: take it.
+            // Recommend Notion for a reviewed Get; background passes never take it.
             return diff(.automatic, .notion)
         case .outgoing:
             if localAt != nil { return diff(.automatic, .local) }
             // No edit time: seeded from older metadata, not edited here.
             if isEmpty(change.remote) { return diff(.reconcilable, .local, "Notion has no value") }
             if equivalent(change.local, change.remote) { return diff(.automatic, .notion, "Same value, different spelling") }
+            // Seeded with nothing (a field this Mac never had). Sending it would erase
+            // Notion's value; keeping Notion's loses nothing. An intentional clear made
+            // here carries an edit time and is handled above.
+            if isEmpty(change.local) { return diff(.automatic, .notion, "Nothing here to send; Notion keeps its value") }
+            if record.serviceRecordID != nil { return diff(.decision, nil, "Recalculated by the background service after it was sent") }
             return diff(.decision, nil, "Would replace a Notion value with older metadata")
         case .conflict:
             if equivalent(change.local, change.remote) { return diff(.automatic, .notion, "Same value, different spelling") }
@@ -177,7 +227,8 @@ public enum ProjectSyncTriage {
     // MARK: Records
 
     public static func item(for record: ProjectGraphRecord, source: ProjectGraphSource, sources: [ProjectGraphSource],
-                            syncedTitles: Set<String>, fileExists: (String) -> Bool, unavailableReferences: Set<String> = []) -> Item? {
+                            syncedTitles: Set<String>, fileExists: (String) -> Bool, unavailableReferences: Set<String> = [],
+                            policy: Policy = Policy()) -> Item? {
         let changes = record.changes.filter { $0.state != .equal && source.writable($0.id) }
         let unaccepted = record.baseline.isEmpty && !record.remote.isEmpty
         let archiveChange = record.remoteArchived != (record.acknowledgedArchived ?? false)
@@ -185,14 +236,22 @@ public enum ProjectSyncTriage {
         let uploads = record.pendingUploads ?? []
         guard draft || unaccepted || archiveChange || record.archiveRequested || !uploads.isEmpty
                 || record.serviceAcknowledgementPending == true || !changes.isEmpty else { return nil }
-        let fields = changes.map { field($0, record: record, source: source, unavailableReferences: unavailableReferences) }
+        let fields = changes.map { field($0, record: record, source: source, unavailableReferences: unavailableReferences, policy: policy) }
         let projects = projectIDs(record, source: source, sources: sources)
+        let held = record.localPath.map(policy.holds) ?? false
         func make(_ category: Category, _ bucket: Bucket, _ reason: String) -> Item {
-            Item(record: record, category: category, bucket: bucket, fields: fields, projectIDs: projects, reason: reason)
+            // A snapshot copy never moves on its own; obsolete stays obsolete.
+            guard held, bucket != .obsolete else {
+                return Item(record: record, category: category, bucket: bucket, fields: fields, projectIDs: projects, reason: reason)
+            }
+            return Item(record: record, category: category, bucket: .decision, fields: fields, projectIDs: projects, reason: "In Backups, a snapshot copy. " + reason)
         }
         // A failed attempt keeps its own category; retrying and backing off is the
         // runner's job (`ProjectAutoSyncPlanner`). Only an ambiguous create needs a person.
         if record.ambiguousCreate { return make(.failed, .decision, "May already exist in Notion") }
+        if record.pageID != nil, record.finderProjectAbsent != true, let path = record.localPath, !fileExists(path) {
+            return make(.missingFile, .decision, "The local source is unavailable; its pending values are retained")
+        }
         if record.archiveRequested { return make(.archive, .decision, "Archive in Notion") }
         if archiveChange { return make(.archive, .decision, record.remoteArchived ? "Archived in Notion" : "Restored in Notion") }
         if draft {
@@ -202,12 +261,24 @@ public enum ProjectSyncTriage {
                 let bytes = uploads.reduce(0) { $0 + $1.byteCount }
                 return make(.upload, .decision, "Uploads \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))")
             }
-            if record.serviceRecordID != nil { return make(.serviceRecord, .decision, "Observed by the background service") }
+            if record.serviceRecordID != nil {
+                // Not a difference anyone made: the service keeps these itself. They are
+                // offered for Notion only when the person asked for that.
+                return policy.offerServiceRecords ? make(.serviceRecord, .decision, "Observed by the background service")
+                    : make(.serviceRecord, .obsolete, "Kept by the background service; not sent to Notion")
+            }
             if record.localFieldEditedAt?.isEmpty == false { return make(.newHere, .automatic, "Made here") }
             return make(.newHere, .decision, "Imported, never sent")
         }
         if !uploads.isEmpty { return make(.upload, .decision, "Uploads a file") }
         let bucket = fields.map(\.bucket).max() ?? .automatic
+        // A day the service recalculated after its log was sent. Notion still has what
+        // was sent; whether the new numbers replace it is the person's call, and only
+        // when they asked for service records in Notion at all.
+        if record.serviceRecordID != nil, !fields.isEmpty, fields.allSatisfy({ $0.state == .outgoing && record.localFieldEditedAt?[$0.id] == nil }) {
+            if !policy.offerServiceRecords { return make(.serviceRecord, .obsolete, "Recalculated by the background service; Notion keeps what was sent") }
+            if fields.contains(where: { $0.bucket == .decision }) { return make(.serviceRecord, .decision, "Recalculated by the background service after it was sent") }
+        }
         if unaccepted && !fields.contains(where: { $0.state == .conflict || $0.state == .outgoing }) {
             return make(.newInNotion, .automatic, "Not yet brought here")
         }
@@ -221,14 +292,14 @@ public enum ProjectSyncTriage {
         return make(.notionEdit, bucket, "Changed in Notion")
     }
 
-    public static func items(records: [ProjectGraphRecord], sources: [ProjectGraphSource],
+    public static func items(records: [ProjectGraphRecord], sources: [ProjectGraphSource], policy: Policy = Policy(),
                              fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> [Item] {
         let byID = Dictionary(sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let unavailable = Set(records.filter { $0.locallyDeleted == true || $0.remoteArchived }.flatMap { [$0.id, $0.pageID].compactMap { $0 }.map(ProjectGraph.normalizedID) })
         let live = records.filter { $0.locallyDeleted != true }
         let synced = Set(live.filter { $0.pageID != nil }.map(titleKey))
         return live.compactMap { record in
-            byID[record.sourceID].flatMap { item(for: record, source: $0, sources: sources, syncedTitles: synced, fileExists: fileExists, unavailableReferences: unavailable) }
+            byID[record.sourceID].flatMap { item(for: record, source: $0, sources: sources, syncedTitles: synced, fileExists: fileExists, unavailableReferences: unavailable, policy: policy) }
         }
     }
 
@@ -258,9 +329,12 @@ public enum ProjectSyncTriage {
 
 /// What automatic sync does on one pass, and what it leaves for a person.
 ///
-/// Only `.automatic` items move on their own. Conflicts settled by edit times
-/// (`.reconcilable`) are still conflicts, and wait for a person, as do deletions,
-/// uploads, background-service records and anything deferred or backing off.
+/// Ordinary outgoing `.automatic` edits on existing pages move on their own. Differences
+/// where Notion's value is kept anyway (equal spellings, nothing here) settle on this Mac
+/// without a request. Routine one-sided Notion changes are received automatically only
+/// when the person's policy says so; otherwise they wait as one action, not as decisions.
+/// New pages, conflicts, archives, uploads, missing files and service handoffs require
+/// review. Per-record deferral and retry backoff are retained.
 public enum ProjectAutoSyncPlanner {
     public struct Failure: Codable, Sendable, Equatable {
         public var attempts: Int
@@ -272,10 +346,15 @@ public enum ProjectAutoSyncPlanner {
     }
 
     public struct Plan: Sendable {
-        /// Take Notion's side (new in Notion, changed in Notion, equal spellings).
+        /// Receive Notion's side: routine changes, when the policy allows it.
         public var pull: [ProjectSyncTriage.Item] = []
         /// Send this Mac's side (made or edited here).
         public var push: [ProjectSyncTriage.Item] = []
+        /// Settled here alone: Notion's value is kept where this Mac's only differs in
+        /// spelling or is empty. No request and no file write.
+        public var settle: [ProjectSyncTriage.Item] = []
+        /// Routine Notion changes the policy leaves for the person to receive together.
+        public var receivable: [ProjectSyncTriage.Item] = []
         /// Automatic, but backing off after a failure.
         public var waiting: [ProjectSyncTriage.Item] = []
         /// Needs a person: decisions, reconcilable conflicts, repeated failures.
@@ -292,26 +371,83 @@ public enum ProjectAutoSyncPlanner {
         [60, 300, 1800, 7200][min(max(attempts - 1, 0), 3)]
     }
 
-    /// Ideas and work logs are written through the background service's handoff, which
-    /// is a person's decision; they are only ever received automatically.
+    /// Ideas and work logs use the service's separately authorized handoff; ordinary
+    /// automatic passes must not write them.
     static let receiveOnly: Set<ProjectEntityKind> = [.ideas, .workLogs]
 
+    /// Kinds whose received values change only this app's own records. Tasks, features
+    /// and milestones rewrite `.bw.md` files in the Workspace, and ideas hand values to
+    /// the background service; those keep a reviewed Get.
+    public static let receivableKinds: Set<ProjectEntityKind> = Set(ProjectEntityKind.allCases).subtracting([.tasks, .features, .milestones, .ideas])
+
+    /// Categories whose state is more than field values; never settled or received routinely.
+    static let structural: Set<ProjectSyncTriage.Category> = [.missingFile, .failed, .archive, .upload, .duplicate, .serviceRecord, .newHere]
+
+    static func plain(_ item: ProjectSyncTriage.Item) -> Bool {
+        let record = item.record
+        return record.pageID != nil && item.bucket == .automatic && !structural.contains(item.category)
+            && !record.archiveRequested && record.remoteArchived == (record.acknowledgedArchived ?? false)
+            && (record.pendingUploads ?? []).isEmpty && !record.ambiguousCreate && record.serviceAcknowledgementPending != true
+            && !item.fields.isEmpty
+    }
+
+    /// Every difference keeps Notion's value and none is incoming: nothing needs to move.
+    public static func settlesLocally(_ item: ProjectSyncTriage.Item) -> Bool {
+        plain(item) && item.fields.allSatisfy { $0.recommended == .notion && $0.state != .incoming && $0.state != .equal }
+    }
+
+    /// Only Notion moved (or a field settles to Notion's value), on a kind whose received
+    /// values touch no Workspace file. A new Notion project is excluded: linking it seeds
+    /// local metadata, which is what built the October 11 backlog.
+    public static func receivesRoutinely(_ item: ProjectSyncTriage.Item) -> Bool {
+        // Service-owned records (its ideas and daily logs) hand received values back to the
+        // service; that stays reviewed. Work logs from other writers have no service id.
+        guard plain(item), receivableKinds.contains(item.record.kind), item.record.serviceRecordID == nil,
+              item.fields.allSatisfy({ $0.recommended == .notion && $0.bucket == .automatic }),
+              item.fields.contains(where: { $0.state == .incoming }) else { return false }
+        return !(item.category == .newInNotion && item.record.kind == .projects)
+    }
+
     public static func plan(_ items: [ProjectSyncTriage.Item], deferred: [String: String],
-                            failures: [String: Failure], now: Date = Date()) -> Plan {
+                            failures: [String: Failure], policy: ProjectSyncTriage.Policy = .init(), now: Date = Date()) -> Plan {
         var plan = Plan()
         for item in items {
+            let priorityReceive = policy.preferWorkspaceChanges && item.fields.contains { $0.state == .conflict }
             if let fingerprint = deferred[item.id], fingerprint == item.fingerprint { plan.deferred.append(item); continue }
             if item.bucket == .obsolete { plan.obsolete.append(item); continue }
             if let failure = failures[item.id] {
                 if failure.attempts >= attemptsBeforeAttention { plan.attention.append(item); continue }
                 if failure.nextAttempt > now { plan.waiting.append(item); continue }
             }
-            guard item.bucket == .automatic else { plan.attention.append(item); continue }
+            if settlesLocally(item) && !priorityReceive { plan.settle.append(item); continue }
+            if policy.preferWorkspaceChanges, plain(item), receivableKinds.contains(item.record.kind), item.record.serviceRecordID == nil,
+               item.fields.allSatisfy({ $0.recommended == .notion }), priorityReceive {
+                if policy.receiveNotionChanges { plan.pull.append(item) } else { plan.receivable.append(item) }
+                continue
+            }
+            if receivesRoutinely(item) {
+                if policy.receiveNotionChanges { plan.pull.append(item) } else { plan.receivable.append(item) }
+                continue
+            }
+            // With receiving allowed, a record whose incoming values are routine and whose
+            // other differences are this Mac's own dated edits (a Finder move into Ideas,
+            // beside a new work-log link) syncs both ways; nothing in it needs a decision.
+            if policy.receiveNotionChanges, plain(item), receivableKinds.contains(item.record.kind), !receiveOnly.contains(item.record.kind),
+               item.record.serviceRecordID == nil,
+               item.fields.allSatisfy({ $0.bucket == .automatic && ($0.state == .incoming ? $0.recommended == .notion : ($0.recommended == .local || $0.recommended == .notion)) }),
+               item.fields.contains(where: { $0.state == .incoming }), item.fields.contains(where: { $0.recommended == .local }) {
+                plan.push.append(item); continue
+            }
+            // Other incoming values require a reviewed Get. Never accept them as a side
+            // effect of sending an unrelated local field on the same record.
+            guard item.record.pageID != nil,
+                  !item.fields.contains(where: { $0.state == .incoming }),
+                  item.bucket == .automatic else { plan.attention.append(item); continue }
             let sends = item.record.pageID == nil || item.fields.contains { $0.recommended == .local }
             if sends {
                 if receiveOnly.contains(item.record.kind) { plan.attention.append(item) } else { plan.push.append(item) }
             } else {
-                plan.pull.append(item)
+                plan.attention.append(item)
             }
         }
         return plan
@@ -321,7 +457,8 @@ public enum ProjectAutoSyncPlanner {
     /// spellings): settled locally before a pull or push, so neither side is rewritten.
     public static func localChoices(_ item: ProjectSyncTriage.Item) -> [String: ProjectSyncTriage.Side] {
         Dictionary(uniqueKeysWithValues: item.fields.compactMap { field in
-            field.recommended == .notion && field.state != .incoming && field.state != .equal ? (field.id, .notion) : nil
+            field.state == .conflict && field.recommended == .local ? (field.id, .local)
+                : field.recommended == .notion && field.state != .incoming && field.state != .equal ? (field.id, .notion) : nil
         })
     }
 }

@@ -18,9 +18,17 @@ final class MobileIdeaProjectMetadataUITests: XCTestCase {
     func testPotentialProjectMetadataSurvivesOfflineSaveWithKeyboardAndLandscape() {
         let app = launch(fresh: true)
         app.buttons["idea.planning.potential"].tap(); app.buttons["Potential Project"].tap()
-        let domain = app.textFields["idea.project.domain"]
+        // Domain is a choice menu (October 19): pick a saved value or add a new one.
+        let domain = app.buttons["idea.project.domain"]
         if !domain.isHittable { app.swipeUp() }
-        XCTAssertTrue(domain.waitForExistence(timeout: 10)); domain.tap(); domain.typeText("Technology")
+        XCTAssertTrue(domain.waitForExistence(timeout: 10)); domain.tap()
+        if app.buttons["Technology"].waitForExistence(timeout: 2) { app.buttons["Technology"].tap() } else {
+            app.buttons["Add new domain…"].tap()
+            let field = app.alerts.textFields.firstMatch
+            XCTAssertTrue(field.waitForExistence(timeout: 5)); field.typeText("Technology")
+            app.alerts.buttons["Add"].tap()
+        }
+        XCTAssertEqual(domain.value as? String, "Technology")
         let line = app.textFields["idea.project.oneLiner"]
         if !line.isHittable { app.swipeUp() }
         XCTAssertTrue(line.waitForExistence(timeout: 10)); line.tap(); line.typeText("A native planning tool")
@@ -32,7 +40,7 @@ final class MobileIdeaProjectMetadataUITests: XCTestCase {
         app.buttons["idea.planning.save"].tap(); app.terminate()
         XCUIDevice.shared.orientation = .portrait
         let reopened = launch(fresh: false)
-        let savedDomain = reopened.textFields["idea.project.domain"]
+        let savedDomain = reopened.buttons["idea.project.domain"]
         XCTAssertTrue(savedDomain.waitForExistence(timeout: 10)); XCTAssertEqual(savedDomain.value as? String, "Technology")
         let savedLine = reopened.textFields["idea.project.oneLiner"]
         if !savedLine.isHittable { reopened.swipeUp() }

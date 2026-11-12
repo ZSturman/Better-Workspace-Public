@@ -22,26 +22,31 @@ final class MobileOverviewUITests: XCTestCase {
 
     func testFocusAndReviewCardRenderInPortraitAndLandscape() {
         let app = launch(fresh: true)
+        XCTAssertTrue(app.navigationBars["Overview"].waitForExistence(timeout: 20))
+        // Next up and Needs Attention come first; the review and focus cards follow.
         let title = app.staticTexts["overview.toReview.title"]
-        XCTAssertTrue(title.waitForExistence(timeout: 20), "The Mac's published review item should be on Overview")
+        XCTAssertTrue(app.scrollTo(title), "The Mac's published review item should be on Overview")
         XCTAssertEqual(title.label, "Review the next screen.md")
         XCTAssertTrue(app.buttons["Studied?"].exists, "To Study's decision is named for its folder")
-        XCTAssertTrue(app.buttons.containing(NSPredicate(format: "identifier BEGINSWITH %@", "overview.focusItem.")).firstMatch
-            .waitForExistence(timeout: 10), "Bring forward should list the digest's almost-done project")
+        XCTAssertTrue(app.scrollTo(app.buttons.containing(NSPredicate(format: "identifier BEGINSWITH %@", "overview.focusItem.")).firstMatch),
+                      "Bring forward should list the digest's almost-done project")
         shoot("mobile-overview-portrait")
         XCUIDevice.shared.orientation = .landscapeLeft
         let landscape = NSPredicate { _, _ in app.windows.firstMatch.frame.width > app.windows.firstMatch.frame.height }
         // As in the composer test: a simulator can decline to rotate; the check below
         // still holds, and the screenshot says which orientation it shows.
         _ = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: landscape, object: nil)], timeout: 10)
-        XCTAssertTrue(app.buttons["overview.toReview.primary"].waitForExistence(timeout: 10))
+        let primary = app.buttons["overview.toReview.primary"]
+        if !primary.waitForExistence(timeout: 5) { for _ in 0..<8 where !primary.exists { app.swipeDown() } }
+        XCTAssertTrue(primary.exists || app.scrollTo(primary))
         shoot("mobile-overview-landscape")
     }
 
     func testDecisionWaitsForTheMacAndSurvivesRelaunch() {
         var app = launch(fresh: true)
+        XCTAssertTrue(app.navigationBars["Overview"].waitForExistence(timeout: 20))
         let later = app.buttons["overview.toReview.later"]
-        XCTAssertTrue(later.waitForExistence(timeout: 20))
+        XCTAssertTrue(app.scrollTo(later))
         later.tap()
         let pending = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Decision saved on this phone")).firstMatch
         XCTAssertTrue(pending.waitForExistence(timeout: 10), "The card should say the decision is waiting for the Mac")
@@ -51,7 +56,8 @@ final class MobileOverviewUITests: XCTestCase {
         app.terminate()
         app = launch(fresh: false)
         let restored = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Decision saved on this phone")).firstMatch
-        XCTAssertTrue(restored.waitForExistence(timeout: 20), "A pending decision must survive relaunch")
+        XCTAssertTrue(app.navigationBars["Overview"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.scrollTo(restored), "A pending decision must survive relaunch")
         XCTAssertFalse(app.staticTexts["overview.toReview.title"].exists)
     }
 }

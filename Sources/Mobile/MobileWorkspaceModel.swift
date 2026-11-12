@@ -38,6 +38,9 @@ final class MobileWorkspaceModel {
     static let refreshTimeout: TimeInterval = 180
     private var cleaningReceipts = false
     private(set) var planningDrafts: [MobilePlanningEdit] = []
+    /// Retained ledger history also exposes values settled by earlier app versions.
+    /// It is review-only and never replays an old edit automatically.
+    private(set) var planningHistory: [MobilePlanningEdit] = []
     var planningErrors: [String: String] = [:]
     var saveMessage: String?
     private var receiptCleanup: Set<UUID> = []
@@ -45,9 +48,9 @@ final class MobileWorkspaceModel {
     /// Drafts the Mac reports applied while the downloaded index still shows the record
     /// as it was. CloudKit queries lag behind writes, so dropping the draft on the receipt
     /// alone made a completed task flip back to open until a later refresh. The draft's
-    /// effect stays on screen until the index shows it, or for ten minutes at most.
+    /// effect stays on screen until the index actually shows it. Elapsed time is
+    /// never evidence that a person's saved values reached the Mac.
     private var appliedAt: [UUID: Date] = [:]
-    static let appliedDraftGrace: TimeInterval = 600
     private let widgetStore = WidgetSnapshotStore(appGroup: WidgetAppGroup.mobile)
     private let snapshotCache = MobileSnapshotCache(appGroup: WidgetAppGroup.mobile)
 
@@ -119,6 +122,7 @@ final class MobileWorkspaceModel {
         draftStore = MobilePlanningDraftStore(defaults: planningDefaults, ledger: widgetCommands)
         receiptCleanup = Set((planningDefaults.stringArray(forKey: "BWPlanningReceiptCleanup") ?? []).compactMap(UUID.init(uuidString:)))
         planningDrafts = draftStore.load()
+        planningHistory = ((try? widgetCommands?.records()) ?? []).filter { $0.settled && $0.edit?.operation == .saveProject }.compactMap(\.edit)
         planningErrors = planningDefaults.dictionary(forKey: "BWMobilePlanningErrors") as? [String: String] ?? [:]
         appliedAt = ((planningDefaults.dictionary(forKey: "BWPlanningAppliedAt") as? [String: Double]) ?? [:])
             .reduce(into: [:]) { result, pair in
@@ -139,7 +143,7 @@ final class MobileWorkspaceModel {
             snapshot = MobileWorkspaceSnapshot(
                 tags: [Tag(id: "test-tag", name: "Design", colorIndex: 1, createdAt: Date())],
                 entries: [MobileWorkspaceEntry(path: "Projects/Example", parentPath: "Projects", name: "Example", isDirectory: true, revision: 1, modifiedAt: Date(), projectDetails: MobileProjectDetails(path: "Projects/Example", oneLiner: "A clearer workspace", assessment: MobileParityFixture.assessment, projectID: "fixture-project", ratings: [:], scoringPreferences: ProjectScoringPreferences(), needsSetup: true,
-                        previews: [MobileFilePreview(path: "Projects/Example/README.md", name: "README.md", text: "Read-only project file preview.")])),
+                        previews: [MobileFilePreview(path: "Projects/Example/README.md", name: "README.md", text: "Read-only project file preview.")], history: MobileParityFixture.history)),
                     MobileWorkspaceEntry(path: "Ideas/Potential studio", parentPath: "Ideas", name: "Potential studio", isDirectory: true, revision: 1, modifiedAt: Date(timeIntervalSince1970: 1_700_000_000)),
                     MobileWorkspaceEntry(path: "Ideas/Example.md", parentPath: "Ideas", name: "Example.md", isDirectory: false, revision: 1, modifiedAt: Date())],
                 workItems: [MobileWorkItem(id: "test-work", path: "Projects/Example/Work/Next.bw.md", title: "Sketch the next screen", kind: .task,
@@ -197,6 +201,9 @@ final class MobileWorkspaceModel {
         #if DEBUG
         if UserDefaults.standard.bool(forKey: "BWTestMobilePlanning") { return }
         #endif
+        // Sending must not depend on successfully downloading the Mac's index.
+        // A failed/stalled read otherwise strands durable, unsent edits indefinitely.
+        Task { await flushOutbox() }
         if let inFlight = refreshTask { await inFlight.value; return }
         let task = Task { await performRefresh() }
         refreshTask = task
@@ -207,7 +214,9 @@ final class MobileWorkspaceModel {
     private func reloadSharedWidgetDrafts() {
         guard let widgetCommands else { return }
         planningDrafts = draftStore.load()
-        for record in (try? widgetCommands.records()) ?? [] {
+        let records = (try? widgetCommands.records()) ?? []
+        planningHistory = records.filter { $0.settled && $0.edit?.operation == .saveProject }.compactMap(\.edit)
+        for record in records {
             if record.state == .rejected { planningErrors[record.id.uuidString] = record.message ?? "The Mac refused this change." }
             if let date = record.appliedAt { appliedAt[record.id] = date }
         }
@@ -251,14 +260,9 @@ final class MobileWorkspaceModel {
                 if receipt.applied { appliedAt[receipt.id] = appliedAt[receipt.id] ?? Date() }
                 else { planningErrors[receipt.id.uuidString] = receipt.message ?? "The Mac could not apply this change." }
             }
-            let now = Date()
-            planningDrafts.removeAll { draft in
-                guard let applied = appliedAt[draft.id] else { return false }
-                let settled = MobilePlanningFiles.index(fetched, reflects: draft)
-                    || now.timeIntervalSince(applied) > Self.appliedDraftGrace
-                if settled { appliedAt.removeValue(forKey: draft.id) }
-                return settled
-            }
+            let settled = MobilePlanningFiles.settledDraftIDs(planningDrafts, appliedAt: appliedAt, snapshot: fetched)
+            planningDrafts.removeAll { settled.contains($0.id) }
+            for id in settled { appliedAt.removeValue(forKey: id) }
             outbox.remove(ids: Set(receipts.map(\.id)))
             receiptCleanup.formUnion(receipts.map(\.id))
             persistDownloads()
@@ -455,8 +459,8 @@ final class MobileWorkspaceModel {
         })
     }
     var recommendedWorkItem: MobileWorkItem? {
-        let paths = Set(projectChoices.map(\.path))
-        return WorkItemRecommendation.nextMobileAction(in: filteredWorkItems().filter { $0.projectPath.map(paths.contains) ?? true }, allItems: snapshot.workItems, projectScores: projectScores)
+        let paths = Set(projectChoices.filter { !ProjectMetadata(status: $0.projectDetails?.status).isUnavailableForNextWork }.map(\.path))
+        return WorkItemRecommendation.nextMobileAction(in: filteredWorkItems().filter { $0.projectPath.map(paths.contains) ?? true }, allItems: snapshot.workItems, projectScores: projectScores, projectPriorities: Dictionary(uniqueKeysWithValues: snapshot.entries.compactMap { entry in entry.projectDetails?.portfolioPriority.map { (entry.path, $0) } }))
     }
 
     func toggle(tagID: String, on entry: MobileWorkspaceEntry) {
@@ -505,7 +509,7 @@ final class MobileWorkspaceModel {
         cacheReceivedSnapshot()
         #endif
         publishWidgetSnapshot()
-        saveMessage = "Saved on this phone · waiting for the Mac"
+        saveMessage = "Saved on this device. These values are shown now and will save to your Mac automatically when Better Workspace is running there and iCloud is available."
         Task { await flushOutbox() }
         return true
     }
@@ -654,6 +658,9 @@ final class MobileWorkspaceModel {
                     if fields.contains("Status") { details.status = properties.status.isEmpty ? nil : properties.status }
                     if fields.contains("Phase") { details.phase = properties.phase.isEmpty ? nil : properties.phase }
                     if fields.contains("Type") { details.projectType = properties.projectType.isEmpty ? nil : properties.projectType }
+                    if let desired = properties.portfolio {
+                        details.portfolio = try? ProjectProperties.merging(desired, original: change.original.editablePortfolio, current: details.editablePortfolio)
+                    }
                 }
                 snapshot.entries[index] = MobileWorkspaceEntry(path: entry.path, parentPath: entry.parentPath, name: entry.name, isDirectory: entry.isDirectory, revision: entry.revision, tagIDs: entry.tagIDs, modifiedAt: entry.modifiedAt, projectDetails: details)
             case .fileCapture, .reviewInbox: break // The card uses persisted drafts; keep the downloaded projection untouched.
@@ -756,5 +763,16 @@ private final class ResumeOnce: @unchecked Sendable {
         if claimed { return false }
         claimed = true
         return true
+    }
+}
+
+extension MobileWorkspaceModel {
+    func toggleFeatured(_ project: MobileWorkspaceEntry) {
+        guard var original = snapshot.entries.first(where: { $0.id == project.id })?.projectDetails, original.ratings != nil else { return }
+        original.previews = nil
+        var properties = MobileProjectProperties(original)
+        var portfolio = original.editablePortfolio; portfolio.featured = !(portfolio.featured ?? false)
+        properties.portfolio = portfolio
+        _ = savePlanning(.init(operation: .saveProject, title: project.name, projectEdit: .init(original: original, ratings: original.ratings ?? [:], oneLiner: original.oneLiner ?? "", summary: original.summary ?? "", properties: properties)))
     }
 }

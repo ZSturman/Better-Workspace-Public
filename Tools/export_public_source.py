@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TOOLS = {
     'archive_release.sh', 'check_release_archive.py', 'prepare_python_runtime.py',
     'sign_bundled_python.py', 'verify_mac_download.sh', 'verify_packaged_service.py',
-    'store_sample_fixture.swift', 'export_public_source.py',
+    'store_sample_fixture.swift', 'export_public_source.py', 'test_root_integrations.py',
 }
 
 def main():
@@ -45,7 +45,7 @@ def main():
     image_dir = destination / 'docs/images'
     image_dir.mkdir(parents=True)
     for platform in ['mac', 'iphone', 'ipad']:
-        shutil.copy2(ROOT / f'docs/images/cohesive-2026-10-15/{platform}-personal-overview.png', image_dir / f'{platform}-sample.png')
+        shutil.copy2(ROOT / f'docs/images/unified-workspace-2026-10-20/{platform}-workspace.png', image_dir / f'{platform}-sample.png')
     print(f'Exported {len(selected)} allowlisted source files, public docs and three sample screenshots to {destination}.')
 
 if __name__ == '__main__':

@@ -104,15 +104,19 @@ public struct WorkspaceWidgetSnapshot: Codable, Equatable, Sendable {
     }
 
     /// Keep the mobile widget's recommendation deterministic and aligned with the
-    /// desktop's documented ordering: active work, then Now/Next/Later, priority,
-    /// and finally a stable title comparison.
+    /// desktop's explicit project priority/manual score ordering, then actionable
+    /// Now/Next work, work priority and a stable title comparison.
     public static func make(from snapshot: MobileWorkspaceSnapshot) -> Self {
         let active = snapshot.workItems.filter { $0.status != .completed }.sorted { lhs, rhs in
             if lhs.stage != rhs.stage { return lhs.stage.rank < rhs.stage.rank }
             if lhs.priority != rhs.priority { return lhs.priority.rank < rhs.priority.rank }
             return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
         }
-        let next = WorkItemRecommendation.nextMobileAction(in: snapshot.workItems).map {
+        let unavailable = Set(snapshot.entries.filter { ProjectMetadata(status: $0.projectDetails?.status).isUnavailableForNextWork }.map(\.path))
+        let next = WorkItemRecommendation.nextMobileAction(in: snapshot.workItems.filter { !($0.projectPath.map(unavailable.contains) ?? false) },
+            allItems: snapshot.workItems,
+            projectScores: Dictionary(uniqueKeysWithValues: snapshot.entries.compactMap { entry in entry.projectDetails?.rankingScore.map { (entry.path, $0) } }),
+            projectPriorities: Dictionary(uniqueKeysWithValues: snapshot.entries.compactMap { entry in entry.projectDetails?.portfolioPriority.map { (entry.path, $0) } })).map {
             WorkspaceWidgetWorkItem(title: $0.title,
                                     projectName: $0.projectPath?.split(separator: "/").last.map(String.init),
                                     kind: $0.kind.rawValue, stage: $0.stage.rawValue,

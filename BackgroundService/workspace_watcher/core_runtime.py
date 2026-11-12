@@ -47,6 +47,14 @@ from .project_graph_poll import ProjectGraphPoller
 class CoreRuntime:
     """Long-lived single-writer v2 runtime used by ``workspace-watcher run``."""
 
+    # Gap after a filesystem-triggered full walk: five times as long as the walk took,
+    # within these bounds. A quick walk stays prompt (a Finder move is indexed within
+    # seconds); an expensive one cannot occupy more than about a sixth of a core
+    # however busy the workspace is.
+    _FILESYSTEM_RECONCILE_COOLDOWN = 60.0
+    _FILESYSTEM_RECONCILE_MIN_COOLDOWN = 2.0
+    _FILESYSTEM_RECONCILE_COST_FACTOR = 5.0
+
     def __init__(self, config: CoreConfig) -> None:
         self.config = config
         self.project_graph_poller = ProjectGraphPoller()
@@ -82,6 +90,7 @@ class CoreRuntime:
         # A filesystem reconcile deferred because more events were queued
         # behind the one that asked for it (see `_on_settled`).
         self._reconcile_pending: str | None = None
+        self._next_filesystem_reconcile = 0.0
         self._listed_cache: frozenset[str] | None = None
         self._widget_marker: tuple[int, int] | None = None
         self._widget_published_at = 0.0
@@ -433,9 +442,25 @@ class CoreRuntime:
         return self._listed_cache
 
     def _run_pending_reconcile(self) -> None:
-        reason, self._reconcile_pending = self._reconcile_pending, None
-        if reason is not None:
+        reason = self._reconcile_pending
+        if reason is None or time.monotonic() < self._next_filesystem_reconcile:
+            return
+        self._reconcile_pending = None
+        started = time.monotonic()
+        try:
             self._reconcile(reason)
+        except Exception:
+            self._reconcile_pending = reason
+            raise
+        finally:
+            # Give sensing and API requests time between full walks even when
+            # unrelated filesystem bursts keep arriving. The tick drains any
+            # pending reconcile after the cooldown without needing a new event.
+            finished = time.monotonic()
+            cooldown = min(self._FILESYSTEM_RECONCILE_COOLDOWN,
+                           max(self._FILESYSTEM_RECONCILE_MIN_COOLDOWN,
+                               (finished - started) * self._FILESYSTEM_RECONCILE_COST_FACTOR))
+            self._next_filesystem_reconcile = finished + cooldown
 
     def _on_settled_failed(self, payload: Any, error: Exception) -> None:
         """Surface a dropped filesystem event where the app can see it.

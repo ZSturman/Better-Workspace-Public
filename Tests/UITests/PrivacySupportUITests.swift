@@ -14,7 +14,7 @@ final class PrivacySupportUITests: XCTestCase {
         defer { app.terminate() }
         let privacy = app.buttons["Privacy"].firstMatch
         XCTAssertTrue(privacy.waitForExistence(timeout: 20)); privacy.click()
-        XCTAssertTrue(app.staticTexts["Your workspace"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@ OR value BEGINSWITH %@", "Projects, plans, ideas and notes save on this device", "Projects, plans, ideas and notes save on this device")).firstMatch.waitForExistence(timeout: 10))
         app.activate()
         privacy.click()
         let capture = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())

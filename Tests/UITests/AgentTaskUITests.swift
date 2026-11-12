@@ -15,6 +15,7 @@ final class AgentTaskUITests: IsolatedUITestCase {
         app.radioButtons["Cards"].firstMatch.click()
         let card = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Fixture project")).firstMatch
         XCTAssertTrue(card.waitForExistence(timeout: 15)); card.click()
+        showProjectTasks(app)
         XCTAssertTrue(app.buttons["projects.plan.agent"].firstMatch.waitForExistence(timeout: 10))
         return app
     }

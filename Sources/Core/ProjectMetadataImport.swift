@@ -14,6 +14,7 @@ public enum ProjectMetadataImport {
         case domain, status, phase, completionModel, maintenanceCadence, projectType
         case workModes, currentWork, nextWork, recentWork, blockers, statusDetail
         case startedAt, lastUpdateAt, trackingPriority, relatedProjects
+        case featured, inShowcase, isPublic
         case github, website, resources, collections, media, tasks, features, milestones, workLogs
 
         public var id: String { rawValue }
@@ -37,6 +38,9 @@ public enum ProjectMetadataImport {
             case .lastUpdateAt: return "Last update"
             case .trackingPriority: return "Tracking priority"
             case .relatedProjects: return "Related projects"
+            case .featured: return "Featured"
+            case .inShowcase: return "In Showcase"
+            case .isPublic: return "Public"
             case .github: return "GitHub"
             case .website: return "Website"
             case .resources: return "Linked resources"
@@ -127,6 +131,10 @@ public enum ProjectMetadataImport {
             return []
         }
         func date(_ aliases: [String]) -> Date? { key(aliases).flatMap { page.date($0) }.flatMap(parseDate) }
+        func flag(_ aliases: [String]) -> Bool? {
+            guard let name = key(aliases), case let .flag(value)? = page.properties[name] else { return nil }
+            return value
+        }
         func number(_ aliases: [String]) -> Double? { key(aliases).flatMap { page.number($0) } }
         func relations(_ aliases: [String]) -> [String] { key(aliases).map { page.relations($0) } ?? [] }
 
@@ -169,7 +177,8 @@ public enum ProjectMetadataImport {
                 taskReferences: relations(["Tasks", "Task"]),
                 featureReferences: relations(["Features", "Feature"]),
                 milestoneReferences: relations(["Milestones", "Milestone"]),
-                workLogReferences: relations(["Work Log", "Work Logs"])
+                workLogReferences: relations(["Work Log", "Work Logs"]),
+                featured: flag(["Featured"]), inShowcase: flag(["In Showcase"]), isPublic: flag(["Public"])
             ),
             relatedNotionPageIDs: relations(["Related Projects", "Related Project"])
         )
@@ -188,6 +197,7 @@ public enum ProjectMetadataImport {
             .blockers: ["blocked by"], .statusDetail: ["status details", "status detail"],
             .startedAt: ["started at", "start date"], .lastUpdateAt: ["last update at", "last update"],
             .trackingPriority: ["tracking priority"], .relatedProjects: ["related projects", "related project"],
+            .featured: ["featured"], .inShowcase: ["in showcase"], .isPublic: ["public"],
             .github: ["github", "repo link", "repository url", "repository", "repo"],
             .website: ["website", "project url", "url", "live url", "download url"],
             .resources: ["resources", "resource"], .collections: ["collections", "collection"],
@@ -258,6 +268,9 @@ public enum ProjectMetadataImport {
             case .lastUpdateAt: metadata.lastUpdateAt = values.metadata.lastUpdateAt
             case .trackingPriority: metadata.trackingPriority = values.metadata.trackingPriority
             case .relatedProjects: break // resolved by the app-model boundary
+            case .featured: if let flag = values.portfolioDetails.featured { portfolioDetails.featured = flag }
+            case .inShowcase: if let flag = values.portfolioDetails.inShowcase { portfolioDetails.inShowcase = flag }
+            case .isPublic: if let flag = values.portfolioDetails.isPublic { portfolioDetails.isPublic = flag }
             case .github: portfolioDetails.githubURL = values.portfolioDetails.githubURL
             case .website: portfolioDetails.websiteURL = values.portfolioDetails.websiteURL
             case .resources: portfolioDetails.resourceReferences = values.portfolioDetails.resourceReferences
@@ -293,6 +306,9 @@ public enum ProjectMetadataImport {
             .lastUpdateAt: date(metadata.lastUpdateAt),
             .trackingPriority: metadata.trackingPriority.map { String($0) },
             .relatedProjects: list(relatedNames),
+            .featured: portfolioDetails.featured.map { $0 ? "Yes" : "No" },
+            .inShowcase: portfolioDetails.inShowcase.map { $0 ? "Yes" : "No" },
+            .isPublic: portfolioDetails.isPublic.map { $0 ? "Yes" : "No" },
             .github: portfolioDetails.githubURL,
             .website: portfolioDetails.websiteURL,
             .resources: list(portfolioDetails.resourceReferences),

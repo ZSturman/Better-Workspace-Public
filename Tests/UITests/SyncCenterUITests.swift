@@ -23,7 +23,7 @@ final class SyncCenterUITests: IsolatedUITestCase {
             baseline: ["title": text("Shared task", type: "title"), "details": text("base")],
             remote: ["title": text("Shared task", type: "title"), "details": text("notion words")])
         conflict.editedAt = Date()
-        // A Notion record not yet brought here: ready.
+        // A Notion record not yet brought here: incoming values wait for review (October 25 policy).
         let incoming = ProjectGraphRecord(id: "incoming", pageID: "p-incoming", sourceID: "tasks", kind: .tasks,
             remote: ["title": text("New in Notion", type: "title")])
         // A draft whose file is gone: cleanup.
@@ -47,7 +47,7 @@ final class SyncCenterUITests: IsolatedUITestCase {
     private func openSyncCenter(_ app: XCUIApplication) {
         let indicator = app.descendants(matching: .any)["projects.sync"].firstMatch
         XCTAssertTrue(indicator.waitForExistence(timeout: 15))
-        XCTAssertEqual(indicator.value as? String, "1 need you, 2 waiting")
+        XCTAssertEqual(indicator.value as? String, "2 need you, 1 waiting")
         indicator.click()
         XCTAssertTrue(app.staticTexts["sync.status"].firstMatch.waitForExistence(timeout: 5))
     }
@@ -56,10 +56,51 @@ final class SyncCenterUITests: IsolatedUITestCase {
         let shot = XCTAttachment(screenshot: app.windows.firstMatch.screenshot()); shot.name = name; shot.lifetime = .keepAlways; add(shot)
     }
 
+    func testReviewedApplyHidesImmediatelyAndReturnsOnFailure() throws {
+        let app = isolatedApp(arguments: ["-bwStartArea", "Overview", "-bwWindowWidth", "820", "-bwWindowHeight", "720", "-bwReviewedSyncDelay", "12"])
+        app.launch(); requireWindow(app)
+        openSyncCenter(app)
+        let row = app.descendants(matching: .any)["sync.row.New in Notion"].firstMatch
+        row.click()
+        app.buttons["sync.detail.apply"].firstMatch.click()
+        let hidden = expectation(for: NSPredicate { _, _ in !row.exists }, evaluatedWith: nil)
+        wait(for: [hidden], timeout: 5)
+        let count = app.staticTexts["sync.recordCount"].firstMatch
+        XCTAssertEqual(count.value as? String ?? count.label, "1 record")
+        XCTAssertNotNil(try store.record(id: "incoming"), "Optimism must not delete the pending record")
+        XCTAssertTrue(app.buttons["sync.now"].firstMatch.waitForExistence(timeout: 25), "Apply finishes")
+        // Existing retry policy puts network failures in Ready while backing off;
+        // missing credentials leave the record in Needs You.
+        if !app.descendants(matching: .any)["sync.row.New in Notion"].firstMatch.exists {
+            app.radioButtons["Ready"].firstMatch.click()
+        }
+        XCTAssertTrue(app.descendants(matching: .any)["sync.row.New in Notion"].firstMatch.waitForExistence(timeout: 5), "The unresolved record returns after a failure")
+        let incoming = try XCTUnwrap(store.record(id: "incoming"))
+        XCTAssertTrue(incoming.local.isEmpty)
+        XCTAssertTrue(incoming.baseline.isEmpty, "Failed Apply must retain the original pending values")
+    }
+
+    func testReviewedBulkConfirmationClosesWhileApplying() throws {
+        let app = isolatedApp(arguments: ["-bwStartArea", "Overview", "-bwWindowWidth", "820", "-bwWindowHeight", "720", "-bwReviewedSyncDelay", "12"])
+        app.launch(); requireWindow(app)
+        openSyncCenter(app)
+        app.radioButtons["Ready"].firstMatch.click()
+        app.buttons["sync.applySafe"].firstMatch.click()
+        app.buttons["sync.summary.confirm"].firstMatch.click()
+        let row = app.descendants(matching: .any)["sync.row.Edited here"].firstMatch
+        let hidden = expectation(for: NSPredicate { _, _ in !row.exists && !app.buttons["sync.summary.confirm"].firstMatch.exists }, evaluatedWith: nil)
+        wait(for: [hidden], timeout: 5)
+        XCTAssertNotNil(try store.record(id: "edited"))
+        XCTAssertTrue(row.waitForExistence(timeout: 25), "A failed transfer returns to Ready")
+        let edited = try XCTUnwrap(store.record(id: "edited"))
+        XCTAssertEqual(edited.local["details"]?.display, "new")
+        XCTAssertEqual(edited.baseline["details"]?.display, "old")
+    }
+
     func testManualByDefaultWithSectionsDeferAndCleanup() throws {
         let app = launch()
         openSyncCenter(app)
-        XCTAssertEqual(app.staticTexts["sync.status"].firstMatch.value as? String, "1 need you")
+        XCTAssertEqual(app.staticTexts["sync.status"].firstMatch.value as? String, "2 changes to review")
         let manual = app.radioButtons["Manual"].firstMatch
         XCTAssertEqual(manual.value as? Int, 1, "Automatic sync is off until turned on")
         shoot(app, "sync-center-needs-you")
@@ -73,8 +114,8 @@ final class SyncCenterUITests: IsolatedUITestCase {
 
         // Decide later: it leaves Needs You until it changes.
         app.buttons["sync.detail.later"].firstMatch.click()
-        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "value == %@", "Everything is in sync")).firstMatch.exists
-                      || app.staticTexts.matching(NSPredicate(format: "value CONTAINS %@", "ready to sync")).firstMatch.waitForExistence(timeout: 5))
+        // The incoming Notion record still waits for review.
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "value == %@", "1 change to review")).firstMatch.waitForExistence(timeout: 5))
 
         // Cleanup: the orphaned draft is discarded; nothing in Notion is touched.
         app.radioButtons["Cleanup"].firstMatch.click()
@@ -96,7 +137,10 @@ final class SyncCenterUITests: IsolatedUITestCase {
         safe.click()
         let summary = app.descendants(matching: .any)["sync.summary"].firstMatch
         XCTAssertTrue(summary.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["Records received"].firstMatch.exists)
+        // Since October 25 an incoming Notion record waits for review, so the safe set
+        // only sends the local edit; nothing is received without a decision.
+        XCTAssertTrue(app.staticTexts["Notion values replaced"].firstMatch.exists)
+        XCTAssertFalse(app.staticTexts["Records received"].firstMatch.exists)
         shoot(app, "sync-center-bulk-summary")
         app.buttons["sync.summary.confirm"].firstMatch.click()
         // Notion cannot be reached from an isolated run: nothing is lost or half-applied.
@@ -183,7 +227,7 @@ final class SyncCenterUITests: IsolatedUITestCase {
         XCTAssertEqual(app.radioButtons["Automatic"].firstMatch.value as? Int, 1)
         let feedback = app.staticTexts["sync.feedback"].firstMatch
         XCTAssertTrue(feedback.waitForExistence(timeout: 5))
-        XCTAssertTrue((feedback.value as? String ?? feedback.label).contains("Automatic sync enabled"))
+        XCTAssertTrue((feedback.value as? String ?? feedback.label).contains("Local updates will send automatically"))
         app.terminate(); _ = app.wait(for: .notRunning, timeout: 10)
         app = launch()
         openSyncCenter(app)

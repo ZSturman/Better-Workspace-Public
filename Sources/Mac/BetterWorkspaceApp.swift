@@ -15,6 +15,8 @@ struct BetterWorkspaceApp: App {
     init() {
         // `--migrate …` runs a migration headlessly and exits before any window exists.
         ProjectAuditCommand.runIfRequested()
+        AgentMonitorCommand.runIfRequested()
+        UnifiedInspectCommand.runIfRequested()
         ProjectMediaCommand.runIfRequested()
         NotionGraphCommand.runIfRequested()
         MigrationCommand.runIfRequested()
@@ -31,14 +33,16 @@ struct BetterWorkspaceApp: App {
                 // A login launch is menu bar only: the window SwiftUI opens at launch
                 // hides itself before it is shown (`LaunchWindowSuppressor`).
                 .background(LaunchWindowSuppressor())
+                .connectedApps()
                 .frame(minWidth: 820, minHeight: 468)
-                .onOpenURL { url in Task { @MainActor in await model.openDeepLink(url) } }
+                .onOpenURL { url in if url.host != "connected-apps" { Task { @MainActor in await model.openDeepLink(url) } } }
                 .task {
                     delegate.start(model: model)
                 }
         }
         .windowToolbarStyle(.unified)
-        .defaultSize(width: 1240, height: 820)
+        .defaultSize(width: CGFloat(TestIsolation.launchArgument("bwWindowWidth").flatMap(Double.init) ?? 1240),
+                     height: CGFloat(TestIsolation.launchArgument("bwWindowHeight").flatMap(Double.init) ?? 820))
         .commands {
             CommandGroup(after: .newItem) {
                 Button("Quick Capture…") { QuickCaptureController.shared.show() }
@@ -103,13 +107,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) static weak var current: AppDelegate?
     lazy var model = AppModel()
     private var started = false
+    private var wakeObserver: NSObjectProtocol?
 
     /// Starts once, at launch, whether or not a window ever opens. The window's own
     /// call is a no-op after this.
     func start(model: AppModel) {
         guard started == false else { return }
         started = true
+        model.installConnectedWorkspace()
         model.start()
+        ProjectExchangeHost.shared.start(model: model)
+        HomePageExport.shared.start { [weak model] in model?.homePageSummary }
+        AgentMonitorSupervisor.shared.start(model: model)
         QuickCaptureController.shared.configure(model: model)
     }
 
@@ -168,6 +177,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let launchedAtLogin = LoginItem.wasLaunchedAtLogin()
         configureTips()
         start(model: model)
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.model.requestMobileCloudSync()
+                await self?.model.unifiedWorkspace?.synchronize()
+            }
+        }
         LoginItem.registerByDefaultIfNeeded()
         LoginItem.claimForInstalledCopyIfNeeded()
         // New Capture (Shortcuts, Spotlight, the widget) opens the quick-capture panel.
@@ -234,6 +249,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        AgentMonitorSupervisor.shared.shutdown()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        model.requestMobileCloudSync()
+        model.refreshNotionCredentialAvailability()
+        Task { await model.unifiedWorkspace?.synchronize() }
+    }
 
     // MARK: - Menu bar utility
 
@@ -357,7 +382,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Dropping files onto the Dock icon, or "Open With", routes into the inbox.
     func application(_ application: NSApplication, open urls: [URL]) {
-        model.importURLs(urls, source: .desktopDrop)
+        var imports: [URL] = []
+        for url in urls {
+            if url.scheme == "betterworkspace" {
+                start(model: model)
+                if !ConnectedApps.shared.handle(url) {
+                    Task { @MainActor in await model.openDeepLink(url) }
+                }
+            } else { imports.append(url) }
+        }
+        guard !imports.isEmpty else { return }
+        model.importURLs(imports, source: .desktopDrop)
         model.selection = .ingest
         collapseToSingleWindow()
     }
@@ -532,6 +567,7 @@ struct MenuBarContent: View {
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
+    @State private var showingWorkspaceSetup = false
     // `TestIsolation.defaults`: a test that touches Settings must not rewrite the real app's.
     @AppStorage(WorkspaceLocation.defaultsWorkspaceRootKey, store: TestIsolation.defaults) private var workspaceRoot = ""
     @AppStorage(WorkspaceLocation.defaultsIngestRootKey, store: TestIsolation.defaults) private var ingestRoot = ""
@@ -561,11 +597,17 @@ struct SettingsView: View {
         }
         .frame(width: 700, height: 560)
         .padding()
+        .sheet(isPresented: $showingWorkspaceSetup) {
+            WorkspaceSetupView(root: model.workspace.root).environment(model)
+        }
     }
 
     private var general: some View {
         Form {
+            HomePageExportSettings()
             Section("Locations") {
+                Button("Workspace Setup…") { showingWorkspaceSetup = true }
+                    .accessibilityIdentifier("settings.workspaceSetup")
                 LabeledContent("Workspace") {
                     HStack {
                         Text(model.workspace.root.path).font(.system(size: 11, design: .monospaced)).lineLimit(1).truncationMode(.middle)
@@ -618,6 +660,9 @@ struct SettingsView: View {
         Form {
             Section("Background service") {
                 BackgroundServiceSection()
+            }
+            Section("Agent completion monitor") {
+                AgentMonitorSection()
             }
             Section("iPhone workspace index") {
                 Toggle("Sync a workspace index with iPhone", isOn: $mobileCloudSyncEnabled)

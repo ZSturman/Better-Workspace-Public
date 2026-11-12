@@ -49,6 +49,38 @@ struct ProjectOutlineTable: NSViewRepresentable {
             return coordinator.headerMenu(key: key)
         }
     }
+    /// What the outline shows. Rows carry closures and records, so they are compared by
+    /// the values their cells display.
+    struct Signature: Equatable {
+        struct Row: Equatable { let id: String, name: String, values: [String: String], linked: Bool }
+        let grouped: Bool
+        let collapsed: Set<String>
+        let groups: [String]
+        let rows: [[Row]]
+        init(grouped: Bool, collapsed: Set<String>, groups: [(String, [ProjectBrowserRow])]) {
+            self.grouped = grouped; self.collapsed = grouped ? collapsed : []
+            self.groups = groups.map(\.0)
+            rows = groups.map { $0.1.map { Row(id: $0.id, name: $0.name, values: $0.values, linked: $0.item != nil || $0.graph != nil) } }
+        }
+    }
+    struct NameCell: View {
+        let row: ProjectBrowserRow
+        let action: (ProjectBrowserRow, String) -> Void
+        var body: some View {
+            HStack(spacing: 7) {
+                FeaturedCell(row: row, action: action)
+                Text(row.name).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+            }.accessibilityIdentifier("projects.row.\(row.id).name")
+        }
+    }
+    struct FeaturedCell: View {
+        let row: ProjectBrowserRow
+        let action: (ProjectBrowserRow, String) -> Void
+        var body: some View {
+            Button { action(row, "featured") } label: { Image(systemName: row.value("featured") == "Yes" ? "star.fill" : "star").foregroundStyle(.yellow) }
+                .buttonStyle(.borderless).accessibilityLabel("Toggle featured " + row.name)
+        }
+    }
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeNSView(context: Context) -> NSScrollView {
         let outline = KeyboardOutline()
@@ -105,12 +137,20 @@ struct ProjectOutlineTable: NSViewRepresentable {
             let desired = widths[key] ?? (key == "name" ? 270 : 130)
             if abs(column.width - desired) > 0.5 { column.width = desired }
         }
-        coordinator.nodes = grouped ? groups.map { name, rows in Node(name: "\(name) · \(rows.count)", children: rows.map { Node(name: $0.name, row: $0) }) }
-            : groups.flatMap { $0.1.map { Node(name: $0.name, row: $0) } }
-        coordinator.groupNames = Dictionary(uniqueKeysWithValues: zip(coordinator.nodes, groups.map(\.0)).map { (ObjectIdentifier($0.0), $0.1) })
-        outline.reloadData()
-        if grouped { for node in coordinator.nodes { if !collapsed.contains(coordinator.groupNames[ObjectIdentifier(node)] ?? "") { outline.expandItem(node) } } }
-        if let selection {
+        // SwiftUI calls this for any change to the enclosing view, including ones that
+        // leave every row as it was. Reloading then rebuilt every cell (and expanded each
+        // group again) and kept the main thread busy while Projects was open (November 9
+        // profile). Reload only when what the rows show has changed.
+        let signature = Signature(grouped: grouped, collapsed: collapsed, groups: groups)
+        if signature != coordinator.signature {
+            coordinator.signature = signature
+            coordinator.nodes = grouped ? groups.map { name, rows in Node(name: "\(name) · \(rows.count)", children: rows.map { Node(name: $0.name, row: $0) }) }
+                : groups.flatMap { $0.1.map { Node(name: $0.name, row: $0) } }
+            coordinator.groupNames = Dictionary(uniqueKeysWithValues: zip(coordinator.nodes, groups.map(\.0)).map { (ObjectIdentifier($0.0), $0.1) })
+            outline.reloadData()
+            if grouped { for node in coordinator.nodes { if !collapsed.contains(coordinator.groupNames[ObjectIdentifier(node)] ?? "") { outline.expandItem(node) } } }
+        }
+        if let selection, coordinator.selectedRow?.id != selection {
             for index in 0..<outline.numberOfRows where (outline.item(atRow: index) as? Node)?.row?.id == selection { outline.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false); break }
         }
         if outline.sortDescriptors.first?.key != sort || outline.sortDescriptors.first?.ascending != ascending {
@@ -122,6 +162,7 @@ struct ProjectOutlineTable: NSViewRepresentable {
         var nodes: [Node] = []
         var groupNames: [ObjectIdentifier: String] = [:]
         weak var outline: NSOutlineView?
+        var signature: Signature?
         var updating = false
         init(_ parent: ProjectOutlineTable) { self.parent = parent }
         func headerMenu(key: String?) -> NSMenu {
@@ -166,10 +207,34 @@ struct ProjectOutlineTable: NSViewRepresentable {
         func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any { (item as? Node)?.children[index] ?? nodes[index] }
         func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool { !(item as! Node).children.isEmpty }
         func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool { (item as! Node).row != nil }
+        /// Cells come from AppKit's reuse queue. A new hosting view per cell per reload
+        /// made each reload pay for tearing down hundreds of them.
+        private func reused<V: View>(_ outlineView: NSOutlineView, _ identifier: String, _ view: V) -> NSHostingView<V> {
+            let key = NSUserInterfaceItemIdentifier(identifier)
+            if let cell = outlineView.makeView(withIdentifier: key, owner: nil) as? NSHostingView<V> { cell.rootView = view; return cell }
+            let cell = NSHostingView(rootView: view); cell.identifier = key
+            return cell
+        }
         func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
             guard let node = item as? Node, let column = tableColumn else { return nil }
-            let field = NSTextField(labelWithString: node.row.map { $0.value(column.identifier.rawValue).isEmpty ? "—" : $0.value(column.identifier.rawValue) } ?? (column == outlineView.outlineTableColumn ? node.name : ""))
-            field.lineBreakMode = .byTruncatingTail; field.font = .systemFont(ofSize: 12, weight: node.row == nil ? .semibold : .regular)
+            let action = parent.action
+            if let row = node.row, column.identifier.rawValue == "name", row.item != nil || row.graph != nil {
+                return reused(outlineView, "projects.cell.name", NameCell(row: row, action: action))
+            }
+            if let row = node.row, column.identifier.rawValue == "featured" {
+                return reused(outlineView, "projects.cell.featured", FeaturedCell(row: row, action: action))
+            }
+            if let row = node.row, column.identifier.rawValue == "domain" {
+                return reused(outlineView, "projects.cell.domain", ProjectDomainBadge(domain: row.value("domain")))
+            }
+            let key = NSUserInterfaceItemIdentifier("projects.cell.text")
+            let field = outlineView.makeView(withIdentifier: key, owner: nil) as? NSTextField ?? {
+                let field = NSTextField(labelWithString: ""); field.identifier = key
+                field.lineBreakMode = .byTruncatingTail
+                return field
+            }()
+            field.stringValue = node.row.map { $0.value(column.identifier.rawValue).isEmpty ? "—" : $0.value(column.identifier.rawValue) } ?? (column == outlineView.outlineTableColumn ? node.name : "")
+            field.font = .systemFont(ofSize: 12, weight: node.row == nil ? .semibold : .regular)
             field.textColor = column.identifier.rawValue == "name" ? .labelColor : .secondaryLabelColor
             field.setAccessibilityIdentifier(node.row.map { "projects.row.\($0.id).\(column.identifier.rawValue)" } ?? "projects.group")
             field.toolTip = node.row?.values["help:" + column.identifier.rawValue] ?? field.stringValue

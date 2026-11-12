@@ -42,14 +42,9 @@ public struct MobileCaptureCatalog: Codable, Equatable, Sendable {
     }
 }
 
-/// The one way anything on the phone hands a saved capture to the Mac.
-///
-/// The app, its App Intents and the Share extension all save real files into the
-/// shared iCloud Inbox with `MobileCaptureService`, then come here. This queues the
-/// optional filing request (destination, idea, tags) as a CloudKit intent, records the
-/// save for Recently Added, and keeps the catalog of tags and folders. Everything
-/// lives in the app group, so a save from the Share extension is in the app's
-/// Recently Added and its queued filing is sent by whichever process flushes next.
+/// Shared queue for the app, App Intents and Share extension. Ordinary captures and
+/// legacy ideas keep their Inbox filing commands. New CloudKit ideas retain their
+/// full asset in the app group until the Mac confirms it filed the original.
 public final class MobileCaptureQueue: @unchecked Sendable {
     public static let outboxKey = "mobileCaptureIntentOutbox"
     public static let logKey = "recentCaptureLog"
@@ -58,10 +53,12 @@ public final class MobileCaptureQueue: @unchecked Sendable {
     public let outbox: MobileIntentOutbox
     public let log: RecentCaptureLog
     private let defaults: UserDefaults
+    private let ledger: WidgetCommandStore?
 
     public init(defaults: UserDefaults, outboxKey: String = MobileCaptureQueue.outboxKey,
                 logKey: String = MobileCaptureQueue.logKey, ledger: WidgetCommandStore? = nil) {
         self.defaults = defaults
+        self.ledger = ledger
         self.outbox = MobileIntentOutbox(defaults: defaults, key: outboxKey, ledger: ledger, stream: "capture")
         self.log = RecentCaptureLog(defaults: defaults, key: logKey)
     }
@@ -173,10 +170,55 @@ public final class MobileCaptureQueue: @unchecked Sendable {
         #endif
     }
 
+    #if os(iOS)
+    private var ideaRoot: URL? { ledger?.directory.appendingPathComponent("IdeaTransfers", isDirectory: true) }
+    public var supportsCloudIdeas: Bool { ideaRoot != nil }
+
+    public func saveIdea(_ entries: [CaptureDraftEntry], title: String, tagIDs: Set<String>) throws -> MobileIdeaCapture {
+        guard let ideaRoot else { throw MobilePlanningFiles.Error.invalid("The local idea queue is unavailable.") }
+        return try MobileIdeaCapture.stage(entries, title: title, tagIDs: tagIDs, in: ideaRoot)
+    }
+
+    public func pendingIdeas() -> [MobileIdeaCapture] {
+        ideaRoot.map { MobileIdeaCapture.pending(in: $0).map(\.capture) } ?? []
+    }
+
+    private func flushIdeas(using store: MobileCloudStore) async throws {
+        guard let ideaRoot, let ledger else { return }
+        let pending = MobileIdeaCapture.pending(in: ideaRoot)
+        guard !pending.isEmpty, try ledger.beginDelivery(stream: "idea-transfers") else { return }
+        defer { try? ledger.release("delivery:idea-transfers") }
+
+        var firstError: Error?
+        for (capture, directory) in pending {
+            do {
+                let file = directory.appendingPathComponent("bundle.plist")
+                guard let filedName = try await store.submitIdeaCapture(capture.intent, file: file, title: capture.title) else { continue }
+                var records = log.load()
+                if !records.contains(where: { $0.id == capture.intent.id }) {
+                    records.append(.init(id: capture.intent.id, name: filedName, savedAt: capture.intent.createdAt,
+                                         destinationPath: Self.ideasDestination.path, destinationName: Self.ideasDestination.name))
+                    log.save(records)
+                }
+                try FileManager.default.removeItem(at: directory)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+            if Task.isCancelled { break }
+        }
+        if let firstError { throw firstError }
+    }
+    #endif
+
     /// Sends what is queued. Anything that cannot be sent stays queued for the next
     /// process that tries; the captures themselves are already in the Inbox.
     public func flush(using store: MobileCloudStore) async -> MobileOutboxFlush {
-        await outbox.flush { intent in try await store.submit(intent) }
+        var result = await outbox.flush { intent in try await store.submit(intent) }
+        #if os(iOS)
+        do { try await flushIdeas(using: store) }
+        catch { result.blockedBy = .unavailable(error.localizedDescription) }
+        #endif
+        return result
     }
 
     /// Says where a save went (shared by every entry point).

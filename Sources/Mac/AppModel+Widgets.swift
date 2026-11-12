@@ -37,10 +37,17 @@ extension AppModel {
     /// check happens here; the app already owns every value in this projection.
     func requestWidgetDashboardPublish() {
         guard workspaceAvailable, !isAwaitingInitialRefresh, workItemsLoaded, let store = widgetCommands else { return }
-        widgetPublishingTask?.cancel()
+        widgetPublishRequested = true
+        guard widgetPublishingTask == nil else { return }
         widgetPublishingTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled, let self else { return }
+            defer {
+                self.widgetPublishingTask = nil
+                if self.widgetPublishRequested { self.requestWidgetDashboardPublish() }
+            }
+            self.widgetPublishRequested = false
+            guard self.workspaceAvailable else { return }
             let projects = self.projects(), folders = self.folders, items = self.workItems
             let root = self.workspace.root, projectRecords = self.projectRecordsByPath
             let ratings = self.ratingsByProject, focusItems = self.overviewFocusItems
@@ -65,7 +72,7 @@ extension AppModel {
                     entries.append(MobileWorkspaceEntry(path: path, parentPath: "Projects", name: item.displayTitle,
                         isDirectory: true, revision: 0, modifiedAt: item.contentModifiedAt,
                         projectDetails: MobileProjectDetails(path: path, status: metadata.status, projectID: record?.id,
-                            serviceID: record?.watcherID, manualScore: rating?.projectScore, ratingCoverage: rating?.coverage, lastWorked: focus?.lastWorked)))
+                            serviceID: record?.watcherID, manualScore: rating?.projectScore, ratingCoverage: rating?.coverage, lastWorked: focus?.lastWorked, portfolioPriority: metadata.portfolioPriority)))
                 }
                 entries += folders.map { MobileWorkspaceEntry(path: $0.name, parentPath: nil, name: $0.name, isDirectory: true, revision: 0) }
                 let work = items.compactMap { item -> MobileWorkItem? in
@@ -203,7 +210,10 @@ extension AppModel {
         } else {
             let ingest = ingest
             let directory = folder.url
-            _ = try await Task.detached(priority: .userInitiated) { try ingest.classify(capture, intoDirectory: directory, renamingTo: nil) }.value
+            let filed = try await Task.detached(priority: .userInitiated) {
+                try ingest.file(capture, intoDirectory: directory, renamingTo: nil)
+            }.value
+            checkpoint.destination = filed.destination.canonicalPath
         }
         checkpoint.applied = true
         try store.set(key, checkpoint)

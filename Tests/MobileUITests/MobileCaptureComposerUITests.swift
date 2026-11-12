@@ -34,7 +34,8 @@ final class MobileCaptureComposerUITests: XCTestCase {
         let title = app.textFields["capture-title"]
         title.tap(); title.typeText("Offline Markdown")
         let text = app.textViews["capture-text"]
-        text.tap(); text.typeText("- [ ] **First line**\n\n## More")
+        text.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.15)).tap()
+        text.typeText("- [ ] **First line**\n\n## More")
         XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 10))
         let keyboard = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         keyboard.name = "Capture Markdown with keyboard"; keyboard.lifetime = .keepAlways; add(keyboard)
@@ -87,6 +88,22 @@ final class MobileCaptureComposerUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Blue PNG.png"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Blue JPEG.jpeg"].waitForExistence(timeout: 10))
         shoot("Two separate saved image files")
+    }
+
+    /// An idea keeps its note and photos together: one Inbox capture, not three.
+    func testIdeaWithTwoImagesIsOneCapture() {
+        let app = launch(images: true, url: "betterworkspace-mobile://capture?kind=idea")
+        let note = app.textViews["capture-text"].firstMatch
+        XCTAssertTrue(note.waitForExistence(timeout: 10))
+        // Empty TextEditor centers can hit its scrolling surface on physical
+        // iPhones. Tap the first insertion line, as a person entering text would.
+        note.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.15)).tap()
+        note.typeText("Porch swing\n\nCedar slats, rope from the beam.")
+        save(app)
+        XCTAssertTrue(receipt(app, "Added to Ideas").waitForExistence(timeout: 10))
+        XCTAssertTrue(recentRow(app, containing: "Porch swing").waitForExistence(timeout: 10))
+        XCTAssertEqual(app.buttons.matching(identifier: "recent-capture").count, 1, "Note and images are one capture")
+        shoot("Idea with two images saved as one capture")
     }
 
     private func reveal(_ element: XCUIElement, in app: XCUIApplication) {
@@ -215,7 +232,9 @@ final class MobileCaptureComposerUITests: XCTestCase {
         let search = app.textFields["capture-tag-search"]
         search.tap(); search.typeText("photo\n")
         XCTAssertTrue(app.buttons["Tag Photography, selected"].waitForExistence(timeout: 5))
-        app.buttons["file-into-Ideas"].tap()
+        // The folder list follows the tag picker and can sit below the fold.
+        let ideas = app.buttons["file-into-Ideas"]
+        reveal(ideas, in: app); ideas.tap()
         shoot("Inbox capture tagged and filed")
         app.buttons["recent-capture-confirm"].tap()
 

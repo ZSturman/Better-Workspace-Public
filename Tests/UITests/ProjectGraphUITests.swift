@@ -97,6 +97,7 @@ final class ProjectGraphUITests: IsolatedUITestCase {
         let app = launch()
         let row = app.staticTexts["Fixture project"].firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 10)); row.doubleClick()
+        showProjectTasks(app)
         let add = app.buttons["Add Task"].firstMatch
         XCTAssertTrue(add.waitForExistence(timeout: 5)); add.click()
         let title = app.textFields["workItem.title"].firstMatch
@@ -186,12 +187,14 @@ final class ProjectGraphUITests: IsolatedUITestCase {
         let app = launch(width: 820, height: 520)
         let local = app.staticTexts.matching(NSPredicate(format: "value == %@", "Fixture project")).firstMatch
         XCTAssertTrue(local.waitForExistence(timeout: 5)); local.doubleClick()
+        showProjectTasks(app)
         XCTAssertTrue(app.descendants(matching: .any)["projects.nextAction"].firstMatch.waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["No tasks yet"].firstMatch.exists)
         XCTAssertTrue(app.buttons["projects.plan.emptyAdd"].firstMatch.exists)
         for label in ["Tasks", "Details", "Media", "Portfolio"] { XCTAssertTrue(app.radioButtons[label].firstMatch.exists) }
         app.radioButtons["Details"].firstMatch.click()
-        XCTAssertTrue(app.textFields["Type"].firstMatch.waitForExistence(timeout: 5))
+        // Type became the multi-value Types menu (October 20).
+        XCTAssertTrue(app.menuButtons["project.types.add"].firstMatch.waitForExistence(timeout: 5))
         app.radioButtons["Tasks"].firstMatch.click()
         let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
         attachment.name = "project-tasks-820x520"; attachment.lifetime = .keepAlways; add(attachment)
@@ -346,12 +349,13 @@ final class ProjectGraphUITests: IsolatedUITestCase {
         let row = app.staticTexts.matching(NSPredicate(format: "value == %@", "Offline project draft")).firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 10))
         let sync = app.descendants(matching: .any)["projects.sync"].firstMatch
-        XCTAssertEqual(sync.value as? String, "0 need you, 1 waiting")
+        // Since October 25 a new Notion page waits for review rather than sending itself.
+        XCTAssertEqual(sync.value as? String, "1 need you, 0 waiting")
         app.terminate(); app.launch(); requireWindow(app)
         XCTAssertTrue(row.waitForExistence(timeout: 10)); row.doubleClick()
         XCTAssertTrue(app.staticTexts["Local draft"].firstMatch.waitForExistence(timeout: 10))
-        XCTAssertEqual(app.descendants(matching: .any)["projects.sync"].firstMatch.value as? String, "0 need you, 1 waiting",
-                       "Still waiting to be sent after a restart")
+        XCTAssertEqual(app.descendants(matching: .any)["projects.sync"].firstMatch.value as? String, "1 need you, 0 waiting",
+                       "Still waiting for review after a restart")
     }
 
 }

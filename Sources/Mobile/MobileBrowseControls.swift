@@ -31,6 +31,17 @@ struct MobileBrowseControls: View {
             filter("Domain", selection: $query.domain, options: model.propertyOptions["domain"] ?? [])
             filter("Status", selection: $query.status, options: model.propertyOptions["Status"] ?? [])
             filter("Phase", selection: $query.phase, options: model.propertyOptions["Phase"] ?? [])
+            if !ideas {
+                Menu("Type") {
+                    Button("All types") { query.projectType = nil }
+                    ForEach(Array(Set((model.propertyOptions["Type"] ?? []).flatMap { ProjectProperties.types($0) })).sorted(), id: \.self) { type in Button(type) { query.projectType = type } }
+                }
+                Menu("Featured") {
+                    Button("All projects") { query.featured = nil }
+                    Button("Featured") { query.featured = true }
+                    Button("Not featured") { query.featured = false }
+                }
+            }
             if ideas {
                 Menu("Potential") {
                     Button("All potentials") { query.potential = "" }
@@ -62,10 +73,11 @@ struct MobileBrowseControls: View {
                 model.overviewDefaults.set(String(decoding: (try? JSONEncoder().encode(stored)) ?? Data(), as: UTF8.self), forKey: preferenceKey)
             }
     }
-    private var filtered: Bool { !query.domain.isEmpty || !query.potential.isEmpty || !query.status.isEmpty || !query.phase.isEmpty }
+    private var filtered: Bool { !query.domain.isEmpty || !query.potential.isEmpty || !query.status.isEmpty || !query.phase.isEmpty || query.projectType != nil || query.featured != nil }
     private func filter(_ title: String, selection: Binding<String>, options: [String]) -> some View {
         Menu(title) {
             Button(title == "Status" ? "All statuses" : "All " + title.lowercased() + "s") { selection.wrappedValue = "" }
+            Button("Not set") { selection.wrappedValue = "Not set" }
             ForEach(Array(Set(options + (selection.wrappedValue.isEmpty ? [] : [selection.wrappedValue]))).sorted(), id: \.self) { value in Button(value) { selection.wrappedValue = value } }
         }
     }

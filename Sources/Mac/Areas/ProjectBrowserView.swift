@@ -30,6 +30,8 @@ enum ProjectBrowserCache {
     static var kinds: [String: ProjectKind] = [:]
     /// The build `rows` is complete for; nil while a build has not finished.
     static var key: String?
+    /// When the last complete build finished.
+    static var builtAt: ContinuousClock.Instant?
 }
 
 /// Rows after search, filters and sort. Recomputed when one of those changes, never in
@@ -44,6 +46,38 @@ struct ProjectBrowserBuildProgress: Equatable {
     var phase: String
     var done: Int
     var total: Int
+}
+
+/// Build progress lives in its own observable object and is read only by the small views
+/// that show it. As `@State` on the browser, each update (every 20 rows) re-ran the whole
+/// browser body and pushed the table through another update.
+@MainActor @Observable final class ProjectBrowserProgressModel {
+    var current: ProjectBrowserBuildProgress?
+}
+
+private struct ProjectBrowserUpdatingLabel: View {
+    let progress: ProjectBrowserProgressModel
+    var body: some View {
+        if let progress = progress.current {
+            // Rows on screen are the previous build; say so instead of freezing them silently.
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                ViewThatFits {
+                    Text("\(progress.phase)… \(progress.done) of \(progress.total)").fixedSize()
+                    Text("Updating…").fixedSize()
+                }
+            }.font(.caption).foregroundStyle(.secondary)
+                .help("Showing the projects already loaded while newer data is gathered.")
+                .accessibilityIdentifier("projects.updating")
+        }
+    }
+}
+
+private struct ProjectBrowserLoadingState: View {
+    let progress: ProjectBrowserProgressModel
+    var body: some View {
+        LoadingAreaState(title: "Loading projects…", message: progress.current.map { "\($0.phase): \($0.done) of \($0.total). You can switch areas while this runs." })
+    }
 }
 struct ProjectBrowserPreferences: Codable, Equatable {
     var query: String?
@@ -109,18 +143,27 @@ struct ProjectBrowserView: View {
     @State private var visible = ProjectBrowserVisibleRows()
     @State private var visibleBuilt = false
     /// Non-nil while rows are being rebuilt; the rows on screen stay until it finishes.
-    @State private var progress: ProjectBrowserBuildProgress?
+    @State private var progress = ProjectBrowserProgressModel()
+    /// The running row build. Not cancelled when the inputs change again, only when the
+    /// browser goes away: restarting on every file event under Projects meant a busy
+    /// workspace (builds and agents writing there) kept a build running indefinitely.
+    @State private var buildTask: Task<Void, Never>?
+    @State private var buildGeneration = 0
 
     /// Projects not listed yet, or listed but not yet turned into rows.
     private var showsLoading: Bool {
         rows.isEmpty && (model.isAwaitingFirstRead(of: .projects) || (rowsBuilt == false && model.projects().isEmpty == false) || (rowsBuilt && visibleBuilt == false))
     }
-    private var buildKey: String { "\(model.revision(ofArea: "Projects"))-\(model.projectViewRevision)-\(model.graphRevision)" }
+    /// What the rows are built from: the Projects listing, project records and the graph.
+    private var buildKey: String { "\(model.listingRevision(ofArea: "Projects"))-\(model.projectViewRevision)-\(model.graphRevision)" }
+    /// Changes anywhere inside a project. Only a few derived values (kind, tools) read
+    /// below the listing, so these refresh the rows at most once a minute.
+    private var contentKey: String { "\(buildKey)|\(model.revision(ofArea: "Projects"))" }
     private struct VisibleKey: Hashable {
         let domainScope: String?, query: String, rules: [ProjectPropertyFilter], matchAny: Bool, activity: ProjectActivityFilter, secondary: ProjectSortRule?, sort: String, ascending: Bool, group: String, generation: Int
     }
     static let fields: [(String, String)] = [
-        ("name", "Name"), ("domain", "Domain"), ("status", "Status"), ("phase", "Phase"), ("type", "Type"), ("tags", "Tags"), ("lastUpdate", "Last Update"),
+        ("featured", "Featured"), ("name", "Name"), ("domain", "Domain"), ("status", "Status"), ("phase", "Phase"), ("type", "Type"), ("tags", "Tags"), ("lastUpdate", "Last Update"),
         ("oneLiner", "One Liner"), ("currentWork", "Current Work"), ("nextWork", "Next Work"), ("blockers", "Blocked By"), ("workMode", "Work Mode"),
         ("completionModel", "Completion Model"), ("maintenanceCadence", "Maintenance Cadence"), ("startedAt", "Started At"),
         ("priority", "Local Priority"), ("score", "Score"), ("coverage", "Rated"), ("assets", "Assets"), ("resources", "Resources"),
@@ -139,6 +182,7 @@ struct ProjectBrowserView: View {
         let scoring = model.scoringPreferences()
         let formatter = ISO8601DateFormatter()
         let local = model.projects()
+        let completed = WorkItemRecommendation.completedDependencyIDs(in: model.workItems)
         let workByPath = Dictionary(grouping: model.workItems.filter { $0.projectPath != nil }, by: { $0.projectPath! })
         let logsByID = Dictionary(grouping: model.workLogs.filter { $0.projectID != nil }, by: { $0.projectID! })
         let knownWorkPaths = Set(model.workItems.map { $0.url.path })
@@ -153,7 +197,7 @@ struct ProjectBrowserView: View {
                 guard await yieldForBuild(phase: "Updating projects", done: index, total: total) else { return nil }
             }
             var row = makeRow(item, scoring: scoring, formatter: formatter)
-            row.candidate = model.portfolioCandidate(for: item, preferences: scoring)
+            row.candidate = model.portfolioCandidate(for: item, preferences: scoring, completedDependencies: completed)
             let path = model.workspaceRelativePath(for: item.url) ?? ""
             let work = (workByPath[path] ?? []) + (workByPath[item.url.path] ?? [])
             addWorkMetrics(work, graph: row.graph, knownPaths: knownWorkPaths, to: &row.values)
@@ -180,6 +224,7 @@ struct ProjectBrowserView: View {
             for (key, name) in [("domain", "domain"), ("status", "Status"), ("phase", "Phase"), ("type", "Type"), ("tags", "tags"), ("lastUpdate", "last update at"), ("oneLiner", "one liner"), ("currentWork", "Current Work"), ("nextWork", "Next Work"), ("blockers", "Blocked By"), ("workMode", "Work Mode"), ("completionModel", "Completion Model"), ("maintenanceCadence", "Maintenance Cadence"), ("startedAt", "started at")] {
                 values[key] = graph.value(name, source: source).display
             }
+            values["featured"] = graph.value("Featured", source: source)["checkbox"].bool ? "Yes" : "No"
             addCounts(graph, to: &values)
             addWorkMetrics([], graph: graph, knownPaths: [], to: &values)
             addNotionProperties(graph, to: &values)
@@ -190,7 +235,7 @@ struct ProjectBrowserView: View {
     }
     /// Publishes progress and lets queued events (clicks, typing, area switches) run.
     @MainActor private func yieldForBuild(phase: String, done: Int, total: Int) async -> Bool {
-        progress = .init(phase: phase, done: done, total: total)
+        progress.current = .init(phase: phase, done: done, total: total)
         do { try await Task.sleep(for: .milliseconds(1)) } catch { return false }
         return Task.isCancelled == false
     }
@@ -199,6 +244,7 @@ struct ProjectBrowserView: View {
             let score = model.score(for: item, preferences: scoring)
             let tags = model.tags(for: item).map(\.name)
             var values: [String: String] = [:]
+            values["featured"] = model.projectPortfolioDetails(for: item).featured == true ? "Yes" : "No"
             values["domain"] = metadata.domain ?? ""
             values["status"] = metadata.status ?? ""
             values["phase"] = metadata.phase ?? ""
@@ -331,18 +377,7 @@ struct ProjectBrowserView: View {
                     .accessibilityIdentifier("projects.filterButton")
                     .popover(isPresented: $showingFilters, arrowEdge: .bottom) { ProjectFilterEditor(preferences: $preferences, rows: allRows) }
                 Spacer(minLength: 0)
-                if let progress, showsLoading == false {
-                    // Rows on screen are the previous build; say so instead of freezing them silently.
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        ViewThatFits {
-                            Text("\(progress.phase)… \(progress.done) of \(progress.total)").fixedSize()
-                            Text("Updating…").fixedSize()
-                        }
-                    }.font(.caption).foregroundStyle(.secondary)
-                        .help("Showing the projects already loaded while newer data is gathered.")
-                        .accessibilityIdentifier("projects.updating")
-                }
+                if showsLoading == false { ProjectBrowserUpdatingLabel(progress: progress) }
                 InlineSearchField(text: $query, prompt: "Search projects and tags").frame(minWidth: 140, maxWidth: 240)
             }.padding(.horizontal, 16).padding(.vertical, 10)
             HStack(spacing: 8) {
@@ -365,7 +400,7 @@ struct ProjectBrowserView: View {
             }.font(.caption).buttonStyle(.borderless).padding(.horizontal, 16).padding(.bottom, 8)
             Divider()
             if showsLoading {
-                LoadingAreaState(title: "Loading projects…", message: progress.map { "\($0.phase): \($0.done) of \($0.total). You can switch areas while this runs." })
+                ProjectBrowserLoadingState(progress: progress)
             } else if rows.isEmpty { ContentUnavailableView("No matching projects", systemImage: "folder", description: Text("Change your search or filters, or import project data in Settings.")) }
             else if preferences.presentation == "charts" {
                 ProjectAnalyticsDashboard(rows: rows, open: open, drillDomain: { domain in
@@ -427,35 +462,69 @@ struct ProjectBrowserView: View {
             visibleBuilt = true
         }
         .onChange(of: model.widgetChartRequest) { _, _ in preferences.presentation = "charts" }
-        .task(id: buildKey) { @MainActor in
-            let key = buildKey
-            // The cached rows are already this build; nothing to gather.
-            guard ProjectBrowserCache.key != key || rowsBuilt == false else { return }
-            defer { if Task.isCancelled == false { progress = nil } }
-            guard let rows = await makeRows() else { return }
-            setRows(rows, key: nil)
-            let local = model.projects()
-            var resolved: [String: ProjectToolCapability] = [:]
-            var resolvedKinds: [String: ProjectKind] = [:]
-            for (index, item) in local.enumerated() {
-                if index.isMultiple(of: 20) { progress = .init(phase: "Checking project tools", done: index, total: local.count) }
-                if Task.isCancelled { return }
-                resolved[item.id] = await model.projectToolCapability(for: item)
-                resolvedKinds[item.id] = await ItemProbe.shared.detail(for: item).projectKind
+        .task(id: contentKey) { @MainActor in startRowBuilds() }
+        .onDisappear { buildTask?.cancel(); buildTask = nil; progress.current = nil }
+    }
+    /// The shortest gap between background rebuilds once rows are on screen. A burst of
+    /// file events becomes one rebuild instead of one per event; the first change after a
+    /// quiet spell still starts at once.
+    private static let rebuildInterval: Duration = .seconds(5)
+    private static let contentRebuildInterval: Duration = .seconds(60)
+
+    /// Runs builds until the rows match the current inputs. Changes arriving during a
+    /// build are picked up by the next pass of this loop.
+    @MainActor private func startRowBuilds() {
+        guard buildTask == nil else { return }
+        buildGeneration += 1
+        let generation = buildGeneration
+        buildTask = Task { @MainActor in
+            defer { if buildGeneration == generation { buildTask = nil; progress.current = nil } }
+            while Task.isCancelled == false {
+                let key = contentKey
+                // The cached rows are already this build; nothing to gather.
+                guard ProjectBrowserCache.key != key || rowsBuilt == false else { return }
+                if rowsBuilt, let last = ProjectBrowserCache.builtAt {
+                    // Only content inside projects changed: the rows' own inputs did not.
+                    let contentOnly = ProjectBrowserCache.key?.hasPrefix(buildKey + "|") == true
+                    let next = last.advanced(by: contentOnly ? Self.contentRebuildInterval : Self.rebuildInterval)
+                    if next > .now {
+                        do { try await Task.sleep(until: next) } catch { return }
+                        continue
+                    }
+                }
+                guard await buildRows(key: key) else { return }
             }
-            if Task.isCancelled { return }
-            capabilities = resolved; kinds = resolvedKinds
-            ProjectBrowserCache.capabilities = resolved; ProjectBrowserCache.kinds = resolvedKinds
-            // Patch the three values that depended on them instead of rebuilding every row.
-            setRows(cachedRows.map { row in
-                var row = row
-                guard let item = row.item else { return row }
-                row.values["kind"] = resolvedKinds[item.id]?.rawValue ?? ""
-                row.values["canExplain"] = resolved[item.id]?.canExplain == true ? "true" : "false"
-                row.values["canFlow"] = resolved[item.id]?.canFlowReview == true ? "true" : "false"
-                return row
-            }, key: key)
         }
+    }
+
+    /// One complete build for `key`; false when cancelled.
+    @MainActor private func buildRows(key: String) async -> Bool {
+        defer { progress.current = nil }
+        guard let rows = await makeRows() else { return false }
+        setRows(rows, key: nil)
+        let local = model.projects()
+        var resolved: [String: ProjectToolCapability] = [:]
+        var resolvedKinds: [String: ProjectKind] = [:]
+        for (index, item) in local.enumerated() {
+            if index.isMultiple(of: 20) { progress.current = .init(phase: "Checking project tools", done: index, total: local.count) }
+            if Task.isCancelled { return false }
+            resolved[item.id] = await model.projectToolCapability(for: item)
+            resolvedKinds[item.id] = await ItemProbe.shared.detail(for: item).projectKind
+        }
+        if Task.isCancelled { return false }
+        capabilities = resolved; kinds = resolvedKinds
+        ProjectBrowserCache.capabilities = resolved; ProjectBrowserCache.kinds = resolvedKinds
+        // Patch the three values that depended on them instead of rebuilding every row.
+        setRows(cachedRows.map { row in
+            var row = row
+            guard let item = row.item else { return row }
+            row.values["kind"] = resolvedKinds[item.id]?.rawValue ?? ""
+            row.values["canExplain"] = resolved[item.id]?.canExplain == true ? "true" : "false"
+            row.values["canFlow"] = resolved[item.id]?.canFlowReview == true ? "true" : "false"
+            return row
+        }, key: key)
+        ProjectBrowserCache.builtAt = .now
+        return true
     }
     /// Decide's rankings only show projects that can be ranked. This lists the matching
     /// projects that cannot appear above, with the rule that excludes each one.
@@ -494,6 +563,16 @@ struct ProjectBrowserView: View {
     private func open(_ row: ProjectBrowserRow) { if let item = row.item { model.openProjectWorkspace(for: item) } else { model.openGraphProjectID = row.graph?.id } }
     private func action(_ row: ProjectBrowserRow, _ action: String) {
         if action == "open" { open(row); return }
+        if action == "featured" {
+            if let item = row.item {
+                let original = model.projectPortfolioDetails(for: item)
+                var value = original; value.featured = !(value.featured ?? false)
+                do { try model.saveProjectPortfolio(value, original: original, for: item) } catch { model.lastError = error.localizedDescription }
+            } else if var graph = row.graph, let source = model.graphSource(for: graph), let property = source.property(named: "Featured"), property.definition["type"].string == "checkbox", source.writable(property.id) {
+                graph.set("Featured", value: .bool(!graph.value("Featured", source: source)["checkbox"].bool), source: source); model.saveGraphRecord(graph)
+            } else { model.lastError = "This Notion-only project needs a writable Featured checkbox in its existing source. No schema change was made." }
+            return
+        }
         if let item = row.item {
             if action == "explain" { model.openProjectTool(.explain, for: item) }
             if action == "flow" { model.openProjectTool(.flowReview, for: item) }
@@ -585,19 +664,21 @@ struct ProjectBrowserCard: View {
                     else { RoundedRectangle(cornerRadius: 8).fill(.quaternary).frame(height: 130).overlay(Image(systemName: "folder").font(.largeTitle).foregroundStyle(.secondary)) }
                     Text(row.name).font(.headline).lineLimit(2)
                     Text(row.value("oneLiner").isEmpty ? "No description yet" : row.value("oneLiner")).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                    Text([row.value("domain"), row.value("status"), row.value("phase")].filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption2).foregroundStyle(.secondary)
+                    ProjectDomainBadge(domain: row.value("domain"))
+                    Text(row.value("status").isEmpty ? "No status" : row.value("status")).font(.caption).foregroundStyle(.secondary)
                     if !row.tags.isEmpty { Text(row.tags.prefix(3).joined(separator: " · ")).font(.caption2).foregroundStyle(.secondary) }
                     if row.item == nil { Label("Notion-only", systemImage: "cloud").font(.caption2).foregroundStyle(.secondary) }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }.buttonStyle(.plain).accessibilityIdentifier("projects.portfolio.\(row.id)")
             HStack {
+                Button { action("featured") } label: { Image(systemName: row.value("featured") == "Yes" ? "star.fill" : "star") }.foregroundStyle(.yellow).accessibilityLabel("Toggle featured " + row.name)
                 if capability?.canExplain == true { Button("Explain") { action("explain") } }
                 if capability?.canFlowReview == true { Button("User Flow") { action("flow") } }
                 Spacer()
                 Menu { Button("Open project", action: open); if row.item != nil { Button("Reveal in Finder") { action("finder") }; Divider(); Button("Delete project…", role: .destructive) { action("delete") } }; if row.graph?.pageID != nil { Button("Open in Notion") { action("notion") } } } label: { Image(systemName: "ellipsis") }
             }.font(.caption).buttonStyle(.borderless)
         }.padding(12).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ProjectDomainStyle(row.value("domain")).color.opacity(0.5)))
             .contextMenu { if let item = row.item { ItemContextMenu(item: item) } }
     }
 }

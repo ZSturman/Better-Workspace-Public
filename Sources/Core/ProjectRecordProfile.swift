@@ -78,7 +78,8 @@ public struct ProjectRecordProfile: Sendable {
         case .projects:
             return Plan(description: [("summary", "Description", nil), ("description", "Description", nil)],
                         essentials: [("one liner", "One-line summary", "What is it, in a sentence?"), ("Status", "Status", nil), ("Phase", "Phase", nil),
-                                     ("domain", "Domain", nil), ("Type", "Type", nil), ("tags", "Tags", nil)])
+                                     ("domain", "Domain", nil), ("Type", "Types", nil), ("Featured", "Featured", nil), ("In Showcase", "In Showcase", nil), ("Public", "Public", nil),
+                                     ("GitHub", "GitHub", "https://"), ("Website", "Website", "https://"), ("App Store", "App Store", "https://"), ("URL", "Link", "https://"), ("tags", "Tags", nil)])
         case .ideas:
             return Plan(description: [("one liner", "Description", nil)],
                         essentials: [("status", "Status", nil), ("type", "Type", nil), ("tags", "Tags", nil)])
@@ -115,8 +116,13 @@ public struct ProjectRecordProfile: Sendable {
         var used = Set([title, description?.name].compactMap { $0 })
         var essentials: [Field] = []
         for (name, label, prompt) in plan.essentials {
-            guard let resolved = resolve(name), !used.contains(resolved), usable(resolved), type(resolved) != "relation" else { continue }
+            guard let resolved = resolve(name), !used.contains(resolved), (usable(resolved) || kind == .projects), type(resolved) != "relation" else { continue }
             essentials.append(Field(name: resolved, label: label, prompt: prompt)); used.insert(resolved)
+        }
+        if kind == .projects {
+            for name in schema.keys.sorted() where type(name) == "url" && writable(name) && !used.contains(name) {
+                essentials.append(Field(name: name, label: name, prompt: "https://")); used.insert(name)
+            }
         }
         let kindsBySource = Dictionary(sources.map { ($0.id, $0.kind) }, uniquingKeysWith: { first, _ in first })
         var relations: [Relation] = []

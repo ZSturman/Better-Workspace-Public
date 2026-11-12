@@ -48,6 +48,7 @@ struct NotionSettingsSection: View {
                 Spacer()
                 Button("Remove") {
                     SecretStore.remove()
+                    model.refreshNotionCredentialAvailability()
                     self.fingerprint = nil
                 }
             }
@@ -57,6 +58,7 @@ struct NotionSettingsSection: View {
                     .textFieldStyle(.roundedBorder)
                 Button("Save") {
                     guard SecretStore.save(token) else { return }
+                    model.refreshNotionCredentialAvailability()
                     token = ""
                     fingerprint = SecretStore.fingerprint()
                     // With databases still undecided, the obvious next step is finding

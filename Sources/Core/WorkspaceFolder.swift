@@ -62,7 +62,8 @@ public struct WorkspaceFolderDiscovery: Sendable {
             at: workspace.root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
         ) else { return nil }
         let found: [(url: URL, name: String, identity: String?)] = urls.compactMap { url in
-            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+            guard url.pathExtension.lowercased() != "app",
+                  (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
                   Self.couldBeArea(url.lastPathComponent)
             else { return nil }
             return (url.canonical, url.lastPathComponent, FileIdentityResolver.identity(of: url)?.key)

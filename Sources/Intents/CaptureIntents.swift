@@ -246,11 +246,16 @@ struct CaptureFilesIntent: AppIntent {
     @Parameter(title: "Folder")
     var folder: CaptureDestinationEntity?
 
+    /// One idea folder holding every file (and the title as its note), instead of one
+    /// Inbox item per file.
+    @Parameter(title: "Make an Idea", default: false)
+    var asIdea: Bool
+
     @Parameter(title: "Tags")
     var tags: [CaptureTagEntity]?
 
     static var parameterSummary: some ParameterSummary {
-        Summary("Capture \(\.$files)") { \.$title; \.$folder; \.$tags }
+        Summary("Capture \(\.$files)") { \.$title; \.$asIdea; \.$folder; \.$tags }
     }
 
     @MainActor
@@ -266,7 +271,7 @@ struct CaptureFilesIntent: AppIntent {
         }
         guard payload.isEmpty == false else { throw CaptureIntentError.nothingToCapture }
         return try await PlatformCaptureBackend.capture(
-            CaptureIntentRequest(title: title, files: payload, destinationID: folder?.id, tags: tags ?? []))
+            CaptureIntentRequest(title: title, files: payload, destinationID: asIdea ? nil : folder?.id, asIdea: asIdea, tags: tags ?? []))
     }
 }
 
@@ -289,6 +294,12 @@ enum CaptureIntentError: Error, CustomLocalizedStringResourceConvertible {
 
 struct BetterWorkspaceShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
+        AppShortcut(intent: AddWorkspaceTaskIntent(),
+                    phrases: ["Add a task in \(.applicationName)"],
+                    shortTitle: "Add Task", systemImageName: "checkmark.circle")
+        AppShortcut(intent: AddWorkspaceIdeaIntent(),
+                    phrases: ["Save an idea in \(.applicationName)"],
+                    shortTitle: "Add Idea", systemImageName: "lightbulb")
         AppShortcut(intent: QuickCaptureIntent(),
                     phrases: ["Capture in \(.applicationName)",
                               "Quick capture in \(.applicationName)",

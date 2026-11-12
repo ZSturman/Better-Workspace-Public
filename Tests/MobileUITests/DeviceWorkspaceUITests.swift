@@ -235,23 +235,23 @@ final class DeviceWorkspaceUITests: XCTestCase {
         defer { XCUIDevice.shared.orientation = previous == .unknown ? .portrait : previous }
         XCUIDevice.shared.orientation = .portrait
         waitForOverviewSurface(app)
-        app.buttons["Projects"].tap()
+        app.openPlanning("Projects")
         XCTAssertTrue(app.navigationBars["Projects"].waitForExistence(timeout: 15))
         let row = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "mobile-project-")).firstMatch
         guard row.waitForExistence(timeout: 30) else { throw XCTSkip("No project has been published to the device.") }
         row.tap()
-        XCTAssertTrue(app.staticTexts["Up Next"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.buttons["project.score.edit"].waitForExistence(timeout: 15))
         shoot("iphone-project-detail")
-        app.buttons["Work"].tap()
+        app.openPlanning("Work")
         XCTAssertTrue(app.navigationBars["Work"].waitForExistence(timeout: 15))
         shoot("iphone-work-portrait")
         XCUIDevice.shared.orientation = .landscapeRight
         XCTAssertTrue(app.navigationBars["Work"].waitForExistence(timeout: 15))
         shoot("iphone-work-landscape")
-        app.buttons["Ideas"].tap()
+        app.workspaceDestination("Ideas").tap()
         XCTAssertTrue(app.navigationBars["Ideas"].waitForExistence(timeout: 15))
         XCUIDevice.shared.orientation = .portrait
-        app.buttons["Overview"].tap()
+        app.workspaceDestination("Overview").tap()
         XCTAssertTrue(app.navigationBars["Overview"].waitForExistence(timeout: 15))
     }
 
@@ -309,18 +309,23 @@ final class DeviceWorkspaceUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Overview"].waitForExistence(timeout: 30))
         shoot("ipad-split-overview")
 
-        let selections = [("workspace-sidebar-projects", "Projects"),
-                          ("workspace-sidebar-work", "Work"),
-                          ("workspace-sidebar-ideas", "Ideas"),
-                          ("workspace-sidebar-overview", "Overview")]
-        for (sidebarID, title) in selections {
+        // The unified-workspace sidebar (October 2026): Projects live inside Workspace,
+        // and Work is shown as Planning. Each selection must replace the detail.
+        let selections = ["workspace-sidebar-workspace", "workspace-sidebar-work", "workspace-sidebar-ideas",
+                          "workspace-sidebar-ingest", "workspace-sidebar-overview"]
+        var shown = app.navigationBars.allElementsBoundByIndex.map(\.identifier)
+        for sidebarID in selections {
             let row = app.staticTexts[sidebarID]
             XCTAssertTrue(row.waitForExistence(timeout: 15), "Missing sidebar row \(sidebarID)")
             row.tap()
-            XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 15),
-                          "Sidebar selection \(sidebarID) did not show \(title)")
-            shoot("ipad-split-\(title.lowercased())")
+            let changed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                app.navigationBars.allElementsBoundByIndex.map(\.identifier) != shown
+            }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [changed], timeout: 15), .completed, "Sidebar selection \(sidebarID) did not change the detail")
+            shown = app.navigationBars.allElementsBoundByIndex.map(\.identifier)
+            shoot("ipad-split-\(sidebarID)")
         }
+        XCTAssertTrue(app.navigationBars["Overview"].waitForExistence(timeout: 15))
         #endif
     }
 

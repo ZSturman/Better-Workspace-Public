@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// A portable planning record.  Work items are ordinary Markdown files, identified by
 /// a small `better-workspace` front matter block rather than by their filename or a
@@ -157,14 +158,26 @@ public struct WorkItem: Identifiable, Hashable, Sendable {
 /// to change the recommendation.
 public enum WorkItemRecommendation {
     public static func nextAction(in items: [WorkItem], allItems: [WorkItem]? = nil,
-                                  audience: WorkActionAudience = .all, capabilities: Set<String>? = nil, projectScores: [String: Double] = [:]) -> WorkItem? {
-        let universe = allItems ?? items
-        let completed = Set(universe.filter { !$0.isOpen }.flatMap { [$0.id, $0.importedNotionPageID].compactMap { $0 } })
+                                  audience: WorkActionAudience = .all, capabilities: Set<String>? = nil, projectScores: [String: Double] = [:], projectPriorities: [String: Int] = [:]) -> WorkItem? {
+        nextAction(in: items, completedDependencyIDs: completedDependencyIDs(in: allItems ?? items),
+                   audience: audience, capabilities: capabilities, projectScores: projectScores, projectPriorities: projectPriorities)
+    }
+
+    public static func completedDependencyIDs(in items: [WorkItem]) -> Set<String> {
+        items.reduce(into: []) { completed, item in
+            guard !item.isOpen else { return }
+            completed.insert(item.id)
+            if let pageID = item.importedNotionPageID { completed.insert(pageID) }
+        }
+    }
+
+    public static func nextAction(in items: [WorkItem], completedDependencyIDs: Set<String>,
+                                  audience: WorkActionAudience = .all, capabilities: Set<String>? = nil, projectScores: [String: Double] = [:], projectPriorities: [String: Int] = [:]) -> WorkItem? {
         // Decode optional JSON once per item, then choose the best in one pass.
         // Sorting reparsed metadata for every comparison and stalled Overview on large queues.
         let candidates = items.compactMap { item -> (item: WorkItem, metadata: WorkItemActionMetadata?)? in
             guard item.isOpen, item.stage != .later,
-                  item.dependencyIDs.allSatisfy({ completed.contains($0) }) else { return nil }
+                  item.dependencyIDs.allSatisfy(completedDependencyIDs.contains) else { return nil }
             let meta = item.actionMetadata
             if let meta {
                 guard meta.blockedBy.isEmpty else { return nil }
@@ -178,6 +191,9 @@ public enum WorkItemRecommendation {
             return (item, meta)
         }
         return candidates.min { lhs, rhs in
+            let leftPriority = lhs.item.projectPath.flatMap { projectPriorities[$0] } ?? 3
+            let rightPriority = rhs.item.projectPath.flatMap { projectPriorities[$0] } ?? 3
+            if leftPriority != rightPriority { return leftPriority > rightPriority }
             let left = lhs.item.projectPath.flatMap { projectScores[$0] }.flatMap { $0.isFinite ? $0 : nil }
             let right = rhs.item.projectPath.flatMap { projectScores[$0] }.flatMap { $0.isFinite ? $0 : nil }
             if left != right { return (left ?? -.infinity) > (right ?? -.infinity) }
@@ -202,6 +218,7 @@ public enum WorkItemRecommendation {
 /// general YAML implementation: deliberately accepting only scalar fields here keeps
 /// the on-disk contract small, inspectable, and dependency-free.
 public final class WorkItemService: @unchecked Sendable {
+    private static let connectedWriteLock = NSRecursiveLock()
     public static let markerKey = "better-workspace"
     public static let fileSuffix = ".bw.md"
     private let fm = FileManager.default
@@ -252,6 +269,22 @@ public final class WorkItemService: @unchecked Sendable {
             }
         }
         throw CocoaError(.fileWriteFileExists)
+    }
+
+    /// Creates at a destination already shown in a reviewed creation plan. Never
+    /// chooses another filename on replay and never replaces an occupied path.
+    /// Bounded path and source-identity checks belong to the calling editor.
+    public func createAtReviewedURL(_ item: WorkItem) throws -> WorkItem {
+        guard item.url.lastPathComponent.hasSuffix(Self.fileSuffix),
+              (try item.url.deletingLastPathComponent().resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true else { throw CocoaError(.fileNoSuchFile) }
+        let staged = try stage(render(item), beside: item.url)
+        defer { try? fm.removeItem(at: staged) }
+        let handle = try FileHandle(forWritingTo: staged)
+        defer { try? handle.close() }
+        try handle.synchronize()
+        try fm.moveItem(at: staged, to: item.url)
+        guard let saved = read(at: item.url), saved.id == item.id else { throw WorkItemError.changedOnDisk(item.url) }
+        return saved
     }
 
     public func read(at url: URL) -> WorkItem? {
@@ -347,15 +380,23 @@ public final class WorkItemService: @unchecked Sendable {
     /// Keep one deterministic representative rather than handing SwiftUI two rows with
     /// the same identity (which causes selection and edits to target an arbitrary row).
     /// The files remain untouched for the person to resolve.
+    ///
+    /// A copy in a Backups folder is a snapshot and never represents a live record with
+    /// the same id: the October 20 To Do backup kept every id, sorted first, and froze
+    /// 1,353 tasks at their backed-up content while edits went into the snapshot.
+    /// UUID ids compare without case, as their workspace record identity does.
     public static func indexed(_ items: [WorkItem]) -> [WorkItem] {
         var unique: [String: WorkItem] = [:]
         for item in items {
-            if let existing = unique[item.id] {
-                if item.url.canonicalPath.localizedStandardCompare(existing.url.canonicalPath) == .orderedAscending {
-                    unique[item.id] = item
+            let key = UUID(uuidString: item.id)?.uuidString ?? item.id
+            if let existing = unique[key] {
+                let (snapshot, existingSnapshot) = (isSnapshotCopy(item), isSnapshotCopy(existing))
+                if snapshot != existingSnapshot ? !snapshot
+                    : item.url.canonicalPath.localizedStandardCompare(existing.url.canonicalPath) == .orderedAscending {
+                    unique[key] = item
                 }
             } else {
-                unique[item.id] = item
+                unique[key] = item
             }
         }
         return unique.values.sorted { lhs, rhs in
@@ -364,6 +405,10 @@ public final class WorkItemService: @unchecked Sendable {
             if lhs.priority != rhs.priority { return lhs.priority.rank < rhs.priority.rank }
             return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
         }
+    }
+
+    static func isSnapshotCopy(_ item: WorkItem) -> Bool {
+        item.url.canonicalPath.split(separator: "/").dropLast().contains { $0 == WorkspaceArea.backups.rawValue }
     }
 
     // MARK: Incremental updates
@@ -438,6 +483,7 @@ public final class WorkItemService: @unchecked Sendable {
     }
 
     public func update(_ item: WorkItem) throws -> WorkItem {
+        Self.connectedWriteLock.lock(); defer { Self.connectedWriteLock.unlock() }
         var value = item
         if let previous = read(at: item.url), previous.priority != item.priority,
            var metadata = item.actionMetadata, metadata.legacyPriority != item.priority {
@@ -446,6 +492,34 @@ public final class WorkItemService: @unchecked Sendable {
         }
         try write(value, expectedModificationDate: item.modifiedAt)
         return read(at: item.url) ?? item
+    }
+
+    public func connectedRevision(_ item: WorkItem) -> String {
+        SHA256.hash(data: Data((item.url.standardizedFileURL.path + "\n" + render(item)).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// A status is set, never toggled. The retry marker is committed in the same atomic
+    /// file replacement as the status, so a crash cannot leave an unreceipted toggle.
+    public func setConnectedStatus(_ item: WorkItem, expectedRevision: String, status: WorkItemStatus,
+                                   requestID: UUID, now: Date = .now) throws -> WorkItem {
+        Self.connectedWriteLock.lock(); defer { Self.connectedWriteLock.unlock() }
+        guard let current = read(at: item.url), current.id == item.id, current.kind == .task else {
+            throw WorkItemError.missing(item.url)
+        }
+        let key = "home-page-command: "
+        let fingerprint = SHA256.hash(data: Data((item.id + ":" + expectedRevision + ":" + status.rawValue).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let marker = key + requestID.uuidString + ":" + fingerprint
+        if current.extraFrontMatter.contains(marker), current.status == status { return current }
+        guard !current.extraFrontMatter.contains(where: { $0.hasPrefix(key + requestID.uuidString + ":") }),
+              connectedRevision(current) == expectedRevision else { throw WorkItemError.changedOnDisk(item.url) }
+        var edited = current
+        edited.status = status
+        edited.completedAt = status == .completed ? (current.completedAt ?? now) : nil
+        edited.extraFrontMatter.removeAll { $0.hasPrefix(key) }
+        edited.extraFrontMatter.append(marker)
+        return try update(edited)
     }
 
     public func complete(_ item: WorkItem, now: Date = Date()) throws -> WorkItem {

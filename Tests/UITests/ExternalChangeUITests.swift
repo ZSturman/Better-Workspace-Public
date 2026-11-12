@@ -133,6 +133,68 @@ final class ExternalChangeUITests: IsolatedUITestCase {
         XCTAssertTrue(app.staticTexts["Fixture project"].exists)
     }
 
+    /// A project moved out in Finder while its row's context menu was open crashed the
+    /// app (October 26): AppKit drew the menu highlight for a row that no longer existed
+    /// (`NSTableRowData rowViewAtRow:`). The listing now waits until the menu closes.
+    /// The crash is timing-dependent: this test also passed with that wait disabled
+    /// (October 27), so it guards the app staying up rather than reproducing the crash.
+    func testAProjectMovedOutWhileItsContextMenuIsOpenLeavesTheAppRunning() throws {
+        let projects = Self.workspaceRoot.appendingPathComponent("Projects")
+        let names = ["Menu project A", "Menu project B"]
+        for name in names {
+            let folder = projects.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try "x".write(to: folder.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        }
+        let app = try launch(startingIn: "Projects")
+        let row = app.staticTexts["Menu project B"]
+        XCTAssertTrue(row.waitForExistence(timeout: 20))
+        row.rightClick()
+        XCTAssertTrue(app.menuItems.firstMatch.waitForExistence(timeout: 5), "The row's context menu is open")
+        for name in names {
+            try FileManager.default.moveItem(at: projects.appendingPathComponent(name), to: Self.fixtureRoot.appendingPathComponent(name))
+        }
+        sleep(6)  // the file observer and listing read finish while the menu stays open
+        XCTAssertEqual(app.state, .runningForeground, "A listing change under an open context menu must not take the app down")
+        app.typeKey(.escape, modifierFlags: [])
+        let gone = NSPredicate(format: "exists == false")
+        expectation(for: gone, evaluatedWith: row)
+        waitForExpectations(timeout: 15)
+        XCTAssertEqual(app.state, .runningForeground)
+        XCTAssertTrue(app.staticTexts["Fixture project"].exists)
+    }
+
+    /// The same, at the scale of the real crash: the menu is open on the last of many rows
+    /// and most of the rows go at once, so the table is reloaded rather than edited.
+    func testManyProjectsMovedOutUnderAnOpenContextMenuLeaveTheAppRunning() throws {
+        let projects = Self.workspaceRoot.appendingPathComponent("Projects")
+        let names = (1...40).map { String(format: "Bulk project %02d", $0) }
+        for name in names {
+            let folder = projects.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try "x".write(to: folder.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        }
+        let app = try launch(startingIn: "Projects")
+        let last = app.staticTexts["Bulk project 40"]
+        XCTAssertTrue(last.waitForExistence(timeout: 20))
+        if !last.isHittable { app.typeKey(.end, modifierFlags: []) }
+        last.rightClick()
+        XCTAssertTrue(app.menuItems.firstMatch.waitForExistence(timeout: 5), "The row's context menu is open")
+        let away = Self.fixtureRoot.appendingPathComponent("Moved away", isDirectory: true)
+        try FileManager.default.createDirectory(at: away, withIntermediateDirectories: true)
+        for name in names.dropFirst() {
+            try FileManager.default.moveItem(at: projects.appendingPathComponent(name), to: away.appendingPathComponent(name))
+        }
+        sleep(8)
+        XCTAssertEqual(app.state, .runningForeground, "Rows reloaded under an open context menu must not take the app down")
+        app.typeKey(.escape, modifierFlags: [])
+        let gone = NSPredicate(format: "exists == false")
+        expectation(for: gone, evaluatedWith: last)
+        waitForExpectations(timeout: 15)
+        XCTAssertTrue(app.staticTexts["Bulk project 01"].exists)
+        XCTAssertEqual(app.state, .runningForeground)
+    }
+
     /// The whole Workspace going away (a drive unplugged) must read as unavailable, not
     /// as every area emptied — and coming back must bring it all back without a relaunch.
     func testAMissingWorkspaceSaysSoKeepsWhatItShowedAndRecovers() throws {

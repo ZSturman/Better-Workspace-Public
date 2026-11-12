@@ -66,7 +66,9 @@ final class MobileWorkLifecycleUITests: XCTestCase {
 
     private func chartValue(_ app: XCUIApplication, _ identifier: String) -> String {
         let chart = app.descendants(matching: .any)[identifier]
-        XCTAssertTrue(chart.waitForExistence(timeout: 10), "\(identifier) missing")
+        // A project's progress sits in Up Next, below its details; lists build rows lazily.
+        if !chart.waitForExistence(timeout: 5) { app.scrollTo(chart) }
+        XCTAssertTrue(chart.exists, "\(identifier) missing")
         return chart.value as? String ?? ""
     }
 
@@ -77,7 +79,7 @@ final class MobileWorkLifecycleUITests: XCTestCase {
         XCTAssertTrue(work.waitForExistence(timeout: 20)); work.tap()
 
         // Complete: the detail updates in place, and the button becomes Reopen.
-        app.buttons["work-toggle-completion"].tap()
+        app.scrollTo(app.buttons["work-toggle-completion"]); app.buttons["work-toggle-completion"].tap()
         XCTAssertTrue(label(app, "Status, Completed").waitForExistence(timeout: 10))
         XCTAssertEqual(app.buttons["work-toggle-completion"].label, "Reopen")
         shoot("work-completed-detail")
@@ -92,9 +94,10 @@ final class MobileWorkLifecycleUITests: XCTestCase {
         // Restore from the Completed group.
         app.workspaceDestination("Work").tap()
         let completed = app.buttons["Completed (2)"]
-        XCTAssertTrue(completed.waitForExistence(timeout: 10)); completed.tap()
-        XCTAssertTrue(row(app, title).waitForExistence(timeout: 10)); row(app, title).tap()
-        app.buttons["work-toggle-completion"].tap()
+        XCTAssertTrue(completed.waitForExistence(timeout: 10)); app.scrollTo(completed); completed.tap()
+        _ = row(app, title).waitForExistence(timeout: 10)
+        XCTAssertTrue(app.scrollTo(row(app, title))); row(app, title).tap()
+        app.scrollTo(app.buttons["work-toggle-completion"]); app.buttons["work-toggle-completion"].tap()
         XCTAssertTrue(label(app, "Status, Open").waitForExistence(timeout: 10))
         back(app)
         XCTAssertTrue(app.staticTexts["Now"].waitForExistence(timeout: 10), "Reopened work returns to Now")
@@ -102,7 +105,7 @@ final class MobileWorkLifecycleUITests: XCTestCase {
 
         // Delete, after confirming.
         row(app, title).tap()
-        app.buttons["work-delete"].tap()
+        app.scrollTo(app.buttons["work-delete"]); app.buttons["work-delete"].tap()
         shoot("work-delete-confirmation")
         confirmDelete(app)
         XCTAssertTrue(app.navigationBars["Work"].waitForExistence(timeout: 10), "Deleting leaves the detail screen")
@@ -112,7 +115,8 @@ final class MobileWorkLifecycleUITests: XCTestCase {
         XCTAssertTrue(project.waitForExistence(timeout: 10))
         XCTAssertFalse(project.label.contains(title), "The project row still names deleted work")
         project.tap()
-        XCTAssertTrue(app.staticTexts["Up Next"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.navigationBars["Example"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.scrollTo(app.staticTexts["Up Next"]))
         XCTAssertFalse(row(app, title).exists, "The project page still lists deleted work")
         shoot("work-deleted-project")
 
@@ -177,14 +181,15 @@ final class MobileWorkLifecycleUITests: XCTestCase {
         app.buttons["Save"].tap()
         XCTAssertTrue(app.staticTexts[marker + " edited"].waitForExistence(timeout: 10))
         XCTAssertTrue(label(app, "Due, ").exists, "Editing kept the due date")
-        app.buttons["work-toggle-completion"].tap()
+        app.scrollTo(app.buttons["work-toggle-completion"]); app.buttons["work-toggle-completion"].tap()
         XCTAssertTrue(label(app, "Status, Completed").waitForExistence(timeout: 10))
 
         app.terminate()
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 10))
         let relaunched = launch(fresh: false)
         let group = relaunched.buttons["Completed (2)"]
-        XCTAssertTrue(group.waitForExistence(timeout: 20)); group.tap()
+        if !group.waitForExistence(timeout: 20) { relaunched.scrollTo(group) }
+        XCTAssertTrue(group.exists); group.tap()
         let saved = row(relaunched, marker + " edited")
         XCTAssertTrue(saved.waitForExistence(timeout: 10)); saved.tap()
         XCTAssertTrue(label(relaunched, "Due, ").waitForExistence(timeout: 10))
@@ -225,7 +230,7 @@ final class MobileWorkLifecycleUITests: XCTestCase {
         app.workspaceDestination("Work").tap()
         let task = row(app, "Sketch the next screen")
         XCTAssertTrue(task.waitForExistence(timeout: 10)); task.tap()
-        app.buttons["work-toggle-completion"].tap()
+        app.scrollTo(app.buttons["work-toggle-completion"]); app.buttons["work-toggle-completion"].tap()
         XCTAssertTrue(label(app, "Status, Completed").waitForExistence(timeout: 10))
         back(app)
         let workspaceAfter = "1 next · 1 later · 50% done"

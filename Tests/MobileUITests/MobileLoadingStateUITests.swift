@@ -35,7 +35,7 @@ final class MobileLoadingStateUITests: XCTestCase {
         attach("Overview loading portrait")
 
         for tab in ["Projects", "Work", "Ideas"] {
-            app.workspaceDestination(tab).tap()
+            if tab == "Ideas" { app.workspaceDestination(tab).tap() } else { app.openPlanning(tab) }
             XCTAssertTrue(app.descendants(matching: .any)["mobile-loading"].firstMatch.waitForExistence(timeout: 5),
                           "\(tab) should say it is loading")
             attach("\(tab) loading portrait")

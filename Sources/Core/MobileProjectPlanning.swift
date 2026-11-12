@@ -26,11 +26,13 @@ public struct MobileProjectEnvelope: Codable {
 }
 
 public struct MobileProjectProperties: Hashable, Codable, Sendable {
+    public var portfolio: ProjectPortfolioDetails?
     public var domain: String
     public var status: String
     public var phase: String
     public var projectType: String
     public init(_ details: MobileProjectDetails) {
+        portfolio = details.editablePortfolio
         domain = details.domain ?? ""; status = details.status ?? ""; phase = details.phase ?? ""; projectType = details.projectType ?? ""
     }
     public init(_ metadata: ProjectMetadata) {
@@ -43,7 +45,7 @@ public struct MobileProjectProperties: Hashable, Codable, Sendable {
     }
     public func isReflected(in details: MobileProjectDetails, from original: MobileProjectDetails) -> Bool {
         let changed = changedFields(from: original), current = Self(details)
-        return (!changed.contains("domain") || current.domain == domain) && (!changed.contains("Status") || current.status == status)
+        return (portfolio == nil || (try? ProjectProperties.merging(portfolio!, original: original.editablePortfolio, current: details.editablePortfolio)) == details.editablePortfolio) && (!changed.contains("domain") || current.domain == domain) && (!changed.contains("Status") || current.status == status)
             && (!changed.contains("Phase") || current.phase == phase) && (!changed.contains("Type") || current.projectType == projectType)
     }
 }
@@ -56,9 +58,10 @@ public struct MobileProjectEdit: Hashable, Codable, Sendable {
     public var properties: MobileProjectProperties?
     public init(original: MobileProjectDetails, ratings: [String: Int], oneLiner: String, summary: String, properties: MobileProjectProperties? = nil) {
         self.properties = properties
-        self.original = original; self.ratings = ratings; self.oneLiner = oneLiner; self.summary = summary
+        self.original = original; self.original.history = nil; self.ratings = ratings; self.oneLiner = oneLiner; self.summary = summary
     }
     public func validate() throws {
+        if let portfolio = properties?.portfolio { try ProjectProperties.validateChanges(portfolio, from: original.editablePortfolio) }
         if let properties {
             guard [properties.domain, properties.status, properties.phase, properties.projectType].allSatisfy({ $0.utf8.count <= 200 && !$0.contains("\n") }) else {
                 throw MobilePlanningFiles.Error.invalid("Keep each property under 200 bytes and on one line.")
@@ -119,6 +122,13 @@ extension ProjectStore {
                     try db.run("INSERT INTO project_metadata(project_id,\(column),updated_at) VALUES (?,?,?) ON CONFLICT(project_id) DO UPDATE SET \(column)=excluded.\(column),updated_at=excluded.updated_at",
                         [.text(id), desired.isEmpty ? .null : .text(desired), .double(Date().timeIntervalSince1970)])
                 }
+            }
+            if let desired = change.properties?.portfolio {
+                let before = change.original.editablePortfolio
+                let current = portfolioDetails(for: id)
+                let merged = try ProjectProperties.merging(desired, original: before, current: current)
+                let data = try JSONEncoder().encode(merged)
+                try db.run("INSERT INTO project_portfolio_details(project_id,details_json,updated_at) VALUES (?,?,?) ON CONFLICT(project_id) DO UPDATE SET details_json=excluded.details_json,updated_at=excluded.updated_at", [.text(id), .text(String(decoding: data, as: UTF8.self)), .double(Date().timeIntervalSince1970)])
             }
             // Throw on storage failures so a phone never gets a false success receipt.
             for metric in MetricDefinition.all {

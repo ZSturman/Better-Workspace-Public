@@ -157,7 +157,7 @@ public enum MobileWorkspaceProjection {
                 body: item.body.utf8.count <= MobilePlanningFiles.maximumTextBytes ? item.body : nil,
                 actionMetadata: item.actionMetadata, dependencyIDs: item.dependencyIDs,
                 featureIDs: item.featureIDs, milestoneIDs: item.milestoneIDs,
-                createdAt: item.createdAt, modifiedAt: item.modifiedAt, completedAt: item.completedAt, importedNotionPageID: item.importedNotionPageID
+                createdAt: item.createdAt, modifiedAt: item.modifiedAt, completedAt: item.completedAt, importedNotionPageID: item.importedNotionPageID, workspaceFolderID: WorkspaceMacProjection.workspaceFolderID(in: item)
             )))
         }
 
@@ -464,6 +464,39 @@ public actor MobileCloudPublisher {
         do { try await database.deleteRecord(withID: CKRecord.ID(recordName: recordName)) }
         catch let error as CKError where error.code == .unknownItem { return }
         catch { throw Self.cloudError(error) }
+    }
+
+    public func receiveIdeaCapture(name: String) async throws -> MobileDownloadBundle {
+        let database = try await database()
+        let record = try await database.record(for: CKRecord.ID(recordName: name))
+        guard record.recordType == MobileCloudSchema.downloadRecordType, record["path"] as? String == name,
+              let asset = record["bundle"] as? CKAsset, let file = asset.fileURL else {
+            throw MobilePlanningFiles.Error.invalid("The idea transfer is incomplete.")
+        }
+        defer { withExtendedLifetime(record) {} }
+        return try MobileDownloadBundle.read(from: file)
+    }
+
+    /// Keep a small receipt at the transfer ID so a late retry cannot recreate the
+    /// asset or the idea. Only the app-owned transfer bytes are cleared.
+    public func finishIdeaCapture(name: String, filedName: String?) async throws {
+        let database = try await database()
+        let id = CKRecord.ID(recordName: name)
+        let values = try await database.records(for: [id], desiredKeys: ["path"])
+        guard let record = try values[id]?.get(), record.recordType == MobileCloudSchema.downloadRecordType else {
+            throw MobilePlanningFiles.Error.invalid("The idea transfer is unavailable.")
+        }
+        let path = record["path"] as? String
+        let receipt = MobileIdeaCapture.receipt(name)
+        if path == receipt || path?.hasPrefix(receipt + "/") == true { return }
+        guard path == name else { throw MobileCloudError.malformedRecord("idea transfer") }
+        record["path"] = MobileIdeaCapture.receipt(name, filedName: filedName)
+        record["bundle"] = nil
+        let results = try await database.modifyRecords(saving: [record], deleting: [], savePolicy: .allKeys, atomically: true)
+        guard let result = results.saveResults[id] else {
+            throw MobilePlanningFiles.Error.invalid("iCloud did not confirm the idea receipt.")
+        }
+        _ = try result.get()
     }
 
     public func publishDownload(file: URL, requestID: UUID, path: String) async throws {

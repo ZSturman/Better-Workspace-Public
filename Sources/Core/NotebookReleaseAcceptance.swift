@@ -20,6 +20,7 @@ public enum NotebookReleaseAcceptance {
     public static var isBackendTest: Bool {
         #if DEBUG
         ProcessInfo.processInfo.environment["BW_RUN_NOTEBOOK_CLOUD_ACCEPTANCE"] == "1"
+            || ProcessInfo.processInfo.environment["BW_RUN_ISOLATED_CORE_TESTS"] == "1"
         #else
         false
         #endif

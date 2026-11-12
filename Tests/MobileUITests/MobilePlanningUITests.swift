@@ -16,14 +16,17 @@ final class MobilePlanningUITests: XCTestCase {
         shot.name = name; shot.lifetime = .keepAlways; add(shot)
     }
     func testIdeasOpenDescriptionTagsAndFilesAndCanBecomeFeatures() {
-        let app = launch("ideas")
+        // Fresh: MobileDeletionUITests deletes this idea in the shared fixture suite.
+        let app = launch("ideas", fresh: true)
         let idea = app.buttons["mobile-idea-Ideas/Example.md"]
         XCTAssertTrue(idea.waitForExistence(timeout: 20)); idea.tap()
-        XCTAssertTrue(app.staticTexts["Title, description, then supporting files."].waitForExistence(timeout: 10))
+        // The description carries the `idea-description` identifier, so match its label.
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label == %@", "Title, description, then supporting files.")).firstMatch.waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Design"].exists)
-        XCTAssertTrue(app.staticTexts["reference.png"].exists)
+        // Scoring, offline access and previews sit between the description and its files.
+        XCTAssertTrue(app.scrollTo(app.staticTexts["reference.png"]))
         shoot("mobile-idea-detail")
-        app.buttons["Create feature plan"].tap()
+        app.scrollTo(app.buttons["Create feature plan"]); app.buttons["Create feature plan"].tap()
         XCTAssertTrue(app.navigationBars["New Feature"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons["Save"].isEnabled, "A project is optional; without one it waits under Needs Attention")
         app.buttons["work-link-project"].tap()
@@ -38,10 +41,11 @@ final class MobilePlanningUITests: XCTestCase {
         let app = launch("projects")
         let project = app.buttons["mobile-project-Projects/Example"]
         XCTAssertTrue(project.waitForExistence(timeout: 20)); project.tap()
-        XCTAssertTrue(app.staticTexts["Up Next"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.navigationBars["Example"].waitForExistence(timeout: 10))
+        // Zen mode, details and previews precede the work (October 19); Up Next follows them.
         let next = app.buttons.containing(NSPredicate(format: "label CONTAINS %@", "Sketch the next screen")).firstMatch
-        // Waits out the push animation instead of sampling hittability mid-flight.
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"), object: next)], timeout: 10), .completed)
+        XCTAssertTrue(app.scrollTo(next), "Up Next lists the project's next work")
+        XCTAssertTrue(app.staticTexts["Up Next"].exists)
         shoot("mobile-project-next-steps")
         for (kind, title) in [("feature", "New Feature"), ("milestone", "New Milestone")] {
             // One Add menu in the toolbar, for every kind.

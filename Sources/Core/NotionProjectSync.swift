@@ -60,13 +60,23 @@ public actor NotionProjectSync {
             }
         }
         try store.write("sources", sources)
+        // A full read (which also verifies pages that disappeared) is due per source once a
+        // day. It used to be one timestamp, written only when the whole check had no
+        // failure, so one failing lookup made every automatic pass re-read every page of
+        // every source (November 9: a 404 on one seed, ~4,700 pages every five minutes).
         let fullAt = try store.read("lastFullCheck", as: Date.self)
-        let full = forceFull || fullAt == nil || Date().timeIntervalSince(fullAt!) > 86400
+        func fullDue(_ source: ProjectGraphSource) throws -> Bool {
+            guard !forceFull, let at = try store.read("fullCheck:\(source.id)", as: Date.self) ?? fullAt else { return true }
+            return Date().timeIntervalSince(at) > 86400
+        }
+        var anyFull = false
         let retainedCounts = Dictionary(grouping: try store.records().filter { $0.pageID != nil }, by: \.sourceID).mapValues(\.count)
         var changedTaskIDs = Set<String>(), changedTaskRelations = Set<String>(), ingested = Set<String>()
         for source in sources {
             report.counts[source.title] = retainedCounts[source.id] ?? 0
             let started = Date()
+            let full = try fullDue(source)
+            anyFull = anyFull || full
             do {
                 let since = full ? nil : try store.read("cursor:\(source.id)", as: Date.self)?.addingTimeInterval(-120)
                 let result = try await client.graphPages(sourceID: source.id, since: since)
@@ -90,6 +100,7 @@ public actor NotionProjectSync {
                 }
                 try store.ingest(pages: verified, source: source)
                 try store.write("cursor:\(source.id)", started)
+                if full { try store.write("fullCheck:\(source.id)", started) }
                 ingested.insert(source.id)
             } catch { report.failures[source.title] = error.localizedDescription }
         }
@@ -114,16 +125,17 @@ public actor NotionProjectSync {
             let counts = Dictionary(grouping: records.filter { $0.pageID != nil && ingested.contains($0.sourceID) }, by: \.sourceID).mapValues(\.count)
             for source in sources where ingested.contains(source.id) { report.counts[source.title] = counts[source.id] ?? 0 }
         }
-        if full && report.failures.isEmpty { try store.write("lastFullCheck", Date()) }
+        if anyFull && report.failures.isEmpty { try store.write("lastFullCheck", Date()) }
         report.checkedAt = Date()
-        report.unresolvedReferences = try store.unresolvedReferences().count
-        report.referenceDetails = try store.referenceDetails(sources: sources)
+        let references = try store.referenceSummary(sources: sources)
+        report.unresolvedReferences = references.unresolved
+        report.referenceDetails = references.details
         try store.write("report", report)
         return report
     }
 
     /// Re-fetch before applying any reviewed field. Never substitute a stale snapshot.
-    public func pull(ids: Set<String>, reviewed: [ProjectGraphRecord], resolutions: [String: [String: Bool]] = [:]) async throws {
+    public func pull(ids: Set<String>, reviewed: [ProjectGraphRecord], resolutions: [String: [String: Bool]] = [:], choices: [String: [String: ProjectSyncTriage.Side]] = [:]) async throws {
         let owner = "pid:\(ProcessInfo.processInfo.processIdentifier):\(UUID().uuidString)"
         guard try store.acquire(owner: owner) else { throw SyncError.busy }
         defer { try? store.release(owner: owner) }
@@ -153,18 +165,24 @@ public actor NotionProjectSync {
                 let latest = try store.record(id: prior.id)
                 guard latest?.remote.mapValues(\.comparable) == prior.remote.mapValues(\.comparable), latest?.remoteArchived == prior.remoteArchived, latest?.editedAt == prior.editedAt else { throw SyncError.stale }
             }
-            if current.changes.contains(where: { $0.state == .conflict && resolutions[prior.id]?[$0.id] == nil }) { throw SyncError.conflict(current.title) }
+            if current.changes.contains(where: { $0.state == .conflict && resolutions[prior.id]?[$0.id] == nil && choices[prior.id]?[$0.id] == nil }) { throw SyncError.conflict(current.title) }
         }
         try Task.checkCancellation()
-        for prior in selected { try store.acceptIncoming(prior.id, resolutions: resolutions[prior.id] ?? [:]) }
+        for prior in selected {
+            if let chosen = choices[prior.id], !chosen.isEmpty {
+                guard try store.resolve(prior.id, choices: chosen, expected: prior) else { throw SyncError.stale }
+            }
+            try store.acceptIncoming(prior.id, resolutions: resolutions[prior.id] ?? [:])
+        }
     }
 
     /// `fields` restricts a reviewed merge to those existing-page properties. Other
     /// conflicts, incoming values, archives and uploads remain pending.
     public func push(ids: Set<String>, reviewed: [ProjectGraphRecord], resolutions: [String: [String: Bool]] = [:],
-                     fields: [String: Set<String>]? = nil, createProjectsOnly: Bool = false) async throws {
+                     fields: [String: Set<String>]? = nil, createProjectsOnly: Bool = false,
+                     choices: [String: [String: ProjectSyncTriage.Side]] = [:]) async throws {
         if createProjectsOnly {
-            guard fields == nil, ids.count == 1, reviewed.filter({ ids.contains($0.id) }).count == 1,
+            guard fields == nil, choices.isEmpty, ids.count == 1, reviewed.filter({ ids.contains($0.id) }).count == 1,
                   reviewed.filter({ ids.contains($0.id) }).allSatisfy({ $0.kind == .projects && $0.pageID == nil && !$0.archiveRequested })
             else { throw SyncError.unsupported("Review one unlinked project to create its Notion page.") }
         }
@@ -183,10 +201,11 @@ public actor NotionProjectSync {
             if let fields {
                 guard record.pageID != nil, !record.remoteArchived,
                       let selectedFields = fields[record.id], !selectedFields.isEmpty,
-                      selectedFields.allSatisfy({ source.writable($0) }) else { throw SyncError.stale }
+                      selectedFields.allSatisfy({ source.writable($0) }),
+                      (choices[record.id] ?? [:]).keys.allSatisfy(selectedFields.contains) else { throw SyncError.stale }
             }
             if record.ambiguousCreate { throw SyncError.ambiguous(record.title) }
-            if record.changes.contains(where: { $0.state == .conflict && (fields == nil || fields?[record.id]?.contains($0.id) == true) && resolutions[record.id]?[$0.id] == nil }) { throw SyncError.conflict(record.title) }
+            if record.changes.contains(where: { $0.state == .conflict && (fields == nil || fields?[record.id]?.contains($0.id) == true) && resolutions[record.id]?[$0.id] == nil && choices[record.id]?[$0.id] == nil }) { throw SyncError.conflict(record.title) }
             if let pageID = prior.pageID {
                 let fresh = try await client.completeProperties(try await client.graphRequest("pages/\(pageID)"))
                 try store.ingest(pages: [fresh], source: source)
@@ -242,6 +261,9 @@ public actor NotionProjectSync {
                     record.baseline[key] = record.remote[key] ?? .null
                 }
                 try store.save(record)
+            }
+            if let chosen = choices[record.id], !chosen.isEmpty {
+                guard try store.resolve(record.id, choices: chosen, expected: record) else { throw SyncError.stale }
             }
             if fields == nil { try store.acceptIncoming(record.id, resolutions: resolutions[record.id] ?? [:]) }
             record = try store.record(id: prior.id)!

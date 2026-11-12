@@ -596,9 +596,13 @@ private struct ProcessingPane: View {
 
     private var resolvedFilename: String {
         let base = renameOnMove.trimmingCharacters(in: .whitespacesAndNewlines)
-        let name = base.isEmpty ? item.url.deletingPathExtension().lastPathComponent : base
+        let isIdea = chosenDestination?.name == WorkspaceArea.ideas.directoryName
+        let originalName = isIdea && item.item.isDirectory
+            ? item.url.lastPathComponent : item.url.deletingPathExtension().lastPathComponent
+        let name = base.isEmpty ? originalName : base
         let ext = item.url.pathExtension
-        return (item.item.isDirectory || ext.isEmpty) ? name : "\(name).\(ext)"
+        let filename = (item.item.isDirectory || ext.isEmpty) ? name : "\(name).\(ext)"
+        return isIdea && !item.item.isDirectory ? "\(name)/\(filename)" : filename
     }
 
     @MainActor

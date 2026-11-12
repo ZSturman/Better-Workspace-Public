@@ -13,6 +13,8 @@ struct MobilePlanningStatusSection: View {
                     if !waiting.isEmpty {
                         Label("\(waiting.count) change\(waiting.count == 1 ? "" : "s") waiting for the Mac", systemImage: "clock")
                             .font(.footnote).foregroundStyle(.secondary)
+                        Text("Saved on this device. Better Workspace will apply these changes automatically when it is running on your Mac and iCloud is available.")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                     ForEach(model.planningDrafts.filter { model.planningErrors[$0.id.uuidString] != nil }) { draft in
                         NavigationLink { MobileSavedDraftView(draft: draft) } label: {
@@ -37,16 +39,31 @@ struct MobilePlanningStatusSection: View {
 
 }
 
-private struct MobileSavedDraftView: View {
+struct MobileSavedDraftView: View {
     @Environment(MobileWorkspaceModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     let draft: MobilePlanningEdit
+    private var isHistory: Bool { model.planningHistory.contains { $0.id == draft.id } }
     var body: some View {
         List {
-            Text(model.planningErrors[draft.id.uuidString] ?? "Waiting for the Mac.").foregroundStyle(.secondary)
+            Text(isHistory ? "Saved values from this device. Compare these with the current project details before making another change." : model.planningErrors[draft.id.uuidString] ?? "Saved on this device. Waiting for confirmed values from the Mac.").foregroundStyle(.secondary)
             Section {
                 Text(draft.title).font(.headline).textSelection(.enabled)
                 if let change = draft.projectEdit {
+                    if let properties = change.properties {
+                        LabeledContent("Domain", value: properties.domain.isEmpty ? "Not set" : properties.domain)
+                        LabeledContent("Status", value: properties.status.isEmpty ? "Not set" : properties.status)
+                        LabeledContent("Phase", value: properties.phase.isEmpty ? "Not set" : properties.phase)
+                        LabeledContent("Type", value: properties.projectType.isEmpty ? "Not set" : properties.projectType)
+                        if let portfolio = properties.portfolio {
+                            LabeledContent("Featured", value: portfolio.featured == true ? "Yes" : "No")
+                            LabeledContent("In showcase", value: portfolio.inShowcase == true ? "Yes" : "No")
+                            LabeledContent("Public", value: portfolio.isPublic == true ? "Yes" : "No")
+                            if let url = portfolio.githubURL { LabeledContent("GitHub", value: url) }
+                            if let url = portfolio.websiteURL { LabeledContent("Website", value: url) }
+                            ForEach(portfolio.customLinks ?? []) { link in LabeledContent(link.label, value: link.url) }
+                        }
+                    }
                     Text(change.oneLiner).textSelection(.enabled)
                     MarkdownView(text: change.summary)
                     ForEach(change.ratings.keys.sorted(), id: \.self) { key in
@@ -76,7 +93,7 @@ private struct MobileSavedDraftView: View {
                     LabeledContent("Priority", value: work.priority.rawValue.capitalized)
                     if let path = work.projectPath { LabeledContent("Project", value: path) }
                 }
-            } header: { Label("Saved phone draft · not applied", systemImage: "iphone").foregroundStyle(.blue) }
+            } header: { Label(isHistory ? "Saved change history" : "Saved device draft", systemImage: "internaldrive").foregroundStyle(.blue) }
             if let original = draft.originalWork, let latest = model.macWorkItems.first(where: { $0.id == original.id }) {
                 Section {
                     Text(latest.title).font(.headline)
@@ -89,7 +106,9 @@ private struct MobileSavedDraftView: View {
             }
             Text(draft.inboxReview == nil ? "Copy any changes you want to keep, refresh the record, then edit its current version."
                  : "Nothing was moved. Discard this decision; the item comes back to Overview when it is due.").foregroundStyle(.secondary)
-            Button("Discard saved draft", role: .destructive) { model.discardPlanningDraft(draft.id); dismiss() }
+            if model.planningErrors[draft.id.uuidString] != nil {
+                Button("Discard saved draft", role: .destructive) { model.discardPlanningDraft(draft.id); dismiss() }
+            }
         }.navigationTitle("Review draft")
     }
 }
@@ -122,6 +141,9 @@ struct MobileWorkItemDetailView: View {
                 LabeledContent("Stage", value: current.stage.displayName)
                 LabeledContent("Status", value: current.status.displayName)
                 LabeledContent("Priority", value: current.priority.rawValue.capitalized)
+                if let owner = current.actionMetadata?.responsibilityLabel {
+                    LabeledContent("For", value: owner).accessibilityIdentifier("work-responsibility")
+                }
                 if let due = current.dueDate { LabeledContent("Due", value: due.formatted(date: .abbreviated, time: .omitted)) }
                 TagPills(tags: model.tags(for: current.tagIDs))
             }
@@ -171,7 +193,11 @@ struct MobileWorkItemDetailView: View {
 struct MobileWorkEditor: View {
     @Environment(MobileWorkspaceModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-    let original: MobileWorkItem?
+    /// The revision this draft was opened on. State, not a `let`: a refresh that redraws
+    /// the parent re-runs `init` with the newer item, and the draft below is kept; saving
+    /// against that newer revision would overwrite a change the person never saw instead
+    /// of returning it for review.
+    @State private var original: MobileWorkItem?
     private let newID = UUID()
     @State private var title: String
     @State private var bodyText: String
@@ -192,7 +218,7 @@ struct MobileWorkEditor: View {
 
     init(item: MobileWorkItem? = nil, projectPath: String? = nil, kind: WorkItemKind = .task,
          title: String = "", description: String = "", tagIDs: Set<String> = []) {
-        original = item
+        _original = State(initialValue: item)
         _title = State(initialValue: item?.title ?? title)
         _bodyText = State(initialValue: item?.body ?? description)
         _kind = State(initialValue: item?.kind ?? kind)

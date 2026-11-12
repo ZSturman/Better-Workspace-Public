@@ -35,7 +35,7 @@ struct OverviewReviewPreview: View {
                     }
                 }
                 Link(link.host ?? link.absoluteString, destination: link).font(.caption).lineLimit(2)
-                ReviewWebsitePreview(url: link).frame(height: 320)
+                WorkspaceWebsiteView(url: link).frame(height: 320)
             } else if let document = controller.document, !document.source.isEmpty {
                 ScrollView {
                     if showSource {
@@ -93,39 +93,6 @@ struct OverviewReviewPreview: View {
             do { children = try await controller.previewChildren() }
             catch is CancellationError {}
             catch { folderError = error.localizedDescription }
-        }
-    }
-}
-
-private struct ReviewWebsitePreview: NSViewRepresentable {
-    let url: URL
-    func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
-        configuration.mediaTypesRequiringUserActionForPlayback = .all
-        let view = WKWebView(frame: .zero, configuration: configuration)
-        view.navigationDelegate = context.coordinator
-        return view
-    }
-    func updateNSView(_ view: WKWebView, context: Context) {
-        guard context.coordinator.loaded != url else { return }
-        context.coordinator.loaded = url
-        view.stopLoading()
-        view.load(URLRequest(url: url))
-    }
-    static func dismantleNSView(_ view: WKWebView, coordinator: Coordinator) {
-        view.stopLoading(); view.loadHTMLString("", baseURL: nil)
-    }
-    func makeCoordinator() -> Coordinator { Coordinator() }
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        var loaded: URL?
-        func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
-                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            guard let url = action.request.url, ["http", "https", "about"].contains(url.scheme?.lowercased() ?? "") else {
-                decisionHandler(.cancel); return
-            }
-            if action.targetFrame == nil { webView.load(action.request); decisionHandler(.cancel) }
-            else { decisionHandler(.allow) }
         }
     }
 }

@@ -49,6 +49,7 @@ final class MobileModel {
     private(set) var workspaceFolders: [WorkspaceDestination] = []
     /// What this phone saved recently and where it asked for each save to be filed.
     private(set) var recentRecords: [RecentCaptureRecord] = []
+    private(set) var pendingIdeas: [MobileIdeaCapture] = []
     /// The Mac-published index (area roots and their direct children), which is how
     /// the phone learns that a capture has actually been placed.
     private(set) var publishedEntries: [MobileWorkspaceEntry] = []
@@ -254,9 +255,14 @@ final class MobileModel {
 
     /// Recent saves wherever they went, plus anything else waiting in the Inbox.
     var recentRows: [RecentCaptureRow] {
-        RecentCaptureHistory.rows(records: recentRecords,
-                                  inbox: recent.map { ($0.url, $0.modified) },
-                                  entries: publishedEntries)
+        let queued = pendingIdeas.map { capture in
+            RecentCaptureRow(name: capture.title, date: capture.intent.createdAt,
+                             placement: .filing(destination: "Ideas"), inboxURL: nil)
+        }
+        let existing = RecentCaptureHistory.rows(records: recentRecords,
+                                                 inbox: recent.map { ($0.url, $0.modified) },
+                                                 entries: publishedEntries)
+        return Array((queued + existing).sorted { $0.date > $1.date }.prefix(30))
     }
 
     /// Folders up front in the destination menu: recently used first, then the start
@@ -439,12 +445,17 @@ final class MobileModel {
     /// files even if a classification is never delivered. The failure is visible, but
     /// it remains non-blocking and retryable for configuration/connectivity problems.
     func flushClassificationOutbox() async {
-        let result = await captureQueue.flush(using: cloudStore)
-        if let error = result.blockedBy {
+        let queue = captureQueue
+        let result = await queue.flush(using: cloudStore)
+        pendingIdeas = await Task.detached(priority: .utility) { queue.pendingIdeas() }.value
+        recentRecords = queue.log.load()
+        if let error = result.blockedBy, !pendingIdeas.isEmpty {
+            classificationDeliveryMessage = "Idea saved on this device. Sync will retry. " + error.localizedDescription
+        } else if let error = result.blockedBy {
             classificationDeliveryMessage = Self.deliveryMessage(for: error)
         } else if let error = result.discardedBy {
             classificationDeliveryMessage = "The optional classification could not be sent: \(error.localizedDescription) The file is safely in Inbox."
-        } else if result.delivered > 0 {
+        } else {
             classificationDeliveryMessage = nil
         }
     }
@@ -497,6 +508,28 @@ final class MobileModel {
     }
 
     var isReady: Bool { backing == .ubiquity || backing == .bookmark }
+
+    private var usesCloudIdeas: Bool {
+        #if DEBUG
+        if UserDefaults.standard.string(forKey: Self.testInboxIDKey) != nil { return false }
+        #endif
+        return captureQueue.supportsCloudIdeas && backing != .bookmark
+            && UserDefaults.standard.string(forKey: Self.pathOverrideKey) == nil
+    }
+
+    var canSaveCapture: Bool { isReady || (selectedCaptureKind == .idea && usesCloudIdeas) }
+
+    private func stageCloudIdea(_ entries: [CaptureDraftEntry], title: String, tagIDs: Set<String>) async throws -> String {
+        let queue = captureQueue
+        let saved = try await Task.detached(priority: .userInitiated) {
+            try queue.saveIdea(entries, title: title, tagIDs: tagIDs)
+        }.value
+        pendingIdeas.append(saved)
+        IngestGuidance.captured()
+        let message = "Idea saved. Waiting for Mac sync."
+        lastSaveReceipt = message
+        return message
+    }
 
     /// Still working out where captures go — don't nag the user to pick a folder yet.
     var isResolving: Bool { backing == .resolving }
@@ -560,10 +593,29 @@ final class MobileModel {
             CaptureDraftEntry(id: $0.id, title: $0.name, content: .file($0.url))
         }
         if let entry = CaptureDraftEntry.note(id: noteID, title: title, markdown: note, url: link) { entries.insert(entry, at: 0) }
+        if selectedCaptureKind == .idea, usesCloudIdeas {
+            do {
+                statusMessage = try await stageCloudIdea(entries, title: title, tagIDs: selectedCaptureTagIDs)
+                flushSoon()
+                for attachment in draftAttachments { removeDraftAttachment(attachment) }
+                clearCaptureClassification()
+                errorMessage = nil
+                return (entries.contains { $0.id == noteID }, true)
+            } catch {
+                errorMessage = error.localizedDescription
+                return (false, false)
+            }
+        }
         let service = capture
-        let result = await Task.detached(priority: .userInitiated) { service.capture(entries) }.value
         let destination = selectedCaptureDestination
         let kind = selectedCaptureKind
+        // An idea is one capture: its note and every photo or file become one folder,
+        // which the Mac files as Idea/Idea.md + Attachments/. Other captures stay
+        // separate items, so each can be filed on its own.
+        let together = kind == .idea
+        let result = await Task.detached(priority: .userInitiated) {
+            together ? service.captureTogether(entries, title: title) : service.capture(entries)
+        }.value
         if result.saved.isEmpty == false { noteFiled(into: destination) }
         for saved in result.saved {
             recentRecords = captureQueue.record(savedURL: saved.url, destination: destination,
@@ -571,6 +623,9 @@ final class MobileModel {
             if let attachment = draftAttachments.first(where: { $0.id == saved.id }) {
                 removeDraftAttachment(attachment)
             }
+        }
+        if together, result.saved.isEmpty == false {
+            for attachment in draftAttachments { removeDraftAttachment(attachment) }
         }
         if !result.saved.isEmpty {
             statusMessage = MobileCaptureQueue.savedMessage(count: result.saved.count, destination: destination, kind: kind)
@@ -581,7 +636,7 @@ final class MobileModel {
         errorMessage = result.failures.isEmpty ? nil : result.failures.map(\.message).joined(separator: "\n")
         if result.failures.isEmpty { clearCaptureClassification() }
         refreshRecent()
-        return (result.saved.contains { $0.id == noteID }, result.failures.isEmpty)
+        return (result.saved.contains { $0.id == noteID } || (together && result.saved.isEmpty == false), result.failures.isEmpty)
     }
 
     /// Links only travel with a capture going to a work queue.
@@ -780,7 +835,6 @@ final class MobileModel {
     func captureFromIntent(text: String?, title: String?, link: String?, files: [(data: Data, filename: String)],
                            destination: MobileCaptureDestination?, kind: CaptureClassificationKind?,
                            tags: [Tag]) async throws -> String {
-        guard await ensureInboxResolved() else { throw IntentCaptureError.noInbox }
         var entries: [CaptureDraftEntry] = []
         if let note = CaptureDraftEntry.note(id: UUID(), title: title ?? "", markdown: text ?? "", url: link ?? "") {
             entries.append(note)
@@ -792,8 +846,15 @@ final class MobileModel {
             entries.append(CaptureDraftEntry(title: named.isEmpty ? base : named, content: .data(file.data, extension: ext)))
         }
         guard entries.isEmpty == false else { throw IntentCaptureError.empty }
-        let service = capture
-        let result = await Task.detached(priority: .userInitiated) { service.capture(entries) }.value
+        if kind == .idea, usesCloudIdeas {
+            let message = try await stageCloudIdea(entries, title: title ?? "", tagIDs: Set(tags.map(\.id)))
+            await flushClassificationOutbox()
+            return message
+        }
+        guard await ensureInboxResolved() else { throw IntentCaptureError.noInbox }
+        let service = capture, together = kind == .idea, ideaTitle = title ?? ""
+        // An idea keeps its note and files together; other captures stay separate items.
+        let result = await Task.detached(priority: .userInitiated) { together ? service.captureTogether(entries, title: ideaTitle) : service.capture(entries) }.value
         let tagIDs = Set(tags.map(\.id))
         for saved in result.saved {
             recentRecords = captureQueue.record(savedURL: saved.url, destination: kind == .idea ? nil : destination,

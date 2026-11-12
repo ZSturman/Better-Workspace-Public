@@ -5,10 +5,12 @@ import BetterWorkspaceCore
 
 enum SidebarSelection: Hashable {
     case overview
+    case unified
     case work
     case ingest
     /// A top-level Workspace folder, by name — purpose-built or configured alike.
     case folder(String)
+    case rootItem(String)
     case tag(String)   // tag id
 
     static func area(_ area: WorkspaceArea) -> SidebarSelection { .folder(area.directoryName) }
@@ -18,6 +20,8 @@ struct WorkItemSyncPrompt: Identifiable {
     let id = UUID()
     let count: Int
     let sampleTitles: [String]
+    let review: WorkspaceMissingWorkReview
+    var itemKeys: Set<String> { review.keys }
 
     var message: String {
         let noun = count == 1 ? "work item file is" : "work item files are"
@@ -59,10 +63,15 @@ final class AppModel {
     var graphSyncReview: ProjectSyncReview?
     var openGraphProjectID: String?
     @ObservationIgnored var graphReloadGeneration = 0
+    /// The `contentID` of the graph snapshot on screen; an identical reload is not republished.
+    @ObservationIgnored var publishedGraphContentID = 0
     @ObservationIgnored var graphReloadTask: Task<Void, Never>?
     @ObservationIgnored var graphCheckTask: Task<Void, Never>?
 
     // Infrastructure — created once, shared by every screen.
+    var unifiedWorkspace: WorkspaceSession?
+    var unifiedBridgeRunning = false
+    var unifiedSyncTask: Task<Void, Never>?
     let workspace: WorkspaceLocation
     let database: Database
     /// Where tags and ratings are actually being written. Anything but `.file` is worth
@@ -95,6 +104,7 @@ final class AppModel {
     /// the app was closed can be followed on the next launch.
     private var selectedFolderIdentity: String? {
         if case .folder(let name)? = selection { return folder(named: name)?.identity }
+        if case .rootItem(let name)? = selection { return rootItems.first { $0.id == name }?.identity?.key }
         return nil
     }
 
@@ -110,6 +120,7 @@ final class AppModel {
         // The screens first: a Workspace folder can share a screen's name (there is an
         // `Overview` folder), and the name alone used to open the folder instead.
         case "Overview": return .overview
+        case "Workspace": return .unified
         case "Ingest": return .ingest
         // Work records belong in their project queue. Keep this launch argument for
         // the focused-work regression tests, but do not restore the retired sidebar
@@ -133,7 +144,10 @@ final class AppModel {
     // Content, keyed by area folder name. Views never scan the filesystem themselves.
     private(set) var itemsByArea: [String: [WorkspaceItem]] = [:]
     private(set) var folders: [WorkspaceFolder] = []
-    private(set) var workItems: [WorkItem] = []
+    private(set) var rootItems: [WorkspaceRootItem] = []
+    private(set) var workItems: [WorkItem] = [] {
+        didSet { publishConnectedTasks() }
+    }
     private(set) var socialPosts: [SocialPost] = []
     private(set) var loadingAreas: Set<String> = []
     /// Areas whose last read failed before any listing was published. They are not
@@ -146,15 +160,24 @@ final class AppModel {
     private(set) var tagsByPath: [String: [Tag]] = [:]
     /// The work record open in the editor sheet, wherever it was opened from.
     var editingWorkItem: WorkItem?
+    var finderWorkDraft: FinderWorkDraft?
 
     // Notion sync (AppModel+NotionSync.swift)
     var syncTriage: [ProjectSyncTriage.Item] = []
     var syncDeferred: [String: String] = [:]
     var syncFailures: [String: ProjectAutoSyncPlanner.Failure] = [:]
+    var syncPolicy = ProjectSyncTriage.Policy()
+    /// The plan for the current graph and settings; the toolbar and Sync Center read it
+    /// several times per render (AppModel+NotionSync.swift).
+    @ObservationIgnored var cachedSyncPlan: (revision: Int, settings: Int, plan: ProjectAutoSyncPlanner.Plan)?
+    var syncHealth: ProjectSyncHealth?
     var syncReport: ProjectAutoSync.Report?
     var syncActionReport: ProjectAutoSync.Report?
     var syncLastChangesReport: ProjectAutoSync.Report?
     var syncActivity: String?
+    /// Presentation only. Reviewed rows leave the list while their transfer runs;
+    /// the refreshed graph decides which differences return afterward.
+    var syncApplyingIDs = Set<String>()
     var syncFeedback: String?
     var syncFeedbackIsError = false
     var syncSettingRevision = 0
@@ -189,12 +212,17 @@ final class AppModel {
     /// Transient route only; state restoration intentionally remembers the area, not
     /// an unfinished project workflow.
     var openProjectWorkspaceID: String?
+    /// A one-shot request for the section an opening project shows (a notification opens
+    /// Tasks); `ProjectWorkspaceView` takes it and clears it.
+    var requestedProjectSection: ProjectSection?
     /// Overview supplies this explicit handoff so its recommendation never becomes a
     /// second work-item browser.
     var focusedWorkItemPath: String?
 
     var statusMessage: String?
-    var lastError: String?
+    var lastError: String? {
+        didSet { if lastError != oldValue { requestWidgetDashboardPublish() } }
+    }
     /// Set when a work-item file disappears outside the app. The last-known records stay
     /// visible until the person chooses whether to restore them or accept the folder.
     var workItemSyncPrompt: WorkItemSyncPrompt?
@@ -218,7 +246,12 @@ final class AppModel {
     /// third change or a relaunch.
     private var workItemRefreshRequested = false
     private var workItemPendingPaths: Set<String> = []
-    private var pendingMissingWorkItems: [WorkItem] = []
+    private var pendingMissingWorkItems: [WorkItem] = [] {
+        didSet { if pendingMissingWorkItems.isEmpty { deferredMissingWorkItemKeys = [] } }
+    }
+    private var deferredMissingWorkItemKeys: Set<String> = []
+    private var workItemSyncPromptPreparing = false
+    var pendingMissingWorkItemCount: Int { pendingMissingWorkItems.count }
     /// Records this app is moving, or has moved, to the Trash itself: its own Delete and
     /// a phone delete. Their disappearance is expected, so it is applied rather than
     /// raising the restore-or-sync prompt meant for changes made outside the app.
@@ -229,13 +262,18 @@ final class AppModel {
     @ObservationIgnored private var mobileTagAliases: [String: String] = [:]
     private var refreshTask: Task<Void, Never>?
     private var inboxPoll: Task<Void, Never>?
+    private var mobileCloudPoll: Task<Void, Never>?
     var widgetOverviewSection: String?
     var widgetChartRequest = UUID()
     @ObservationIgnored var widgetCommands: WidgetCommandStore?
     @ObservationIgnored var widgetPublishingTask: Task<Void, Never>?
+    @ObservationIgnored var widgetPublishRequested = false
     private var mobileCloudSyncTask: Task<Void, Never>?
-    var mobileCloudSyncInFlight = false
-    private var mobileCloudSyncRequested = false
+    var mobileCloudSyncInFlight: Bool { mobileCloudCommandInFlight || mobileCloudPublicationInFlight }
+    private var mobileCloudCommandInFlight = false
+    private var mobileCloudPublicationInFlight = false
+    private var mobileCloudPublicationRequested = false
+    private var mobileCloudLastPublication: ContinuousClock.Instant?
     private var completedInitialRefresh = false
     /// Set once the first service read has been attempted, whatever its outcome, so
     /// views can tell "still asking" from "the service has nothing" or "is not running".
@@ -287,7 +325,12 @@ final class AppModel {
     /// rather than opening on "Folder not found".
     private func settleRestoredSelection() {
         switch selection {
+        case .rootItem(let name)?:
+            guard !rootItems.contains(where: { $0.id == name }) else { return }
+            let matches = rootItems.filter { $0.identity?.key == StateRestoration.folderIdentity && $0.identity != nil }
+            selection = matches.count == 1 ? .rootItem(matches[0].id) : .overview
         case .folder(let name)?:
+            if rootItems.contains(where: { $0.id == name }) { selection = .rootItem(name); return }
             guard folder(named: name) == nil else { return }
             if let identity = StateRestoration.folderIdentity,
                let renamed = folders.first(where: { $0.identity == identity }) {
@@ -305,6 +348,7 @@ final class AppModel {
     // MARK: - Lifecycle
 
     func start() {
+        refreshNotionCredentialAvailability()
         agentTasks.start(model: self)
         startWidgetDashboard()
         startProjectSyncChecks()
@@ -326,6 +370,7 @@ final class AppModel {
             self.ingestLocationResolved = true
             self.startObserving()
             await self.refreshAll()
+            self.startUnifiedWorkspace()
             #if DEBUG
             // `-bwRunLegacyImport YES` runs the Better Projects import at launch and
             // reports to stderr, so the migration can be exercised for real without
@@ -352,6 +397,7 @@ final class AppModel {
             #endif
         }
         startInboxPolling()
+        startMobileCloudPolling()
         startServicePolling()
     }
 
@@ -379,14 +425,13 @@ final class AppModel {
     private func startInboxPolling() {
         inboxPoll?.cancel()
         inboxPoll = Task { [weak self] in
-            var mobileSyncTicks = 0
             while Task.isCancelled == false {
                 try? await Task.sleep(for: .seconds(5))
                 guard let self, Task.isCancelled == false else { return }
                 await self.checkWorkspaceAvailability()
                 // A file provider can deliver a deletion without an FSEvent. Stat the
                 // already-known record paths so external deletes still get the same
-                // explicit restore-or-sync choice. This is bounded work, unlike a
+                // bounded reconciliation. This is bounded work, unlike a
                 // recursive workspace scan, and runs only after the initial index exists.
                 await self.checkForMissingWorkItems()
                 // Areas.json is hand-editable; pick up an edit made while running.
@@ -396,12 +441,19 @@ final class AppModel {
                 }
                 await self.refreshIngest()
                 await self.consumeWidgetCommands()
-                self.requestWidgetDashboardPublish()
-                // A phone can submit a destination intent without causing a local
-                // filesystem event. Poll the optional command channel at a modest
-                // cadence so an already-arrived Inbox item is filed promptly.
-                mobileSyncTicks += 1
-                if mobileSyncTicks.isMultiple(of: 3) { self.requestMobileCloudSync() }
+            }
+        }
+    }
+
+    /// The command channel must not wait for file-provider/inbox/service reads.
+    /// Those can stall independently while a phone edit is already in iCloud.
+    private func startMobileCloudPolling() {
+        mobileCloudPoll?.cancel()
+        mobileCloudPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled, let self else { return }
+                self.requestMobileCloudSync(publish: false)
             }
         }
     }
@@ -456,8 +508,15 @@ final class AppModel {
                 candidates.filter { FileManager.default.fileExists(atPath: $0.path) }
             }.value
             guard let self, roots.isEmpty == false else { return }
+            // The service API supplies this data. Its database and log writes
+            // must never schedule native workspace and work-index refreshes.
+            let serviceData = self.workspace.url(for: .logs).appendingPathComponent("workspace-watcher").canonicalPath
             let observer = DirectoryObserver { [weak self] paths in
-                Task { @MainActor [weak self] in self?.handleFilesystemChange(paths: paths) }
+                let relevant = paths.filter { path in
+                    path != serviceData && !path.hasPrefix(serviceData + "/")
+                }
+                guard !relevant.isEmpty else { return }
+                Task { @MainActor [weak self] in self?.handleFilesystemChange(paths: relevant) }
             }
             observer.start(watching: roots)
             self.observer = observer
@@ -520,7 +579,12 @@ final class AppModel {
         // Only areas that still exist: a folder just removed in Finder is gone from
         // `folders` by now, and reading it would report a failure that isn't one.
         let current = Set(folders.map(\.name))
-        for area in touchedAreas where current.contains(area) { await refresh(areaNamed: area) }
+        let relisted = Set(paths.filter { workspace.changeAltersAreaListing(URL(fileURLWithPath: $0)) }
+            .compactMap { workspace.areaName(containing: URL(fileURLWithPath: $0)) })
+        for area in touchedAreas where current.contains(area) {
+            if relisted.contains(area) { await refresh(areaNamed: area) }
+            else { await noteContentChange(inArea: area) }
+        }
         if outsideAreas && touchedAreas.isEmpty && touchesIngest == false && touchesRoot == false {
             await refreshAll()
         } else {
@@ -550,9 +614,9 @@ final class AppModel {
         await refreshBackgroundService()
         await workRefresh
         if completedInitialRefresh == false { await cleanUpInterruptedSaves() }
+        completedInitialRefresh = true
         refreshOverview()
         reloadTags()
-        completedInitialRefresh = true
         requestMobileCloudSync()
     }
 
@@ -564,8 +628,9 @@ final class AppModel {
         let workspace = workspace
         let store = areaConfigurations
         let discovery = folderDiscovery
-        let scanned = await Task.detached(priority: .userInitiated) { () -> ([WorkspaceFolder], [String])? in
-            guard let found = discovery.folders(in: workspace, store: store) else { return nil }
+        let scanned = await Task.detached(priority: .userInitiated) { () -> ([WorkspaceFolder], [String], [WorkspaceRootItem])? in
+            guard let found = discovery.folders(in: workspace, store: store),
+                  let rootItems = WorkspaceRootDiscovery.items(in: workspace) else { return nil }
             // Folders someone made and has not put anything in yet. Counted here
             // because this task is already off the main actor and already reading
             // this directory.
@@ -573,7 +638,7 @@ final class AppModel {
                 let children = (try? FileManager.default.contentsOfDirectory(atPath: folder.url.path)) ?? []
                 return children.allSatisfy { NoiseFilter.isHidden(name: $0, showHidden: false) }
             }
-            return (found, empty.map(\.name))
+            return (found, empty.map(\.name), rootItems)
         }.value
         guard let scanned else {
             if FileManager.default.fileExists(atPath: workspace.root.path) {
@@ -586,10 +651,18 @@ final class AppModel {
         // The open area's identity, before the list changes under it.
         let openIdentity: String? = {
             if case .folder(let name)? = selection { return folder(named: name)?.identity }
+            if case .rootItem(let name)? = selection { return rootItems.first { $0.id == name }?.identity?.key }
             return nil
         }()
         folders = scanned.0
         emptyFolderNames = scanned.1
+        rootItems = scanned.2
+        if case .folder(let name)? = selection, rootItems.contains(where: { $0.id == name }) {
+            selection = .rootItem(name)
+        } else if case .rootItem(let name)? = selection, !rootItems.contains(where: { $0.id == name }), let openIdentity {
+            let matches = rootItems.filter { $0.identity?.key == openIdentity }
+            if matches.count == 1 { selection = .rootItem(matches[0].id) }
+        }
         // Renamed in Finder while open: follow it, the way its settings already follow
         // it by file identity, rather than showing "Folder not found".
         if case .folder(let name)? = selection, folder(named: name) == nil,
@@ -635,6 +708,7 @@ final class AppModel {
         if workItemsLoaded == false { await holdFirstReadIfSimulating() }
         let workspace = workspace
         let service = workItemService
+        let previous = workItems
         if !workItemsLoaded, let warm = await workItemPathIndex.load(under: workspace.root, service: service) {
             workItems = warm
             workItemsLoaded = true
@@ -675,6 +749,8 @@ final class AppModel {
                 workspaceAvailable = false
                 return
             }
+            await waitForEventTrackingToEnd()
+            if workItemRefreshRequested { continue }
             let foundPaths = Set(found.map { $0.url.canonicalPath })
             let foundIDs = Set(found.map(\.id))
             let disappeared = workItemsLoaded
@@ -689,9 +765,9 @@ final class AppModel {
             if disappeared.isEmpty == false {
                 pendingMissingWorkItems = WorkItemService.indexed(pendingMissingWorkItems + disappeared)
             }
-            // Keep unresolved records in the list until the user makes the explicit
-            // choice. This prevents a missed FSEvent from silently changing the app's
-            // task view while still allowing a full refresh to discover the drift.
+            // Keep an absent record only until bounded root/path checks complete.
+            // Successful checks automatically reconcile it to Finder; failed reads
+            // retain the last usable record rather than manufacturing a deletion.
             workItems = WorkItemService.indexed(found + pendingMissingWorkItems)
             if pendingMissingWorkItems.isEmpty { workItemSyncPrompt = nil }
             else { presentWorkItemSyncPrompt() }
@@ -699,6 +775,7 @@ final class AppModel {
             try? await workItemPathIndex.save(found, under: workspace.root)
         } while workItemRefreshRequested
         refreshOverview()
+        if workItems != previous { requestMobileCloudSync() }
     }
 
     func refreshFoldersAndWork() async {
@@ -712,6 +789,9 @@ final class AppModel {
     /// the table renders 383 of them.
     private(set) var ratingsByProject: [String: [String: Int]] = [:]
     private(set) var projectRecordsByPath: [String: ProjectRecord] = [:]
+    /// Workspace-relative paths projects have left in Finder → where each is now, so a
+    /// task's unchanged `project:` line keeps its project across a rename.
+    private(set) var projectLinkAliases: [String: String] = [:]
     private(set) var measurementsByWatcherID: [String: ProjectMeasurements] = [:]
     private(set) var recentSessions: [WorkSession] = []
     private(set) var attention: [Attention.Item] = []
@@ -728,6 +808,7 @@ final class AppModel {
     // is restarting is not one that has no ideas. See AppModel+BackgroundService.swift.
     var liveSession: LiveSession?
     var serviceIdeasByPath: [String: IdeaRecord] = [:]
+    var serviceIdeasLoaded = false
     var ideaPlanningRefreshInFlight = false
     var projectRegistrationGeneration = 0
     func updateIdeaPlanningRecords(_ records: [String: IdeaRecord]) { serviceIdeasByPath = records }
@@ -754,9 +835,10 @@ final class AppModel {
             return
         }
         let store = projectStore
-        let records = await Task.detached(priority: .utility) {
-            let known = Set(store.allRecords().map(\.id))
-            return urls.map { url in
+        let registration = await Task.detached(priority: .utility) {
+            let originals = store.allRecords()
+            let known = Set(originals.map(\.id))
+            let records = urls.map { url in
                 let record = store.register(url: url)
                 let values = try? url.resourceValues(forKeys: [.creationDateKey, .isDirectoryKey])
                 let created = values?.creationDate
@@ -767,10 +849,24 @@ final class AppModel {
                 }
                 return record
             }
+            return (records, originals, store.pathAliases(), store.allRecords())
         }.value
         guard projectRegistrationGeneration == generation else { return }
+        let records = registration.0
+        let root = workspace.root.canonicalPath + "/"
+        let current = Dictionary(registration.3.map { ($0.id, $0.lastPath) }, uniquingKeysWith: { first, _ in first })
+        projectLinkAliases = registration.2.reduce(into: [:]) { aliases, alias in
+            guard alias.key.hasPrefix(root), let now = current[alias.value], now.hasPrefix(root) else { return }
+            aliases[String(alias.key.dropFirst(root.count))] = String(now.dropFirst(root.count))
+        }
         projectRecordsByPath = Dictionary(records.map { ($0.lastPath, $0) }, uniquingKeysWith: { first, _ in first })
         ratingsByProject = projectStore.allRatings()
+        for item in projects() {
+            if let current = projectRecordsByPath[item.url.canonicalPath],
+               let prior = registration.1.first(where: { $0.id == current.id }) {
+                await reflectFinderProjectLocation(prior, item: item, isIdea: false)
+            }
+        }
         refreshOverview()
     }
 
@@ -853,7 +949,8 @@ final class AppModel {
                     .filter { $0.activeSeconds >= Attention.meaningfulSessionSeconds }
                     .map(\.endedAt).max(),
                 observedHours: measured?.measurement(.investmentObserved)?.rawValue,
-                watcherID: watcherID, needsSetup: record.map { setupIDs.contains($0.id) } ?? false
+                watcherID: watcherID, needsSetup: record.map { setupIDs.contains($0.id) } ?? false,
+                priority: projectMetadata(for: item).portfolioPriority
             )
         }
 
@@ -887,7 +984,8 @@ final class AppModel {
         let lookup = ProjectPathLookup(projects: projects(), relativePath: workspaceRelativePath(for:))
         let candidates = workItems.compactMap { item -> (WorkItem, WorkspaceItem)? in
             guard item.isOpen, item.stage != .later,
-                  let project = project(for: item, in: lookup)
+                  let project = project(for: item, in: lookup),
+                  !projectMetadata(for: project).isUnavailableForNextWork
             else { return nil }
             return (item, project)
         }
@@ -895,15 +993,19 @@ final class AppModel {
 
         let preferences = scoringPreferences()
         var scores: [String: Double] = [:]
+        var priorities: [String: Int] = [:]
         for project in projects() {
+            let priority = projectMetadata(for: project).portfolioPriorityForRecommendation
+            priorities[project.url.path] = priority
+            if let path = workspaceRelativePath(for: project.url) { priorities[path] = priority }
             if let value = score(for: project, preferences: preferences)?.projectScore {
                 scores[project.url.path] = value
                 if let path = workspaceRelativePath(for: project.url) { scores[path] = value }
             }
         }
-        if let best = WorkItemRecommendation.nextAction(in: candidates.map(\.0), allItems: workItems, projectScores: scores),
+        if let best = WorkItemRecommendation.nextAction(in: candidates.map(\.0), allItems: workItems, projectScores: scores, projectPriorities: priorities),
            let candidate = candidates.first(where: { $0.0.id == best.id }),
-           best.projectPath.flatMap({ scores[$0] }) != nil {
+           (best.projectPath.flatMap({ scores[$0] }) != nil || candidates.contains { ($0.0.projectPath.flatMap { priorities[$0] } ?? 3) != 3 }) {
             return OverviewNextAction(item: best, project: candidate.1, resumesRecentProject: false)
         }
         if let recentPath = resumePoint?.projectPath,
@@ -1041,7 +1143,19 @@ final class AppModel {
     private var notionImportSource: NotionImport.Source?
     private var notionImportOptions: NotionImport.Options?
 
-    var hasNotionToken: Bool { SecretStore.hasNotionToken }
+    /// View rendering must never synchronously read Keychain or open an access
+    /// prompt. Explicit credential changes refresh this non-secret availability flag.
+    private(set) var hasNotionToken = false
+    @ObservationIgnored private var credentialAvailabilityTask: Task<Void, Never>?
+    func refreshNotionCredentialAvailability() {
+        credentialAvailabilityTask?.cancel()
+        credentialAvailabilityTask = Task { [weak self] in
+            let available = await Task.detached(priority: .utility) { SecretStore.hasNotionToken }.value
+            guard !Task.isCancelled else { return }
+            self?.hasNotionToken = available
+            self?.adoptFinderNotionPolicyIfConfigured()
+        }
+    }
     var canPreviewProjectMetadataImport: Bool {
         hasNotionToken && NotionSettings.load().databases.projects != nil
     }
@@ -1216,12 +1330,15 @@ final class AppModel {
                     if record.notionPageID == nil {
                         try projectStore.setExplicitNotionPageID(preview.notionPageID, for: record.id)
                     }
+                    let previous = projectStore.metadata(for: record.id)
                     let applied = ProjectMetadataImport.applying(
                         fields, values: preview.values,
-                        to: projectStore.metadata(for: record.id), description: projectStore.description(for: record.id),
+                        to: previous, description: projectStore.description(for: record.id),
                         portfolioDetails: projectStore.portfolioDetails(for: record.id)
                     )
                     projectStore.setMetadata(applied.metadata, for: record.id)
+                    // A reviewed import is a deliberate restore; Finder Workspace owns the result.
+                    forwardOwnedMetadata(projectID: record.id, from: previous, to: applied.metadata)
                     projectStore.setDescription(applied.description, for: record.id)
                     projectStore.setPortfolioDetails(applied.portfolioDetails, for: record.id)
                     if fields.contains(.relatedProjects) {
@@ -1449,6 +1566,7 @@ final class AppModel {
             if itemsByArea[area] == nil { unreadableAreas.insert(area) }
             return
         }
+        await waitForEventTrackingToEnd()
         // Superseded while reading: a newer read of this area will publish.
         guard areaReadGeneration[area] == generation else { return }
         // An empty answer because the whole root vanished mid-read is not an empty area.
@@ -1459,8 +1577,9 @@ final class AppModel {
         // The path-keyed tag cache is an optimization, not a second source of truth.
         // Drop entries that disappeared from this area before publishing its new list
         // so a Finder deletion/rename cannot keep a stale tag set reachable in the UI.
+        let previousItems = itemsByArea[area]
         let currentPaths = Set(items.map { $0.url.canonicalPath })
-        for old in itemsByArea[area] ?? [] {
+        for old in previousItems ?? [] {
             let path = old.url.canonicalPath
             if currentPaths.contains(path) == false { tagsByPath.removeValue(forKey: path) }
         }
@@ -1468,6 +1587,8 @@ final class AppModel {
         unreadableAreas.remove(area)
         reloadTagAssignments(for: items)
         areaRevisions[area, default: 0] += 1
+        let listingChanged = previousItems != items
+        if listingChanged { listingRevisions[area, default: 0] += 1 }
         await refreshSelection(in: area, topLevel: items)
         if area == WorkspaceArea.projects.directoryName, completedInitialRefresh {
             let current = projects()
@@ -1475,7 +1596,10 @@ final class AppModel {
                 guard let record = projectRecordsByPath[item.url.canonicalPath] else { return true }
                 return record.identityKey != item.identity?.key
             }
-            if changed { await refreshProjectRecords() } else { refreshOverview() }
+            // A relisting that found the same projects changes nothing Overview or the
+            // project views read; with builds and agents writing inside projects it
+            // happened every few seconds and rebuilt every project row (November 9).
+            if changed { await refreshProjectRecords() } else if listingChanged { refreshOverview() }
         } else if area == WorkspaceArea.ideas.directoryName, completedInitialRefresh {
             Task { await refreshIdeaPlanning() }
             refreshOverview()
@@ -1485,7 +1609,7 @@ final class AppModel {
         if area == WorkspaceArea.socialPosts.directoryName {
             await refreshSocialPosts()
         }
-        requestMobileCloudSync()
+        if previousItems != items { requestMobileCloudSync() }
     }
 
     /// Bumped each time an area is re-read, which happens for a change anywhere inside
@@ -1498,6 +1622,13 @@ final class AppModel {
 
     func revision(ofArea name: String) -> Int { areaRevisions[name] ?? 0 }
 
+    /// Bumped only when an area's top-level listing actually changed (an item added,
+    /// removed, renamed, or its listed dates/sizes changed). Views built from the
+    /// listing key on this; views of content below an area still use `revision(ofArea:)`.
+    private(set) var listingRevisions: [String: Int] = [:]
+
+    func listingRevision(ofArea name: String) -> Int { listingRevisions[name] ?? 0 }
+
     /// Keeps the inspector on the live item after an area is re-read.
     ///
     /// The selection is a snapshot, so without this it kept showing the size and date
@@ -1505,6 +1636,13 @@ final class AppModel {
     /// one of the area's top-level items — which every nested selection is (an opened
     /// outline folder, a drilled gallery, a log file) — so any change anywhere in the
     /// area silently emptied the inspector.
+    /// Something changed below an area's listed items: views that show that content
+    /// reload on the revision, and a selected nested item is reread. The listing stands.
+    private func noteContentChange(inArea area: String) async {
+        areaRevisions[area, default: 0] += 1
+        await refreshSelection(in: area, topLevel: itemsByArea[area] ?? [])
+    }
+
     private func refreshSelection(in area: String, topLevel items: [WorkspaceItem]) async {
         guard let selected = selectedItem, workspace.areaName(containing: selected.url) == area else { return }
         let path = selected.url.canonicalPath
@@ -1538,6 +1676,7 @@ final class AppModel {
     /// consecutive misses that let a capture's private title be forgotten.
     private var ingestScanInFlight = false
     private var ingestRescanRequested = false
+    private var lastScannedPendingCount: Int?
 
     func refreshIngest() async {
         guard ingestScanInFlight == false else {
@@ -1558,15 +1697,19 @@ final class AppModel {
             ingestStalled = true
             return
         }
+        let resumed = ingestStalled
         ingestStalled = false
         ingestScannedOnce = true
         let previousPaths = Set(ingestItems.map { $0.url.canonicalPath })
         let currentPaths = Set(items.map { $0.url.canonicalPath })
-        let previousPendingCount = pendingIngestCount
+        let pendingCount = items.filter(\.isDue).count
+        let pendingChanged = pendingCount != lastScannedPendingCount
+        let itemsChanged = ingestItems != items
+        lastScannedPendingCount = pendingCount
         for path in previousPaths.subtracting(currentPaths) {
             tagsByPath.removeValue(forKey: path)
         }
-        ingestItems = items
+        if itemsChanged || pendingChanged { ingestItems = items }
         if ingestCursor >= items.count { ingestCursor = max(0, items.count - 1) }
         reloadTagAssignments(for: items.map(\.item))
         if let selected = selectedIngestItem {
@@ -1579,8 +1722,10 @@ final class AppModel {
         // requiring a manual refresh or app relaunch. Only when the inbox actually
         // changed: this runs every five seconds, and a rebuild also invalidates the
         // Projects views, which then recompute every row on the main thread.
-        if previousPaths != currentPaths || previousPendingCount != pendingIngestCount {
+        if previousPaths != currentPaths || pendingChanged {
             refreshOverview()
+        } else if itemsChanged || resumed {
+            requestWidgetDashboardPublish()
         }
         // Filing is what removes an item from the inbox, so only then can this change.
         if previousPaths != currentPaths || recentlyFiledLoaded == false {
@@ -1588,7 +1733,7 @@ final class AppModel {
         }
         // A new iCloud file might have appeared after the phone's intent reached
         // CloudKit. Ask immediately rather than waiting for the periodic command poll.
-        if previousPaths != currentPaths { requestMobileCloudSync() }
+        if previousPaths != currentPaths || pendingChanged { requestMobileCloudSync() }
     }
 
     func items(for area: WorkspaceArea) -> [WorkspaceItem] { itemsByArea[area.directoryName] ?? [] }
@@ -1604,6 +1749,16 @@ final class AppModel {
     }
 
     func items(inArea name: String) -> [WorkspaceItem] { itemsByArea[name] ?? [] }
+
+    /// AppKit throws when a table's rows change while it draws a context-menu highlight
+    /// (`NSTableRowData rowViewAtRow:`; a Finder move during a right-click crashed the app
+    /// on October 26). Background listings wait while a menu, drag or live resize is
+    /// tracking events — at most two minutes — and then publish.
+    func waitForEventTrackingToEnd() async {
+        for _ in 0..<600 where RunLoop.main.currentMode == .eventTracking {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+    }
 
     /// Underscore-prefixed folders in Projects are organizational spaces. They remain
     /// browsable, but they must not acquire project ratings, links, or planning data.
@@ -1966,6 +2121,7 @@ final class AppModel {
         }
         persistWorkItemPaths()
         refreshOverview()
+        requestMobileCloudSync()
     }
 
     /// Applies file events to the work-item list, walking the Workspace only when a
@@ -1996,16 +2152,21 @@ final class AppModel {
             if pendingMissingWorkItems.isEmpty { workItemSyncPrompt = nil }
             else { presentWorkItemSyncPrompt() }
             guard upserts.isEmpty == false || removed.isEmpty == false else { return }
+            // Task tables change under an open context menu too (October 26 crash).
+            await waitForEventTrackingToEnd()
             // Applied to the list as it is *now*, so an in-app save that landed while
-            // this was reading is not undone. Missing records stay until the user
-            // resolves the prompt; external deletion is never an implicit app action.
+            // this was reading is not undone. Missing records remain only until
+            // the separate bounded absence checks reconcile them to Finder.
             // A record found again by ID at a new path was renamed or moved, not deleted:
             // its old path goes, or `indexed` could keep the stale copy over the new one.
             let movedPaths = known.filter { removed.contains($0.url.canonicalPath) && upsertedIDs.contains($0.id) }
                 .map(\.url.canonicalPath)
-            workItems = WorkItemService.merged(workItems, upserting: upserts, removingPaths: Set(trashedHere).union(movedPaths))
+            let merged = WorkItemService.merged(workItems, upserting: upserts, removingPaths: Set(trashedHere).union(movedPaths))
+            guard merged != workItems else { return }
+            workItems = merged
             persistWorkItemPaths()
             refreshOverview()
+            requestMobileCloudSync()
         }
     }
 
@@ -2025,26 +2186,43 @@ final class AppModel {
     }
 
     private func presentWorkItemSyncPrompt() {
-        guard pendingMissingWorkItems.isEmpty == false,
-              workItemSyncResolutionInFlight == false else { return }
-        let sorted = pendingMissingWorkItems.sorted {
-            $0.title.localizedStandardCompare($1.title) == .orderedAscending
+        let keys = Set(pendingMissingWorkItems.map { $0.id + "\0" + $0.url.canonicalPath })
+        guard !keys.isEmpty, keys != deferredMissingWorkItemKeys, !workItemSyncPromptPreparing,
+              workItemSyncPrompt == nil, workItemSyncResolutionInFlight == false else { return }
+        let selected = pendingMissingWorkItems.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        let workspace = workspace, database = database
+        workItemSyncPromptPreparing = true
+        Task {
+            let captured = await Task.detached(priority: .utility) {
+                Result { try WorkspaceMissingWorkReview.capture(selected, graphRecords: ProjectGraphStore(database: database).records(), workspace: workspace) }
+            }.value
+            workItemSyncPromptPreparing = false
+            guard self.workspace.root.canonicalPath == workspace.root.canonicalPath,
+                  Set(pendingMissingWorkItems.map { $0.id + "\0" + $0.url.canonicalPath }) == keys,
+                  keys != deferredMissingWorkItemKeys, workItemSyncPrompt == nil, !workItemSyncResolutionInFlight else { return }
+            switch captured {
+            case .success(let review): syncWorkItemsToFolder(review)
+            case .failure(let error): lastError = "Missing-file review needs unchanged, ordinary Workspace locations: " + error.localizedDescription
+            }
         }
-        workItemSyncPrompt = WorkItemSyncPrompt(
-            count: sorted.count,
-            sampleTitles: Array(sorted.prefix(3).map { "“\($0.title)”" })
-        )
     }
 
-    func dismissWorkItemSyncPrompt() {
+    func dismissWorkItemSyncPrompt(_ keys: Set<String>) {
+        deferredMissingWorkItemKeys = keys
         workItemSyncPrompt = nil
+    }
+
+    func reviewMissingWorkItems() {
+        deferredMissingWorkItemKeys = []
+        presentWorkItemSyncPrompt()
     }
 
     /// Restores every missing record at the path it had before the external deletion.
     /// A file that appeared in the meantime is never overwritten; it remains pending
     /// so the person can inspect the conflict and choose again.
-    func restoreMissingWorkItems() {
-        let candidates = pendingMissingWorkItems
+    func restoreMissingWorkItems(_ review: WorkspaceMissingWorkReview) {
+        let current = pendingMissingWorkItems, workspace = workspace
+        let candidates = review.entries.filter { entry in current.contains(entry.item) }
         guard candidates.isEmpty == false else {
             workItemSyncPrompt = nil
             return
@@ -2056,21 +2234,24 @@ final class AppModel {
             let result = await Task.detached(priority: .userInitiated) {
                 var restored: [WorkItem] = []
                 var failed: [WorkItem] = []
-                for item in candidates {
-                    do { restored.append(try service.restore(item)) }
-                    catch { failed.append(item) }
+                for entry in candidates {
+                    do { restored.append(try review.restore(entry, current: current.first { $0.id == entry.item.id && $0.url == entry.item.url }, workspace: workspace, service: service)) }
+                    catch { failed.append(entry.item) }
                 }
                 return (restored, failed)
             }.value
             workItemSyncResolutionInFlight = false
-            pendingMissingWorkItems = result.1
-            workItems = WorkItemService.merged(workItems, upserting: result.0, removingPaths: [])
+            guard self.workspace.root.canonicalPath == workspace.root.canonicalPath else { return }
+            let unchanged = candidates.filter { pendingMissingWorkItems.contains($0.item) }
+            let installed = result.0.filter { saved in unchanged.contains { $0.item.id == saved.id && $0.item.url == saved.url } }
+            pendingMissingWorkItems.removeAll { item in unchanged.contains { $0.item == item } && installed.contains { $0.id == item.id && $0.url == item.url } }
+            workItems = WorkItemService.merged(workItems, upserting: installed, removingPaths: [])
             if result.1.isEmpty {
                 statusMessage = "Restored \(result.0.count) work item file\(result.0.count == 1 ? "" : "s")"
             } else {
                 lastError = "Could not restore \(result.1.count) work item file\(result.1.count == 1 ? "" : "s"). A file may have appeared at the original path."
-                presentWorkItemSyncPrompt()
             }
+            if !pendingMissingWorkItems.isEmpty { presentWorkItemSyncPrompt() }
             refreshOverview()
             requestMobileCloudSync()
         }
@@ -2079,21 +2260,37 @@ final class AppModel {
     /// Accepts the current Workspace contents as authoritative and removes only the
     /// missing records from the app's in-memory and mobile projections. The files are
     /// already gone; this action does not delete or modify anything on disk.
-    func syncWorkItemsToFolder() {
-        let candidates = pendingMissingWorkItems
-        guard candidates.isEmpty == false else {
-            workItemSyncPrompt = nil
-            return
+    func syncWorkItemsToFolder(_ review: WorkspaceMissingWorkReview) {
+        let current = pendingMissingWorkItems, workspace = workspace, database = database
+        let selected = review.entries.filter { current.contains($0.item) }
+        guard !selected.isEmpty else { workItemSyncPrompt = nil; return }
+        workItemSyncPrompt = nil; workItemSyncResolutionInFlight = true
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { () throws -> Set<String> in
+                    // Filesystem absence and the exact reviewed private drafts are
+                    // checked before any in-memory record is forgotten.
+                    for entry in selected { try review.validate(entry, current: current.first { $0.id == entry.item.id && $0.url == entry.item.url }, workspace: workspace) }
+                    let paths = Set(selected.map { $0.item.url.canonicalPath })
+                    let graph = try ProjectGraphStore(database: database)
+                    for path in paths { try graph.recordLocalDeletion(path: path) }
+                    return paths
+                }
+            }.value
+            workItemSyncResolutionInFlight = false
+            guard self.workspace.root.canonicalPath == workspace.root.canonicalPath else { return }
+            switch result {
+            case .failure(let error):
+                lastError = "The missing-file review changed. Files and app records were kept. " + error.localizedDescription
+            case .success(let paths):
+                let unchanged = Set(selected.filter { pendingMissingWorkItems.contains($0.item) }.map(\.key))
+                pendingMissingWorkItems.removeAll { unchanged.contains($0.id + "\0" + $0.url.canonicalPath) }
+                workItems = WorkItemService.merged(workItems, upserting: [], removingPaths: paths.filter { path in selected.contains { $0.item.url.canonicalPath == path && unchanged.contains($0.key) } })
+                reloadProjectGraph(); refreshOverview(); requestMobileCloudSync()
+                statusMessage = "Updated tasks to match Finder"
+            }
+            if !pendingMissingWorkItems.isEmpty { presentWorkItemSyncPrompt() }
         }
-        let paths = Set(candidates.map { $0.url.canonicalPath })
-        pendingMissingWorkItems.removeAll()
-        workItemSyncPrompt = nil
-        workItems = WorkItemService.merged(workItems, upserting: [], removingPaths: paths)
-        for path in paths { try? ProjectGraphStore(database: database).removeUnsent(localPath: path) }
-        reloadProjectGraph()
-        refreshOverview()
-        requestMobileCloudSync()
-        statusMessage = "Synced the app to the Workspace; removed \(candidates.count) missing work item\(candidates.count == 1 ? "" : "s")"
     }
 
     /// Items waiting on a decision, ready to process now.
@@ -2115,15 +2312,15 @@ final class AppModel {
 
     // MARK: - Optional mobile CloudKit projection
 
-    /// Coalesce local filesystem and tag changes. This check is intentionally before
-    /// creating a task: a normal offline Mac launch makes no CloudKit object or call.
-    func requestMobileCloudSync() {
+    /// Coalesce local changes and command checks. Routine command polls only rebuild
+    /// the index when it is dirty, a receipt needs it, or a fallback refresh is due.
+    func requestMobileCloudSync(publish: Bool = true) {
         guard completedInitialRefresh, workspaceAvailable,
               TestIsolation.isActive == false,
               TestIsolation.defaults.bool(forKey: MobileCloudPublisher.enabledDefaultsKey)
         else { return }
-        mobileCloudSyncRequested = true
-        guard mobileCloudSyncInFlight == false else { return }
+        if publish { mobileCloudPublicationRequested = true }
+        guard !mobileCloudCommandInFlight else { return }
         mobileCloudSyncTask?.cancel()
         mobileCloudSyncTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(1))
@@ -2164,17 +2361,9 @@ final class AppModel {
     #endif
 
     private func syncMobileCloud() async {
-        guard mobileCloudSyncInFlight == false else { return }
-        mobileCloudSyncInFlight = true
-        defer {
-            let shouldReschedule = mobileCloudSyncRequested
-            mobileCloudSyncRequested = false
-            mobileCloudSyncInFlight = false
-            if shouldReschedule {
-                requestMobileCloudSync()
-            }
-        }
-        mobileCloudSyncRequested = false
+        guard !mobileCloudCommandInFlight else { return }
+        mobileCloudCommandInFlight = true
+        defer { mobileCloudCommandInFlight = false }
 
         do {
             let inbound = try await mobileCloudPublisher.pendingIntents().sorted {
@@ -2183,13 +2372,43 @@ final class AppModel {
             }
             var changedLocalState = false
             var expiredMobileIntents = 0
+            var planningReceipts: [MobileWorkspaceIntent] = []
             for record in inbound {
                 guard let intent = record.intent else {
                     try await mobileCloudPublisher.acknowledge(recordName: record.recordName)
                     continue
                 }
+                if let name = MobileIdeaCapture.transferName(for: intent) {
+                    let checkpoints = Database.preferredURL().deletingLastPathComponent()
+                        .appendingPathComponent("MobileIdeaFiling", isDirectory: true)
+                    do {
+                        if try await !mobileCloudPublisher.isHandled(intent.id) {
+                            let workspace = workspace
+                            let bundle = try await mobileCloudPublisher.receiveIdeaCapture(name: name)
+                            guard self.workspace.root.canonicalPath == workspace.root.canonicalPath else { continue }
+                            let url = try await Task.detached(priority: .userInitiated) {
+                                try MobileIdeaCapture.file(bundle, id: intent.id, workspace: workspace,
+                                                           checkpointDirectory: checkpoints)
+                            }.value
+                            let known = Set(allTags.map(\.id))
+                            for tag in intent.tagIDs.map({ mobileTagAliases[$0] ?? $0 }) where known.contains(tag) {
+                                tagStore.assign(tagID: tag, to: url, area: WorkspaceArea.ideas.directoryName)
+                            }
+                            try await mobileCloudPublisher.markHandled(intent)
+                            changedLocalState = true
+                        }
+                        let filedName = MobileIdeaCapture.filedName(intent.id, checkpointDirectory: checkpoints)
+                        try await mobileCloudPublisher.finishIdeaCapture(name: name, filedName: filedName)
+                        try? FileManager.default.removeItem(at: MobileIdeaCapture.checkpointURL(intent.id, directory: checkpoints))
+                        try await mobileCloudPublisher.acknowledge(recordName: record.recordName)
+                    } catch {
+                        statusMessage = "An idea from a mobile device is waiting to sync: " + error.localizedDescription
+                    }
+                    continue
+                }
                 if intent.kind == .planningEdit, let edit = intent.planningEdit {
                     if try await mobileCloudPublisher.isHandled(intent.id) {
+                        planningReceipts.append(intent)
                         continue
                     }
                     do {
@@ -2205,6 +2424,7 @@ final class AppModel {
                         continue
                     }
                     try await mobileCloudPublisher.markHandled(intent)
+                    planningReceipts.append(intent)
                     changedLocalState = true
                     // Publish before returning the receipt so a phone never discards
                     // its draft while still fetching the pre-save projection.
@@ -2220,7 +2440,7 @@ final class AppModel {
                     // intent whose capture was deleted on the phone or filed by hand on
                     // the Mac never becomes applicable, and retrying it forever leaves
                     // the command channel unable to drain.
-                    if MobileIntentLifetime.hasExpired(intent) {
+                    if intent.captureKind != .idea, MobileIntentLifetime.hasExpired(intent) {
                         expiredMobileIntents += 1
                         try await mobileCloudPublisher.markHandled(intent)
                         try await mobileCloudPublisher.acknowledge(recordName: record.recordName)
@@ -2234,11 +2454,33 @@ final class AppModel {
                 try await mobileCloudPublisher.acknowledge(recordName: record.recordName)
                 changedLocalState = true
             }
-            if changedLocalState { await refreshAll() }
+            if changedLocalState {
+                mobileCloudPublicationRequested = true
+                await refreshAll()
+            }
             if expiredMobileIntents > 0 {
                 statusMessage = "Gave up on \(expiredMobileIntents) phone change\(expiredMobileIntents == 1 ? "" : "s") "
                     + "older than two weeks that no longer match anything here."
             }
+            guard !mobileCloudPublicationInFlight else { return }
+            let fallbackDue = mobileCloudLastPublication.map { $0.duration(to: .now) >= .seconds(120) } ?? true
+            guard mobileCloudPublicationRequested || !planningReceipts.isEmpty || fallbackDue else {
+                mobileCloudSyncError = nil
+                return
+            }
+            mobileCloudPublicationRequested = false
+            mobileCloudPublicationInFlight = true
+            // A large startup index publish can take minutes. The existing timer
+            // must still be able to receive commands while its batches are in flight.
+            Task { await publishMobileCloud(planningReceipts: planningReceipts) }
+        } catch {
+            reportMobileCloudError(error)
+        }
+    }
+
+    private func publishMobileCloud(planningReceipts: [MobileWorkspaceIntent]) async {
+        defer { mobileCloudPublicationInFlight = false }
+        do {
             // Work records may live below their area roots and never be rendered in
             // a tag inspector. Fill those cache misses from the one private tag store
             // before projecting rather than publishing an accidentally tag-less task.
@@ -2254,6 +2496,7 @@ final class AppModel {
                 let description = projectStore.description(for: record.id)
                 let metadata = projectStore.metadata(for: record.id)
                 let references = projectStore.portfolioDetails(for: record.id)
+                let rating = score(for: item, preferences: scoring)
                 return (path, MobileProjectDetails(
                     path: path, oneLiner: description.oneLiner, summary: description.summary,
                     domain: metadata.domain, status: metadata.status, phase: metadata.phase, githubURL: references.githubURL,
@@ -2262,11 +2505,13 @@ final class AppModel {
                     taskCount: references.taskReferences.count, featureCount: references.featureReferences.count,
                     milestoneCount: references.milestoneReferences.count, workLogCount: references.workLogReferences.count,
                     assessment: projectAudit(for: item).map(MobileProjectAssessment.init), projectID: record.id, serviceID: record.watcherID,
-                    manualScore: score(for: item, preferences: scoringPreferences())?.projectScore,
-                    ratingCoverage: score(for: item, preferences: scoringPreferences())?.coverage,
+                    manualScore: rating?.projectScore,
+                    ratingCoverage: rating?.coverage,
                     lastWorked: overviewFocusItems.first { $0.path == path }?.lastWorked,
                     ratings: ratingsByProject[record.id] ?? [:], scoringPreferences: scoring,
-                    needsSetup: setupProjectIDs.contains(record.id), previews: previewCache[record.id], projectType: metadata.projectType, createdAt: item.createdAt
+                    needsSetup: setupProjectIDs.contains(record.id), previews: previewCache[record.id], projectType: metadata.projectType, createdAt: item.createdAt, portfolio: references, notionURL: record.notionURL?.absoluteString,
+                    history: ProjectWorkHistory(serviceID: record.watcherID, logs: workLogs, sessions: recentSessions),
+                    portfolioPriority: metadata.portfolioPriority
                 ))
             })
             let snapshot = MobileWorkspaceLocalSnapshot(
@@ -2282,26 +2527,26 @@ final class AppModel {
             }.value
             candidates.append(.entry(MobileWorkspaceEntry(path: OverviewDigest.path, parentPath: nil, name: "Overview focus", isDirectory: false, revision: 0, overview: overviewDigest())))
             try await mobileCloudPublisher.publish(candidates)
-            for record in inbound {
-                if let intent = record.intent, intent.kind == .planningEdit,
-                   try await mobileCloudPublisher.isHandled(intent.id) {
-                    try await mobileCloudPublisher.finishPlanning(intent, workModifiedAt: widgetCommands?.value("applied-work:" + intent.id.uuidString, as: Date.self))
-                }
+            for intent in planningReceipts {
+                try await mobileCloudPublisher.finishPlanning(intent, workModifiedAt: widgetCommands?.value("applied-work:" + intent.id.uuidString, as: Date.self))
             }
+            mobileCloudLastPublication = .now
             mobileCloudLastPublished = Date()
             mobileCloudSyncError = nil
             TestIsolation.defaults.set(mobileCloudLastPublished, forKey: MobileCloudPublisher.lastPublishedDefaultsKey)
-        } catch let error as MobileCloudError {
-            mobileCloudSyncError = error.localizedDescription
-            // Offline/no-account mode is expected. It is deliberately quiet so a
-            // filesystem-first workspace does not look broken without iCloud.
-            if case .rejected = error { lastError = error.localizedDescription }
-            if case .configuration = error { lastError = error.localizedDescription }
         } catch {
-            // The publisher's conversion normally maps CloudKit errors above, but
-            // never make a transport failure invalidate or alter local state.
+            mobileCloudPublicationRequested = true
+            reportMobileCloudError(error)
+        }
+    }
+
+    private func reportMobileCloudError(_ error: Error) {
+        mobileCloudSyncError = error.localizedDescription
+        if let cloudError = error as? MobileCloudError {
+            if case .rejected = cloudError { lastError = error.localizedDescription }
+            if case .configuration = cloudError { lastError = error.localizedDescription }
+        } else {
             lastError = "Mobile sync couldn't finish: \(error.localizedDescription)"
-            mobileCloudSyncError = error.localizedDescription
         }
     }
 
@@ -2380,7 +2625,10 @@ final class AppModel {
                 }
                 for tagID in tagIDs { tagStore.assign(tagID: tagID, to: capture.url, area: nil) }
                 do {
-                    _ = try ingest.classify(capture, intoDirectory: destination.url, renamingTo: nil)
+                    let service = ingest
+                    _ = try await Task.detached(priority: .userInitiated) {
+                        try service.classify(capture, intoDirectory: destination.url, renamingTo: nil)
+                    }.value
                     return true
                 } catch {
                     // A conflict or unavailable provider can be corrected without
@@ -2400,7 +2648,7 @@ final class AppModel {
                     statusMessage = "“\(capture.title)” arrived from your phone as an idea, but the Ideas area is not available yet."
                     return false
                 }
-                return (try? fileAsIdea(capture, tagIDs: tagIDs)) != nil
+                return (try? await fileAsIdea(capture, tagIDs: tagIDs)) != nil
             }
             // Whichever folder is set up as this kind's work queue, so the route follows
             // area settings and Finder renames rather than a fixed name.
@@ -2431,31 +2679,21 @@ final class AppModel {
         }
     }
 
-    /// Files a capture as an idea: a new folder of its own in Ideas, named after it,
-    /// with the capture inside and the tags on the folder. Phone intents and the Mac's
-    /// own Capture Idea action both come here.
+    /// Phone intents and the Mac's Capture Idea action share the Ideas filing path.
     @discardableResult
-    func fileAsIdea(_ capture: IngestItem, tagIDs: Set<String>) throws -> URL {
+    func fileAsIdea(_ capture: IngestItem, tagIDs: Set<String>) async throws -> IngestService.Filed {
         guard let ideas = folders.first(where: { $0.name == WorkspaceArea.ideas.directoryName }) else {
             throw IngestService.IngestError.moveFailed("The Ideas area is not available.")
         }
-        let base = CaptureNaming.safeFilename(capture.title)
-        var folder = ideas.url.appendingPathComponent(base, isDirectory: true)
-        var number = 2
-        while FileManager.default.fileExists(atPath: folder.path) {
-            folder = ideas.url.appendingPathComponent("\(base) \(number)", isDirectory: true)
-            number += 1
-        }
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
-            _ = try ingest.classify(capture, intoDirectory: folder, renamingTo: nil)
-            for tagID in tagIDs { tagStore.assign(tagID: tagID, to: folder, area: ideas.name) }
-            reloadTags()
-            return folder
-        } catch {
-            try? FileManager.default.removeItem(at: folder)
-            throw error
-        }
+        let service = ingest
+        let tags = tagStore
+        let filed = try await Task.detached(priority: .userInitiated) {
+            for tagID in tagIDs { tags.assign(tagID: tagID, to: capture.url, area: nil) }
+            return try service.file(capture, intoDirectory: ideas.url,
+                                    renamingTo: capture.item.isDirectory ? nil : capture.title)
+        }.value
+        reloadTags()
+        return filed
     }
 
     // MARK: - Tags
@@ -2482,6 +2720,7 @@ final class AppModel {
         for id in current.subtracting(wanted) { tagStore.unassign(tagID: id, from: url) }
         tagsByPath[url.canonicalPath] = tagStore.tags(for: url)
         reloadTags()
+        requestWidgetDashboardPublish()
         requestMobileCloudSync()
     }
 
@@ -2493,7 +2732,10 @@ final class AppModel {
     private func reloadTagAssignments(for items: [WorkspaceItem]) {
         let paths = items.map { $0.url.canonicalPath }
         let fresh = tagStore.tagsByObjectKey(forPaths: paths)
-        for path in paths { tagsByPath[path] = fresh[path] ?? [] }
+        for path in paths {
+            let tags = fresh[path] ?? []
+            if tagsByPath[path] != tags { tagsByPath[path] = tags }
+        }
     }
 
     func tags(for item: WorkspaceItem) -> [Tag] {
@@ -2508,6 +2750,7 @@ final class AppModel {
         tagStore.assign(tagID: tag.id, to: item.url, area: area)
         tagsByPath[item.url.canonicalPath] = tagStore.tags(for: item.url)
         reloadTags()
+        requestWidgetDashboardPublish()
         requestMobileCloudSync()
         if !applyingGraphToLocal && projectRecord(for: item) != nil { queueProjectGraphEdits(for: item, fields: ["tags"]) }
     }
@@ -2516,6 +2759,7 @@ final class AppModel {
         tagStore.unassign(tagID: tag.id, from: item.url)
         tagsByPath[item.url.canonicalPath] = tagStore.tags(for: item.url)
         reloadTags()
+        requestWidgetDashboardPublish()
         requestMobileCloudSync()
         if !applyingGraphToLocal && projectRecord(for: item) != nil { queueProjectGraphEdits(for: item, fields: ["tags"]) }
     }
@@ -2545,6 +2789,18 @@ final class AppModel {
     }
 
     // MARK: - Ideas editing
+
+    func createIdea(named name: String) async throws -> WorkspaceItem {
+        let root = workspace.url(for: .ideas)
+        let url = try await Task.detached(priority: .userInitiated) {
+            try IdeaFileService(ideasRoot: root).createIdea(named: name)
+        }.value
+        await refresh(area: .ideas)
+        guard let item = await fs.makeItem(url: url) else { throw CocoaError(.fileNoSuchFile) }
+        selectedItem = item
+        statusMessage = "Created “\(item.name)” in Ideas"
+        return item
+    }
 
     /// Ideas intentionally allow explicit note and attachment edits. The service
     /// validates every target remains below `Ideas`; this is not a general escape
@@ -2829,12 +3085,14 @@ enum StateRestoration {
         guard let raw = defaults.string(forKey: selectionKey) else { return nil }
         switch raw {
         case "overview": return .overview
+        case "unified": return .unified
         // The old global Work screen was redundant with project queues. A saved
         // selection from an older release opens Overview instead.
         case "work": return .overview
         case "ingest": return .ingest
         default:
             if raw.hasPrefix("folder:") { return .folder(String(raw.dropFirst(7))) }
+            if raw.hasPrefix("root:") { return .rootItem(String(raw.dropFirst(5))) }
             if raw.hasPrefix("tag:") { return .tag(String(raw.dropFirst(4))) }
             return nil
         }
@@ -2845,9 +3103,11 @@ enum StateRestoration {
     static func save(_ selection: SidebarSelection?, folder identity: String?) {
         let raw: String? = switch selection {
         case .overview?: "overview"
+        case .unified?: "unified"
         case .work?: "work"
         case .ingest?: "ingest"
         case .folder(let name)?: "folder:" + name
+        case .rootItem(let name)?: "root:" + name
         case .tag(let id)?: "tag:" + id
         case nil: nil
         }

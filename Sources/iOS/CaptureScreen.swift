@@ -34,7 +34,7 @@ struct CaptureScreen: View {
                 VStack(alignment: .leading, spacing: 18) {
                     if model.isResolving {
                         resolvingCard
-                    } else if model.isReady == false {
+                    } else if model.canSaveCapture == false {
                         setupCard
                     }
 
@@ -116,6 +116,11 @@ struct CaptureScreen: View {
                 model.setInboxMonitoring(active: phase == .active)
             }
             .overlay(alignment: .bottom) { statusToast }
+            // Drag photos, screenshots, files, links or text in from another app
+            // (iPad Split View, Slide Over, or a drag on iPhone).
+            .onDrop(of: Self.droppableTypes, isTargeted: nil) { providers in
+                handleDrop(providers); return true
+            }
             .disabled(saving)
         }
     }
@@ -265,7 +270,9 @@ struct CaptureScreen: View {
                     Label("Save", systemImage: "arrow.down.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(saving || loadingPhotos || model.isReady == false || (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && link.isEmpty && model.draftAttachments.isEmpty))
+                // ⌘Return, as on the Mac, from any field with a hardware keyboard.
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(saving || loadingPhotos || model.canSaveCapture == false || (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && link.isEmpty && model.draftAttachments.isEmpty))
             }
             // Until the next capture starts: the toast fades in seconds, this does not.
             if let receipt = model.lastSaveReceipt, text.isEmpty, title.isEmpty, link.isEmpty, model.draftAttachments.isEmpty {
@@ -335,23 +342,25 @@ struct CaptureScreen: View {
                 PhotosPicker(selection: $photoItems, maxSelectionCount: 10, matching: .any(of: [.images, .videos])) {
                     attachmentTile(symbol: "photo.on.rectangle", title: "Photos")
                 }
-                .disabled(model.isReady == false)
+                .disabled(model.canSaveCapture == false)
 
                 Button { choosingFolder = false; showingFileImporter = true } label: {
                     attachmentTile(symbol: "doc", title: "Files")
                 }
-                .disabled(model.isReady == false)
+                .disabled(model.canSaveCapture == false)
 
 
                 Button { pasteAttachment() } label: {
                     attachmentTile(symbol: "doc.on.clipboard.fill", title: "Paste media")
                 }
-                .disabled(model.isReady == false)
+                // ⌘V pastes text into the note; ⇧⌘V adds clipboard images as attachments.
+                .keyboardShortcut("v", modifiers: [.command, .shift])
+                .disabled(model.canSaveCapture == false)
 
                 Button { showingCamera = true } label: {
                     attachmentTile(symbol: "camera", title: "Camera")
                 }
-                .disabled(model.isReady == false || UIImagePickerController.isSourceTypeAvailable(.camera) == false)
+                .disabled(model.canSaveCapture == false || UIImagePickerController.isSourceTypeAvailable(.camera) == false)
             }
         }
     }
@@ -512,6 +521,71 @@ struct CaptureScreen: View {
     /// without touching contents, so they decide first and the blocking read happens off
     /// the main actor. Asking only about the type that is actually present also stops the
     /// old code prompting twice for a text-only clipboard.
+    static let droppableTypes: [UTType] = [.image, .movie, .pdf, .fileURL, .url, .plainText, .item]
+
+    /// Images and files become attachments; a web link fills Link; text joins the note.
+    private func handleDrop(_ providers: [NSItemProvider]) {
+        Task { @MainActor in
+            for provider in providers {
+                let types = provider.registeredTypeIdentifiers.compactMap(UTType.init)
+                if let url = await Self.webURL(from: provider, types: types) {
+                    if link.isEmpty { link = url.absoluteString } else { text = text.isEmpty ? url.absoluteString : text + "\n" + url.absoluteString }
+                    continue
+                }
+                if types.contains(where: { $0.conforms(to: .plainText) }), !types.contains(where: { $0.conforms(to: .image) || $0.conforms(to: .fileURL) }),
+                   let string = await Self.string(from: provider) {
+                    text = text.isEmpty ? string : text + "\n" + string
+                    continue
+                }
+                guard let type = types.first(where: { $0.conforms(to: .image) }) ?? types.first(where: { !$0.conforms(to: .plainText) }) ?? types.first,
+                      let copy = await Self.fileCopy(from: provider, type: type) else {
+                    model.errorMessage = "That item could not be added."
+                    continue
+                }
+                model.stageFiles([copy])
+                try? FileManager.default.removeItem(at: copy.deletingLastPathComponent())
+            }
+        }
+    }
+
+    private static func webURL(from provider: NSItemProvider, types: [UTType]) async -> URL? {
+        guard types.contains(where: { $0.conforms(to: .url) && !$0.conforms(to: .fileURL) }),
+              !types.contains(where: { $0.conforms(to: .image) }) else { return nil }
+        return await withCheckedContinuation { continuation in
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                continuation.resume(returning: url.flatMap { $0.isFileURL ? nil : $0 })
+            }
+        }
+    }
+
+    private static func string(from provider: NSItemProvider) async -> String? {
+        await withCheckedContinuation { continuation in
+            _ = provider.loadObject(ofClass: String.self) { value, _ in
+                let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                continuation.resume(returning: trimmed.isEmpty ? nil : trimmed)
+            }
+        }
+    }
+
+    /// The system deletes a drop's file when its handler returns, so it is copied
+    /// into a private temporary folder first; the caller stages that copy.
+    private static func fileCopy(from provider: NSItemProvider, type: UTType) async -> URL? {
+        await withCheckedContinuation { continuation in
+            _ = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, _ in
+                guard let url else { continuation.resume(returning: nil); return }
+                let folder = FileManager.default.temporaryDirectory.appendingPathComponent("bw-drop-" + UUID().uuidString, isDirectory: true)
+                let name = provider.suggestedName.map { CaptureNaming.safeFilename(($0 as NSString).deletingPathExtension) } ?? url.deletingPathExtension().lastPathComponent
+                let ext = url.pathExtension.isEmpty ? (type.preferredFilenameExtension ?? "") : url.pathExtension
+                let target = ext.isEmpty ? folder.appendingPathComponent(name) : folder.appendingPathComponent(name).appendingPathExtension(ext)
+                do {
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    try FileManager.default.copyItem(at: url, to: target)
+                    continuation.resume(returning: target)
+                } catch { continuation.resume(returning: nil) }
+            }
+        }
+    }
+
     private func pasteAttachment() {
         let pasteboard = UIPasteboard.general
         let hasImages = pasteboard.hasImages

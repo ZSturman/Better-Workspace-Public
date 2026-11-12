@@ -4,7 +4,7 @@ import BetterWorkspaceCore
 
 /// One navigation layer, organized around the reason for opening a project.
 enum ProjectSection: String, CaseIterable, Identifiable {
-    case tasks, insights, details, media, portfolio
+    case tasks, insights, activity, details, media, portfolio
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
 }
@@ -26,7 +26,7 @@ struct ProjectSectionPicker: View {
 struct ProjectWorkspaceView: View {
     @Environment(AppModel.self) private var model
     let project: WorkspaceItem
-    @State private var section = ProjectSection.tasks
+    @State private var section = ProjectSection.details
     @State private var capability: ProjectToolCapability?
 
     var body: some View {
@@ -38,6 +38,7 @@ struct ProjectWorkspaceView: View {
                 switch section {
                 case .tasks: ProjectPlanView(local: project, graph: model.graphProject(for: project))
                 case .insights: ProjectInsightsView(project: project)
+                case .activity: ProjectWorkspaceActivity(project: project)
                 case .details: ProjectWorkspaceDetails(project: project)
                 case .media: ProjectWorkspaceFiles(project: project)
                 case .portfolio:
@@ -50,8 +51,15 @@ struct ProjectWorkspaceView: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("projects.workspace")
         .task(id: project.id) { @MainActor in
-            section = .tasks
+            section = model.requestedProjectSection ?? .details
+            model.requestedProjectSection = nil
             capability = await model.projectToolCapability(for: project)
+        }
+        .onChange(of: model.requestedProjectSection) { _, requested in
+            // The same project was already open when a notification asked for a section.
+            guard let requested else { return }
+            section = requested
+            model.requestedProjectSection = nil
         }
     }
 
@@ -117,7 +125,8 @@ struct NextActionControls: View {
                     .help("Double-click to edit")
                     .accessibilityIdentifier("projects.nextAction.title")
             }
-            Text([item.stage.displayName, item.priority == .medium && item.actionMetadata == nil ? nil : "\(item.actionPriorityLabel) priority"]
+            Text([item.stage.displayName, item.priority == .medium && item.actionMetadata == nil ? nil : "\(item.actionPriorityLabel) priority",
+                  item.responsibilityLabel.map { "For \($0)" }]
                     .compactMap { $0 }.joined(separator: " · "))
                 .font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 8) {
@@ -332,8 +341,15 @@ private struct MetricAnchorGuide: View {
 private struct ProjectWorkspaceDetails: View {
     @Environment(AppModel.self) private var model
     let project: WorkspaceItem
-        @State private var metadata = ProjectMetadata()
+    @State private var metadata = ProjectMetadata()
     @State private var description = ProjectDescription()
+    @State private var portfolio = ProjectPortfolioDetails()
+    @State private var originalPortfolio = ProjectPortfolioDetails()
+    @State private var originalMetadata = ProjectMetadata()
+    @State private var originalDescription = ProjectDescription()
+    @State private var originalRelated = Set<String>()
+    @State private var propertyOptions: [String: [String]] = [:]
+    @State private var saveError: String?
     @State private var related = Set<String>()
     @State private var relationQuery = ""
     @State private var pickingRelated = false
@@ -341,12 +357,24 @@ private struct ProjectWorkspaceDetails: View {
     var body: some View {
         VStack(spacing: 0) {
         ScrollView { VStack(alignment: .leading, spacing: Theme.Space.base) {
+            WorkspaceCard(title: "Project details") {
+                choice("Domain", path: \.domain, option: "domain")
+                choice("Status", path: \.status, option: "Status")
+                ProjectPortfolioFields(details: $portfolio)
+                ProjectTypeField(value: Binding(get: { metadata.projectType ?? "" }, set: { metadata.projectType = $0.isEmpty ? nil : $0 }), suggestions: propertyOptions["Type"] ?? [], store: TestIsolation.defaults)
+            }
+            WorkspaceCard(title: "Notion") { ProjectNotionConnection(project: project) }
+            WorkspaceCard(title: "Links") {
+                ProjectLinksFields(details: $portfolio)
+                if let url = model.projectRecord(for: project)?.notionURL { Link("Notion page", destination: url) }
+            }
+            if let saveError { Text(saveError).foregroundStyle(.red) }
             WorkspaceCard(title: "About") {
-                DetailText("One-line summary", value: $description.oneLiner); DetailText("Description", value: $description.summary, multiline: true)
-                choice("Status", path: \.status, option: "Status"); choice("Phase", path: \.phase, option: "Phase")
-                choice("Type", path: \.projectType, option: "Type"); choice("Domain", path: \.domain, option: "domain")
+                DetailText("One-line summary", value: $description.oneLiner)
+                DetailText("Description", value: $description.summary, multiline: true)
             }
             DisclosureGroup("Lifecycle") { WorkspaceCard(title: "") {
+                choice("Phase", path: \.phase, option: "Phase")
                 choice("Completion model", path: \.completionModel, option: "Completion Model")
                     .help("How the project ends: finite, maintained, ongoing, versioned…")
                 choice("Maintenance cadence", path: \.maintenanceCadence, option: "Maintenance Cadence")
@@ -393,23 +421,53 @@ private struct ProjectWorkspaceDetails: View {
                     .accessibilityIdentifier("project.lmStudio.open")
                 Spacer()
                 Button("Revert") { load() }.disabled(!hasUnsavedDetails)
-                Button("Save") { model.setProjectDescription(description, for: project); model.saveProjectMetadata(metadata, relatedProjectIDs: related, for: project) }
+                Button("Save") {
+                    do {
+                        try model.saveProjectPortfolio(portfolio, original: originalPortfolio, for: project)
+                        model.setProjectDescription(description, for: project); model.saveProjectMetadata(metadata, relatedProjectIDs: related, for: project)
+                        originalPortfolio = portfolio; originalMetadata = metadata
+                        originalDescription = description; originalRelated = related; saveError = nil
+                    } catch { saveError = error.localizedDescription }
+                }
                     .buttonStyle(.borderedProminent).disabled(!hasUnsavedDetails)
                     .accessibilityIdentifier("project.details.save")
             }
             .padding(.horizontal, Theme.Space.loose).padding(.vertical, 10)
-        }.onAppear { load() }
+        }.task(id: project.id) { @MainActor in
+            load()
+            // Six choice controls previously queried every project's metadata on
+            // each layout/keystroke. Read once off the UI actor, then reuse values.
+            let store = model.projectStore
+            let ids = Set(model.projects().compactMap { model.projectRecord(for: $0)?.id })
+            let sourceOptions = model.ideaProjectPropertyOptions()
+            let options = await Task.detached(priority: .utility) {
+                let metadata = store.allMetadata().filter { ids.contains($0.key) }.map(\.value)
+                let fields: [(String, KeyPath<ProjectMetadata, String?>)] = [
+                    ("domain", \.domain), ("Status", \.status), ("Phase", \.phase),
+                    ("Type", \.projectType), ("Completion Model", \.completionModel),
+                    ("Maintenance Cadence", \.maintenanceCadence)]
+                return Dictionary(uniqueKeysWithValues: fields.map { name, path in
+                    (name, Array(Set(metadata.compactMap { $0[keyPath: path] } + (sourceOptions[name] ?? []))).sorted())
+                })
+            }.value
+            guard !Task.isCancelled else { return }
+            propertyOptions = options
+        }
         .sheet(isPresented: $showingSuggestions, onDismiss: { load() }) { ProjectMetadataSuggestionSheet(project: project) }
     }
     private func choice(_ title: String, path: WritableKeyPath<ProjectMetadata, String?>, option: String) -> some View {
-        let values = model.projects().compactMap { model.projectMetadata(for: $0)[keyPath: path] }
         return WorkspaceChoiceField(title, selection: Binding(get: { metadata[keyPath: path] ?? "" },
-            set: { metadata[keyPath: path] = $0.isEmpty ? nil : $0 }), suggestions: values + (model.ideaProjectPropertyOptions()[option] ?? []), identifier: "project.details." + option, store: TestIsolation.defaults)
+            set: { metadata[keyPath: path] = $0.isEmpty ? nil : $0 }), suggestions: propertyOptions[option] ?? [], identifier: "project.details." + option, store: TestIsolation.defaults)
     }
     private var hasUnsavedDetails: Bool {
-        description != (model.projectDescription(for: project) ?? ProjectDescription()) || metadata != model.projectMetadata(for: project) || related != Set(model.relatedProjects(for: project).compactMap { model.projectRecord(for: $0)?.id })
+        portfolio != originalPortfolio || description != originalDescription || metadata != originalMetadata || related != originalRelated
     }
-    private func load() { metadata = model.projectMetadata(for: project); description = model.projectDescription(for: project) ?? ProjectDescription(); related = Set(model.relatedProjects(for: project).compactMap { model.projectRecord(for: $0)?.id }) }
+    private func load() {
+        portfolio = model.projectPortfolioDetails(for: project); originalPortfolio = portfolio; saveError = nil
+        metadata = model.projectMetadata(for: project); originalMetadata = metadata
+        description = model.projectDescription(for: project) ?? ProjectDescription(); originalDescription = description
+        related = Set(model.relatedProjects(for: project).compactMap { model.projectRecord(for: $0)?.id }); originalRelated = related
+    }
     private func commaBinding(_ path: WritableKeyPath<ProjectMetadata, [String]>) -> Binding<String> { Binding(get: { metadata[keyPath: path].joined(separator: ", ") }, set: { metadata[keyPath: path] = $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }) }
     private var relatedItems: [WorkspaceItem] {
         model.projects().filter { model.projectRecord(for: $0).map { related.contains($0.id) } ?? false }
@@ -475,8 +533,9 @@ private struct DetailText: View {
 struct ProjectWorkspaceActivity: View {
     @Environment(AppModel.self) private var model
     let project: WorkspaceItem
-    var body: some View { let record = model.projectRecord(for: project); let sessions = record?.watcherID.map { id in model.recentSessions.filter { $0.projectID == id } } ?? []
-        return ScrollView { VStack(alignment: .leading, spacing: Theme.Space.base) { Text("Activity").font(.title2.weight(.semibold)); WorkspaceCard(title: "OBSERVED WORK") { if sessions.isEmpty { Text("No observed sessions are available. Filesystem recency is shown separately and is not treated as proof of work.").foregroundStyle(.secondary) } else { ForEach(sessions) { session in VStack(alignment: .leading) { Text(Format.relativeDate(session.endedAt)); Text("\(Format.duration(seconds: session.activeSeconds)) · \(session.interestingFiles.prefix(3).joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) } } } }; WorkspaceCard(title: "FILESYSTEM") { Text("Last content change: \(Format.relativeDate(project.contentModifiedAt))").foregroundStyle(.secondary) } }.padding(Theme.Space.loose) }
+    var body: some View {
+        ProjectWorkHistoryView(history: ProjectWorkHistory(serviceID: model.projectRecord(for: project)?.watcherID,
+            logs: model.workLogs, sessions: model.recentSessions))
     }
 }
 

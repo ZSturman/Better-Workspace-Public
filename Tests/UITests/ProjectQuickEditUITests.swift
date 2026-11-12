@@ -24,6 +24,7 @@ final class ProjectQuickEditUITests: IsolatedUITestCase {
         app.radioButtons["Cards"].firstMatch.click()
         let card = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Fixture project")).firstMatch
         XCTAssertTrue(card.waitForExistence(timeout: 15)); card.click()
+        showProjectTasks(app)
         XCTAssertTrue(app.descendants(matching: .any)["projects.nextAction"].firstMatch.waitForExistence(timeout: 10))
         return app
     }
@@ -116,8 +117,12 @@ final class ProjectQuickEditUITests: IsolatedUITestCase {
 
         app.buttons["All Projects"].firstMatch.click()
         app.radioButtons["Charts"].firstMatch.click()
-        XCTAssertTrue(app.descendants(matching: .any)["projects.charts.backlog"].firstMatch.waitForExistence(timeout: 10),
-                      "Outstanding work compares projects")
+        // Work remaining follows Needs review in a lazy grid; scroll until it is built.
+        let backlog = app.descendants(matching: .any)["projects.charts.backlog"].firstMatch
+        let dashboard = app.scrollViews["projects.charts"].firstMatch
+        XCTAssertTrue(dashboard.waitForExistence(timeout: 10))
+        for _ in 0..<6 where !backlog.exists { dashboard.scroll(byDeltaX: 0, deltaY: -300) }
+        XCTAssertTrue(backlog.waitForExistence(timeout: 10), "Outstanding work compares projects")
         XCTAssertTrue(app.descendants(matching: .any)["projects.charts.nearDone"].firstMatch.exists,
                       "Two open and three completed records make this project 60% done")
         shoot(app, "projects-charts")

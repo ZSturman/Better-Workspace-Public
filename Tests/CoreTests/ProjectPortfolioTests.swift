@@ -110,7 +110,7 @@ final class ProjectPortfolioDecisionTests: XCTestCase {
         XCTAssertTrue(recommendation.factors.contains("Open Now work"))
         XCTAssertTrue(recommendation.factors.contains(where: { $0.contains("Do Next score unavailable") }))
         XCTAssertTrue(recommendation.factors.contains(where: { $0.contains("Ready Now score unavailable") }))
-        XCTAssertTrue(recommendation.explanation.contains("stage → local portfolio priority → work-item priority → due date → Do Next → Ready Now → name"))
+        XCTAssertTrue(recommendation.explanation.contains("stage → local portfolio priority → work-item priority → due date → manual project score → Do Next → Ready Now → name"))
     }
 
     func testLensesExposeUnknownCoverageRatherThanFallbackScores() {
@@ -118,6 +118,15 @@ final class ProjectPortfolioDecisionTests: XCTestCase {
         let fullEnough = candidate("rated", name: "Rated", ratings: Dictionary(uniqueKeysWithValues: MetricDefinition.all.map { ($0.id, 3) }))
         let overall = try! XCTUnwrap(ProjectPortfolio.rankings([thin, fullEnough], preferences: preferences).first { $0.id == "overall" })
         XCTAssertEqual(overall.items.map { $0.candidate.id }, ["rated"])
+    }
+
+    func testManualRatingsOutsideReadinessLensesStillPrecedeUnscoredProjects() {
+        let unscored = candidate("unscored", name: "Alpha")
+        let low = candidate("low", name: "Zulu", ratings: [MetricDefinition.enjoyment.id: 1])
+        let high = candidate("high", name: "Later name", ratings: [MetricDefinition.enjoyment.id: 5])
+        XCTAssertEqual(ProjectPortfolio.recommend([unscored, low], preferences: preferences)?.candidate.id, "low")
+        XCTAssertEqual(ProjectPortfolio.recommend([unscored, low, high], preferences: preferences)?.candidate.id, "high")
+        XCTAssertEqual(ProjectPortfolio.recommend([unscored], preferences: preferences)?.candidate.id, "unscored")
     }
 
     func testDecisionSurfaceIncludesAllNineRankingLenses() {

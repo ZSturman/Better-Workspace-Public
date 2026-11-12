@@ -42,6 +42,7 @@ struct BetterWorkspaceStoreApp: App {
                 PersonalWorkspaceView(sample: NotebookReleaseAcceptance.isSamplePreview, isolated: true)
             } else {
                 PersonalWorkspaceView(sample: cloudAcceptance)
+                    .connectedApps()
                     .frame(minWidth: 620, minHeight: 450)
                     .task { if !welcomed && !cloudAcceptance { showsWelcome = true } }
                     .sheet(isPresented: $showsWelcome) {

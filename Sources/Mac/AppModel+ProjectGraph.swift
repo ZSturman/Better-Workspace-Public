@@ -14,7 +14,7 @@ struct ProjectSyncReview: Identifiable {
 extension AppModel {
     /// Prepare only the selected project's page. No general sync preparation runs
     /// here: it can queue service records and unrelated work.
-    func reviewNewProjectInNotion(_ item: WorkspaceItem) async throws {
+    func reviewNewProjectInNotion(_ item: WorkspaceItem, presenterID: String = "newProject") async throws {
         guard !graphBusy else { throw NotionProjectSync.SyncError.busy }
         guard hasNotionToken else { throw NotionClient.Failure.noCredentials }
         await refreshProjectGraph()
@@ -29,7 +29,7 @@ extension AppModel {
         guard matches.count <= 1 else {
             throw NotionProjectSync.SyncError.unsupported("Several Notion pages declare this directory. Resolve the duplicate links in Sync Center before adding this project.")
         }
-        try bindGraphProjects(onlyLocalID: local.id)
+        try await bindGraphProjects(onlyLocalID: local.id)
         await refreshProjectGraph()
         if let linked = graphProject(for: item), let url = linked.pageID.flatMap({ URL(string: "https://www.notion.so/" + $0) }) {
             open(url); return
@@ -45,8 +45,20 @@ extension AppModel {
         var preview = record
         preview.local = record.local.filter { !["relation", "files"].contains($0.value["type"].string ?? "") }
         preview.pendingUploads = nil
-        graphSyncReview = .init(presenterID: "newProject", direction: .outgoing, records: [record],
+        graphSyncReview = .init(presenterID: presenterID, direction: .outgoing, records: [record],
             plan: ProjectSyncReviewPlan(records: [preview], allRecords: graphRecords, sources: graphSources), createProjectOnly: true)
+    }
+
+    /// Identity-only linking: local metadata and pending remote choices are retained.
+    func linkExistingNotionProject(_ expected: ProjectGraphRecord, to item: WorkspaceItem) async throws {
+        guard !graphBusy, let local = projectRecord(for: item),
+              projectStore.record(for: item.url)?.id == local.id else { throw NotionProjectSync.SyncError.stale }
+        let store = try ProjectGraphStore(database: database)
+        let existing = graphProject(for: item)
+        try store.linkLocalProject(local, page: expected, draft: existing?.id == expected.id ? nil : existing, projectStore: projectStore)
+        await refreshProjectRecords()
+        await refreshProjectGraph()
+        statusMessage = "Linked the existing Notion page. Review differences in Sync Center."
     }
 
     /// One worker prepares an immutable graph away from the UI. Requests arriving
@@ -65,7 +77,9 @@ extension AppModel {
                 }.value
                 guard generation == self.graphReloadGeneration else { continue }
                 switch result {
-                case .success(let snapshot): self.publishProjectGraph(snapshot)
+                // Unchanged content keeps graphRevision, so nothing keyed on it rebuilds.
+                case .success(let snapshot) where snapshot.contentID != self.publishedGraphContentID: self.publishProjectGraph(snapshot)
+                case .success: break
                 case .failure(let error): self.lastError = error.localizedDescription
                 }
                 return
@@ -80,6 +94,7 @@ extension AppModel {
     }
 
     private func publishProjectGraph(_ snapshot: ProjectGraphSnapshot) {
+        publishedGraphContentID = snapshot.contentID
         graphRecords = snapshot.records
         graphIndex = snapshot.index
         graphMediaIndex = snapshot.mediaIndex
@@ -94,6 +109,8 @@ extension AppModel {
         syncTriage = snapshot.triage
         syncDeferred = snapshot.deferred
         syncFailures = snapshot.failures
+        syncPolicy = snapshot.policy
+        syncHealth = snapshot.health
         syncReport = snapshot.syncReport
         syncActionReport = snapshot.actionReport
         syncLastChangesReport = snapshot.lastChangesReport
@@ -116,6 +133,8 @@ extension AppModel {
     func startProjectSyncChecks() {
         reloadProjectGraph()
         guard !TestIsolation.isActive else { return }
+        holdSnapshotFolders()
+        adoptFinderNotionPolicyIfConfigured()
         graphCheckTask?.cancel()
         graphCheckTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -124,7 +143,7 @@ extension AppModel {
                 await self.refreshProjectGraph()
                 if self.notionAutoSync {
                     await self.runAutoSyncPass()
-                } else if SecretStore.hasNotionToken && (TestIsolation.defaults.object(forKey: "projectGraphBackgroundChecks") as? Bool ?? true) && (self.graphReport?.checkedAt.map { Date().timeIntervalSince($0) >= 900 } ?? true) {
+                } else if self.hasNotionToken && (TestIsolation.defaults.object(forKey: "projectGraphBackgroundChecks") as? Bool ?? true) && (self.graphReport?.checkedAt.map { Date().timeIntervalSince($0) >= 900 } ?? true) {
                     await self.checkProjectGraph()
                 }
                 await self.synchronizePotentialIdeaProjects()
@@ -137,32 +156,46 @@ extension AppModel {
         guard !graphBusy else { syncFeedback = "A sync is already running."; return }
         graphBusy = true; syncActivity = "Checking Notion for changes…"
         defer { graphBusy = false; syncActivity = nil }
-        guard let token = SecretStore.read() else { showSyncFailure("Add a Notion token in Settings first."); return }
+        guard let token = await Task.detached(priority: .utility, operation: { SecretStore.read(interactive: false) }).value else { showSyncFailure("Add a Notion token in Settings first."); return }
         do {
             let seeds = NotionGraphConfiguration.seeds()
             guard !seeds.isEmpty else { throw NotionProjectSync.SyncError.unsupported("Configure the Projects database in Settings → Integrations → Notion.") }
             let coordinator = NotionProjectSync(store: try ProjectGraphStore(database: database), client: NotionClient(token: token))
             graphReport = try await coordinator.check(seeds: seeds, disabled: NotionGraphConfiguration.disabled(), forceFull: forceFull)
             await refreshProjectGraph()
-            try bindGraphProjects()
+            try await bindGraphProjects()
             await refreshProjectGraph()
-            bindExistingGraphWork()
+            await bindExistingGraphWork()
             await refreshProjectGraph()
             syncFeedbackIsError = graphReport?.failures.isEmpty == false
             syncFeedback = syncFeedbackIsError ? "Check finished with source errors. Previous values were kept." : "Checked \(graphReport?.counts.count ?? 0) Notion sources. Changes are ready for review."
             statusMessage = (graphReport?.failures.isEmpty == false) ? "Notion check has source failures. Review Settings → Integrations → Notion; previous snapshots are retained." : "Checked \(graphReport?.counts.count ?? 0) Notion sources; changes are ready for review."
         } catch { showSyncFailure(error.localizedDescription) }
     }
-    func bindGraphProjects(onlyLocalID: String? = nil) throws {
+    func bindGraphProjects(onlyLocalID: String? = nil) async throws {
+        let database = database, projectStore = projectStore, graphRecords = graphRecords, sources = graphSourcesByID
+        let tagsByProject = Dictionary(projects().compactMap { item -> (String, [String])? in
+            guard let record = projectRecord(for: item) else { return nil }
+            return (record.id, tags(for: item).map(\.name))
+        }, uniquingKeysWith: { first, _ in first })
+        try await Task.detached(priority: .utility) {
         let store = try ProjectGraphStore(database: database)
+        let localRecords = projectStore.allRecords()
+        let linkedByPage = Dictionary(localRecords.compactMap { record in
+            record.notionPageID.map { (NotionImport.normalizedID($0), record) }
+        }, uniquingKeysWith: { first, _ in first })
+        let unlinkedByPath = Dictionary(localRecords.lazy.filter { !$0.hasNotionLink && !$0.lastPath.isEmpty }
+            .map { ($0.lastPath, $0) }, uniquingKeysWith: { first, _ in first })
         for var graph in graphRecords where graph.kind == .projects && graph.pageID != nil {
-            guard let source = graphSource(for: graph) else { continue }
-            let pageID = graph.pageID.map(NotionImport.normalizedID)
+            guard let pageID = graph.pageID, let source = sources[graph.sourceID] else { continue }
+            let original = graph
             let declaredPath = graph.value("Local Directory", source: source).display
-            let local = projectStore.allRecords().first { $0.notionPageID.map(NotionImport.normalizedID) == pageID }
-                ?? projectStore.allRecords().first { !$0.hasNotionLink && !$0.lastPath.isEmpty && $0.lastPath == declaredPath }
+            let local = linkedByPage[NotionImport.normalizedID(pageID)] ?? unlinkedByPath[declaredPath]
             if let local {
                 guard onlyLocalID == nil || local.id == onlyLocalID else { continue }
+                if local.notionPageID == pageID, graph.localProjectID == local.id, graph.localPath == local.lastPath,
+                   !graph.local.isEmpty || !graph.baseline.isEmpty { continue }
+                guard try store.record(id: graph.id) == graph else { continue }
                 if graph.local.isEmpty && graph.baseline.isEmpty {
                     let metadata = projectStore.metadata(for: local.id), description = projectStore.description(for: local.id)
                     var owned: [String: ProjectJSON] = [:]
@@ -171,20 +204,30 @@ extension AppModel {
                     for (name, value) in [("domain", metadata.domain), ("Status", metadata.status), ("Phase", metadata.phase), ("Completion Model", metadata.completionModel), ("Maintenance Cadence", metadata.maintenanceCadence)] { if let value, !value.isEmpty { owned[name] = ProjectJSON(["name": value]) } }
                     for (name, values) in [("Current Work", metadata.currentWork), ("Next Work", metadata.nextWork), ("Recent Work", metadata.recentWork), ("Work Mode", metadata.workModes), ("Blocked By", metadata.blockers), ("Type", (metadata.projectType ?? "").components(separatedBy: ", ").filter { !$0.isEmpty })] where !values.isEmpty { owned[name] = ProjectJSON(values.map { ["name": $0] }) }
                     for (name, date) in [("started at", metadata.startedAt), ("last update at", metadata.lastUpdateAt)] { if let date { owned[name] = ProjectJSON(["start": ISO8601DateFormatter().string(from: date)]) } }
-                    for metric in MetricDefinition.all { if let rating = projectStore.ratings(for: local.id)[metric.id] { owned[metric.displayName] = .number(Double(rating)) } }
-                    if let item = projects().first(where: { projectRecord(for: $0)?.id == local.id }), !tags(for: item).isEmpty { owned["tags"] = ProjectJSON(tags(for: item).map { ["name": $0.name] }) }
+                    let ratings = projectStore.ratings(for: local.id)
+                    for metric in MetricDefinition.all { if let rating = ratings[metric.id] { owned[metric.displayName] = .number(Double(rating)) } }
+                    if let tags = tagsByProject[local.id], !tags.isEmpty { owned["tags"] = ProjectJSON(tags.map { ["name": $0] }) }
                     graph.seedInitialLocalState(owned, source: source)
                 }
                 graph.localProjectID = local.id; graph.localPath = local.lastPath
-                if let id = graph.pageID { try projectStore.setExplicitNotionPageID(id, for: local.id) }
-                try store.save(graph)
+                try projectStore.setExplicitNotionPageID(pageID, for: local.id)
+                try database.transaction {
+                    guard try store.record(id: graph.id) == original else { return }
+                    if graph != original { try store.save(graph) }
+                }
+                if let oldPath = original.localPath, oldPath != local.lastPath,
+                   FileIdentityResolver.identity(of: URL(fileURLWithPath: local.lastPath))?.key == local.identityKey {
+                    try store.reflectFinderProjectLocation(projectID: local.id, path: local.lastPath, title: local.name,
+                        renamed: URL(fileURLWithPath: oldPath).lastPathComponent != local.name, isIdea: false, source: source)
+                }
             }
         }
+        }.value
     }
     func reviewProjectSync(_ direction: ProjectSyncReview.Direction, project: ProjectGraphRecord? = nil, presenterID: String = "settings") {
         Task { @MainActor in
             await refreshProjectGraph()
-            do { try bindGraphProjects(); bindExistingGraphWork(); await queueServiceProjectGraph(); await refreshProjectGraph() } catch { lastError = error.localizedDescription }
+            do { try await bindGraphProjects(); await bindExistingGraphWork(); await queueServiceProjectGraph(); await refreshProjectGraph() } catch { lastError = error.localizedDescription }
             let scope = project.map { Set(graphSyncIndex.related(to: $0).map(\.id) + [$0.id]) }
             let records = graphRecords.filter { record in
                 guard scope == nil || scope!.contains(record.id) else { return false }
@@ -195,18 +238,27 @@ extension AppModel {
         }
     }
     func applyProjectSync(_ review: ProjectSyncReview, selected: Set<String>, resolutions: [String: [String: Bool]]) async throws {
-        guard !graphBusy, let token = SecretStore.read() else { throw NotionClient.Failure.noCredentials }
-        graphBusy = true; defer { graphBusy = false; reloadProjectGraph() }
-        let store = try ProjectGraphStore(database: database)
-        let coordinator = NotionProjectSync(store: store, client: NotionClient(token: token))
-        // Sending ideas or work logs takes over the service's Notion writers; receiving does not.
-        if review.direction == .outgoing, review.records.contains(where: { selected.contains($0.id) && [.ideas, .workLogs].contains($0.kind) }) {
-            try await claimServiceProjectGraphWriter()
-            for var record in review.records where selected.contains(record.id) && record.serviceRecordID != nil { record.serviceAcknowledgementPending = true; try store.save(record) }
+        guard !graphBusy else { throw NotionProjectSync.SyncError.busy }
+        graphBusy = true
+        defer { syncApplyingIDs.subtract(selected); graphBusy = false }
+        await beginReviewedSync(selected)
+        do {
+            guard let token = await Task.detached(priority: .userInitiated, operation: { SecretStore.read() }).value else { throw NotionClient.Failure.noCredentials }
+            let store = try ProjectGraphStore(database: database)
+            let coordinator = NotionProjectSync(store: store, client: NotionClient(token: token))
+            // Sending ideas or work logs takes over the service's Notion writers; receiving does not.
+            if review.direction == .outgoing, review.records.contains(where: { selected.contains($0.id) && [.ideas, .workLogs].contains($0.kind) }) {
+                try await claimServiceProjectGraphWriter()
+                for var record in review.records where selected.contains(record.id) && record.serviceRecordID != nil { record.serviceAcknowledgementPending = true; try store.save(record) }
+            }
+            if review.direction == .incoming { try await coordinator.pull(ids: selected, reviewed: review.records, resolutions: resolutions) }
+            else { try await coordinator.push(ids: selected, reviewed: review.records, resolutions: resolutions, createProjectsOnly: review.createProjectOnly) }
+            try await applyLocalEffects(of: selected, previous: review.records, createFiles: true)
+            await refreshProjectGraph()
+        } catch {
+            await refreshProjectGraph()
+            throw error
         }
-        if review.direction == .incoming { try await coordinator.pull(ids: selected, reviewed: review.records, resolutions: resolutions) }
-        else { try await coordinator.push(ids: selected, reviewed: review.records, resolutions: resolutions, createProjectsOnly: review.createProjectOnly) }
-        try await applyLocalEffects(of: selected, previous: review.records, createFiles: true)
     }
 
     /// What this Mac does once records have been received or sent: service
@@ -235,11 +287,12 @@ extension AppModel {
         }
         refreshOverview()
     }
-    func saveGraphRecord(_ record: ProjectGraphRecord, replacingUploads: Bool = false) {
+    func saveGraphRecord(_ record: ProjectGraphRecord, replacingUploads: Bool = false, projectValuesAlreadySaved: Bool = false) {
         do {
             let store = try ProjectGraphStore(database: database)
             var draft = record
-            if let current = try store.record(id: record.id) {
+            let previous = try store.record(id: record.id)
+            if let current = previous {
                 draft.pageID = current.pageID; draft.baseline = current.baseline; draft.remote = current.remote
                 draft.editedAt = current.editedAt
                 if !replacingUploads { draft.pendingUploads = current.pendingUploads }
@@ -252,7 +305,17 @@ extension AppModel {
             if let localID = draft.localProjectID { graphProjectsByLocalID[localID] = draft }
             if draft.kind == .projects, let pageID = draft.pageID { graphProjectsByPageID[ProjectGraph.normalizedID(pageID)] = draft }
             reloadProjectGraph()
-            if draft.kind == .projects { projectGraphValuesToLocal(draft) }
+            if draft.kind == .projects && !projectValuesAlreadySaved {
+                let before = draft.localProjectID.map { projectStore.metadata(for: $0) }
+                projectGraphValuesToLocal(draft)
+                // A draft edited here is a person's choice; send only the fields they changed.
+                if !applyingGraphToLocal, let localID = draft.localProjectID, let before, let source = graphSource(for: draft) {
+                    let edited = Set(ProjectExchangeMetadata.notionNames.compactMap { field, name in
+                        previous?.value(name, source: source) == draft.value(name, source: source) ? nil : field
+                    })
+                    forwardOwnedMetadata(projectID: localID, from: before, to: projectStore.metadata(for: localID), only: edited)
+                }
+            }
             // A local edit is picked up by the next automatic pass, if that is on.
             requestAutoSync()
         }
@@ -305,6 +368,16 @@ extension AppModel {
         for (name, values) in [("Current Work", metadata.currentWork), ("Next Work", metadata.nextWork), ("Recent Work", metadata.recentWork), ("Work Mode", metadata.workModes), ("Blocked By", metadata.blockers)] where includes(name) {
             graph.set(name, value: .array(values.map { ProjectJSON(["name": $0]) }), source: source)
         }
+        let links = projectStore.portfolioDetails(for: local.id)
+        for (aliases, value) in [(["GitHub", "Github", "Repo Link", "Repository URL", "Repository", "Repo"], links.githubURL),
+                                  (["Website", "Project URL", "URL", "Live URL", "Download URL"], links.websiteURL)] {
+            if let name = aliases.first(where: { source.property(named: $0)?.definition["type"].string == "url" }), fields?.contains(name) == true {
+                graph.set(name, value: value.map(ProjectJSON.string) ?? .null, source: source)
+            }
+        }
+        for (name, value) in [("Featured", links.featured), ("In Showcase", links.inShowcase), ("Public", links.isPublic)] where fields?.contains(name) == true {
+            if source.property(named: name)?.definition["type"].string == "checkbox" { graph.set(name, value: .bool(value ?? false), source: source) }
+        }
         setText("status details", metadata.statusDetail)
         if includes("tags") { graph.set("tags", value: ProjectJSON(tags(for: item).map { ["name": $0.name] }), source: source) }
         if includes("Type") { graph.set("Type", value: ProjectJSON((metadata.projectType ?? "").components(separatedBy: ", ").filter { !$0.isEmpty }.map { ["name": $0] }), source: source) }
@@ -320,12 +393,35 @@ extension AppModel {
             graph.set("related projects", value: ProjectJSON(ids.map { ["id": $0] }), source: source)
         }
         for metric in MetricDefinition.all where includes(metric.displayName) { graph.set(metric.displayName, value: ratingsByProject[local.id]?[metric.id].map { .number(Double($0)) } ?? .null, source: source) }
-        saveGraphRecord(graph)
+        // These fields came from committed ProjectStore values. Reapplying the
+        // entire older graph would overwrite unrelated newer local properties.
+        saveGraphRecord(graph, projectValuesAlreadySaved: true)
     }
     func graphPending(_ direction: ProjectSyncReview.Direction, project: ProjectGraphRecord? = nil) -> Int {
         _ = graphRevision
         let scope = project.map { Set(graphSyncIndex.related(to: $0).map(\.id) + [$0.id]) }
         let pending = direction == .incoming ? graphIncomingIDs : graphOutgoingIDs
         return scope.map { pending.intersection($0).count } ?? pending.count
+    }
+}
+
+extension AppModel {
+    /// Called from successful shallow Finder observations, never a remote status.
+    func reflectFinderProjectLocation(_ prior: ProjectRecord, item: WorkspaceItem, isIdea: Bool) async {
+        guard let source = graphSources.first(where: { $0.kind == .projects }),
+              prior.lastPath != item.url.canonicalPath || prior.name != item.name else { return }
+        let database = database, workspace = workspace, projects = projectStore
+        do {
+            try await Task.detached(priority: .utility) {
+                guard let relative = MobileWorkspaceProjection.relativePath(of: item.url, workspace: workspace),
+                      try MobilePlanningFiles.resolve(relative, workspace: workspace).canonicalPath == item.url.canonicalPath,
+                      let identity = FileIdentityResolver.identity(of: item.url),
+                      prior.identityKey.flatMap(FileIdentity.init(key:)) == identity else { throw WorkspaceReplicaError.changed }
+                try ProjectGraphStore(database: database).reflectFinderProjectLocation(projectID: prior.id,
+                    path: item.url.canonicalPath, title: item.name, renamed: prior.name != item.name, isIdea: isIdea, source: source)
+                _ = projects.register(url: item.url)
+            }.value
+            reloadProjectGraph(); requestAutoSync()
+        } catch { lastError = "The Finder change will be checked again: " + error.localizedDescription }
     }
 }

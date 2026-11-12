@@ -3,8 +3,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 channel="${1:-mobile}"
 case "$channel" in
-  mobile) scheme=BetterWorkspaceMobile; destination='generic/platform=iOS'; directory=AppStore ;;
-  mac) scheme=BetterWorkspace; destination='generic/platform=macOS'; directory=MacDownload ;;
+  mobile) scheme=BetterWorkspaceMobile; destination='generic/platform=iOS'; directory=AppStore; derived_platform=ios ;;
+  mac) scheme=BetterWorkspace; destination='generic/platform=macOS'; directory=MacDownload; derived_platform=mac ;;
   # The sandboxed personal-only Mac Store edition is retired; the advanced Mac is the Mac app.
   mac-store) echo 'mac-store is retired: archive the advanced Mac with "mac" instead.' >&2; exit 2 ;;
   *) echo 'Usage: bash Tools/archive_release.sh [mobile|mac]' >&2; exit 2 ;;
@@ -18,6 +18,7 @@ if [[ -e "$archive" ]]; then
   echo "Archive already exists: $archive. Set a new BUILD_NUMBER or move it aside." >&2; exit 2
 fi
 build_arguments=(-project BetterWorkspace.xcodeproj -scheme "$scheme"
+  -derivedDataPath "build/DerivedData-$derived_platform"
   -configuration Release -destination "$destination"
   -archivePath "$archive" -allowProvisioningUpdates
   "MARKETING_VERSION=${RELEASE_VERSION:-1.0}" "CURRENT_PROJECT_VERSION=$build_number")

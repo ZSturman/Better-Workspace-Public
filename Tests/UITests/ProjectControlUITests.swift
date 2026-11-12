@@ -107,3 +107,48 @@ final class ProjectControlUITests: IsolatedUITestCase {
         screenshot("ingest-nothing-due-820", app)
     }
 }
+
+
+extension ProjectControlUITests {
+    func testNativeProjectDetailsAndFeaturedStarPersist() throws {
+        let url = Self.workspaceRoot.appendingPathComponent("Projects/Creative fixture")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let database = try Database(url: Self.fixtureRoot.appendingPathComponent("test.sqlite"))
+        let store = ProjectStore(database: database), record = store.register(url: url)
+        store.setMetadata(.init(domain: "Art", status: "Active", projectType: "Animation, Collection"), for: record.id)
+        store.setPortfolioDetails(.init(githubURL: "https://github.com/example/project"), for: record.id)
+        let source = ProjectGraphSource(id: "fixture-projects", title: "Projects", kind: .projects, schema: ProjectJSON([
+            "Name": ["id": "title", "type": "title"], "domain": ["id": "d", "type": "select"],
+            "Status": ["id": "s", "type": "status"], "Featured": ["id": "f", "type": "checkbox"]]))
+        var graph = ProjectGraphRecord(sourceID: source.id, kind: .projects)
+        graph.localProjectID = record.id; graph.localPath = url.canonicalPath
+        graph.set("Name", value: ProjectJSON([["type": "text", "text": ["content": "Creative fixture"]]]), source: source)
+        graph.set("domain", value: ProjectJSON(["name": "Older graph domain"]), source: source)
+        graph.set("Featured", value: .bool(false), source: source)
+        let graphStore = try ProjectGraphStore(database: database)
+        try graphStore.write("sources", [source]); try graphStore.save(graph)
+        let app = isolatedApp(arguments: ["-bwStartArea", "Projects", "-bwWindowWidth", "820", "-bwWindowHeight", "520"])
+        app.launch(); defer { app.terminate() }; requireForeground(app)
+        let title = app.staticTexts["Creative fixture"].firstMatch
+        XCTAssertTrue(title.waitForExistence(timeout: 20))
+        // Simulate an unrelated newer private edit after the graph was loaded.
+        store.setMetadata(.init(domain: "Art", status: "Active", projectType: "Animation, Collection"), for: record.id)
+        let star = app.buttons["Toggle featured Creative fixture"].firstMatch
+        XCTAssertTrue(star.waitForExistence(timeout: 10)); star.click()
+        wait("Table star persisted") { store.portfolioDetails(for: record.id).featured == true }
+        XCTAssertEqual(store.metadata(for: record.id).domain, "Art", "A flag draft must not replay older unrelated graph values")
+        screenshot("project-table-native-820", app)
+        title.doubleClick()
+        let featured = app.checkBoxes["project.featured"]
+        XCTAssertTrue(featured.waitForExistence(timeout: 10)); XCTAssertEqual(featured.value as? Int, 1)
+        let scroll = app.scrollViews.firstMatch
+        for _ in 0..<5 where featured.frame.maxY > scroll.frame.maxY - 30 { scroll.scroll(byDeltaX: 0, deltaY: -150) }
+        featured.click()
+        XCTAssertEqual(featured.value as? Int, 0)
+        app.buttons["project.details.save"].click()
+        screenshot("project-details-after-save", app)
+        wait("Details save persisted") { store.portfolioDetails(for: record.id).featured == false }
+        XCTAssertEqual(store.metadata(for: record.id).projectType, "Animation, Collection")
+        screenshot("project-details-native-820", app)
+    }
+}

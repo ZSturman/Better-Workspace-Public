@@ -11,7 +11,7 @@ final class PrivacySupportUITests: XCTestCase {
         XCTAssertTrue(menu.waitForExistence(timeout: 20)); menu.tap()
         app.buttons["Privacy & Support"].tap()
         XCTAssertTrue(app.navigationBars["Privacy & Support"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Your workspace"].exists)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Projects, plans, ideas and notes save on this device")).firstMatch.waitForExistence(timeout: 10))
         let capture = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         capture.name = "iphone-offline-privacy"; capture.lifetime = .keepAlways; add(capture)
         app.terminate()

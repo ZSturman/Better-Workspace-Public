@@ -60,12 +60,20 @@ public extension NotionClient {
 
 public enum ProjectDates {
     public static func parse(_ raw: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        if let date = formatter.date(from: raw) { return date }
-        formatter.formatOptions.insert(.withFractionalSeconds)
-        if let date = formatter.date(from: raw) { return date }
-        let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.calendar = Calendar(identifier: .gregorian); day.timeZone = TimeZone(secondsFromGMT: 0); day.dateFormat = "yyyy-MM-dd"; day.isLenient = false
+        if let date = internet.date(from: raw) { return date }
+        if let date = fractional.date(from: raw) { return date }
         guard let date = day.date(from: raw), day.string(from: date) == raw else { return nil }
         return date
     }
+    // Built once: a sync pass parses a date for every page it reads, and building three
+    // formatters per call showed up as seconds of CPU per pass (November 9 profile).
+    // Both formatter classes are thread-safe for parsing and formatting.
+    nonisolated(unsafe) private static let internet = ISO8601DateFormatter()
+    nonisolated(unsafe) private static let fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter(); formatter.formatOptions.insert(.withFractionalSeconds); return formatter
+    }()
+    nonisolated(unsafe) private static let day: DateFormatter = {
+        let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.calendar = Calendar(identifier: .gregorian); day.timeZone = TimeZone(secondsFromGMT: 0); day.dateFormat = "yyyy-MM-dd"; day.isLenient = false
+        return day
+    }()
 }

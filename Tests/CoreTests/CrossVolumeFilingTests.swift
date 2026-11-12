@@ -104,7 +104,8 @@ final class CrossVolumeFilingTests: XCTestCase {
 
         let filed = try ingest.file(item, intoDirectory: ideas, renamingTo: nil)
         XCTAssertTrue(filed.originalKept)
-        XCTAssertEqual(try Data(contentsOf: filed.destination).count, 50)
+        // An idea is a folder: the note, and the captured file under Attachments.
+        XCTAssertEqual(try Data(contentsOf: attachment(of: filed.destination, named: item.url.lastPathComponent)).count, 50)
         XCTAssertTrue(FileManager.default.fileExists(atPath: item.url.path))
     }
 
@@ -129,7 +130,8 @@ final class CrossVolumeFilingTests: XCTestCase {
         let filed = try ingest.file(file, intoDirectory: ideas, renamingTo: nil)
         XCTAssertFalse(filed.originalKept)
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.url.path), "The original went only after the copy")
-        XCTAssertEqual(try Data(contentsOf: filed.destination).count, 200_000)
+        XCTAssertEqual(try Data(contentsOf: attachment(of: filed.destination, named: file.url.lastPathComponent)).count, 200_000)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: filed.destination.appendingPathComponent(filed.destination.lastPathComponent + ".md").path))
         XCTAssertEqual(tagStore.tags(for: filed.destination).map(\.name), ["Receipts"])
 
         let folder = inbox.appendingPathComponent("Project bundle", isDirectory: true)
@@ -173,5 +175,9 @@ final class CrossVolumeFilingTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: unmarked.path), "Unmarked: not provably ours")
         XCTAssertTrue(FileManager.default.fileExists(atPath: young.path), "Recent: possibly still copying")
         XCTAssertTrue(FileManager.default.fileExists(atPath: stillThere.path))
+    }
+
+    private func attachment(of idea: URL, named name: String) -> URL {
+        idea.appendingPathComponent(IdeaFolderLayout.attachmentsFolder).appendingPathComponent(name)
     }
 }

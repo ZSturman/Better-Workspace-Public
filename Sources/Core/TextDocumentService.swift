@@ -39,6 +39,15 @@ public final class TextDocumentService: @unchecked Sendable {
 
     public init() {}
 
+    /// Explicit creation at an already reviewed destination. Never replaces a file.
+    public func create(_ text: String, at url: URL) throws {
+        guard Self.supportsEditing(url) else { throw Error.unsupported(url) }
+        let bytes = Data(text.utf8)
+        guard bytes.count <= Self.maximumEditableBytes else { throw Error.tooLarge(url) }
+        try bytes.write(to: url, options: .withoutOverwriting)
+        let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }; try handle.synchronize()
+    }
+
     /// Keep binary, package, database, and rich-text formats out of a plain-text editor.
     public static func supportsEditing(_ url: URL) -> Bool {
         ["md", "markdown", "mdown", "txt", "log", "out", "err",

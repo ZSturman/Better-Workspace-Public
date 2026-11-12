@@ -38,7 +38,13 @@ public struct MobilePlanningEdit: Identifiable, Hashable, Sendable, Codable {
         self.captureReview = captureReview
         self.projectEdit = projectEdit
         self.id = id; self.operation = operation; self.title = title; self.description = description
-        self.work = work; self.originalWork = originalWork; self.originalIdea = originalIdea; self.originalEntry = originalEntry; self.tagIDs = tagIDs; self.inboxReview = inboxReview; self.captureFiling = captureFiling
+        self.work = work; self.originalWork = originalWork; self.originalIdea = originalIdea; self.originalEntry = originalEntry.map { entry in
+            guard var details = entry.projectDetails, details.history != nil else { return entry }
+            details.history = nil
+            return MobileWorkspaceEntry(path: entry.path, parentPath: entry.parentPath, name: entry.name,
+                isDirectory: entry.isDirectory, revision: entry.revision, tagIDs: entry.tagIDs,
+                modifiedAt: entry.modifiedAt, projectDetails: details, overview: entry.overview)
+        }; self.tagIDs = tagIDs; self.inboxReview = inboxReview; self.captureFiling = captureFiling
     }
 }
 
@@ -225,10 +231,20 @@ public enum MobilePlanningFiles {
         }
     }
 
+    /// A receipt acknowledges execution; only the downloaded values acknowledge
+    /// projection delivery. Receipt age must never discard an unreflected edit.
+    public static func settledDraftIDs(_ drafts: [MobilePlanningEdit], appliedAt: [UUID: Date],
+                                       snapshot: MobileWorkspaceSnapshot) -> Set<UUID> {
+        Set(drafts.filter { appliedAt[$0.id] != nil && index(snapshot, reflects: $0) }.map(\.id))
+    }
+
     static func sameEditableFields(_ lhs: MobileWorkItem, _ rhs: MobileWorkItem) -> Bool {
         func day(_ date: Date?) -> Double? { date.map { floor($0.timeIntervalSince1970) } }
         return lhs.title == rhs.title && lhs.kind == rhs.kind && lhs.status == rhs.status && lhs.stage == rhs.stage
             && lhs.priority == rhs.priority && lhs.projectPath == rhs.projectPath && day(lhs.dueDate) == day(rhs.dueDate)
+            && (rhs.body.map { lhs.body.map(normalizedWorkBody) == normalizedWorkBody($0) } ?? true)
+            && (rhs.actionMetadata.map { lhs.actionMetadata == $0 } ?? true)
+            && lhs.tagIDs == rhs.tagIDs
             // Links count only where `rhs` says something: nil is "not changed here".
             && (rhs.featureIDs.map { (lhs.featureIDs ?? []) == $0 } ?? true)
             && (rhs.milestoneIDs.map { (lhs.milestoneIDs ?? []) == $0 } ?? true)
@@ -263,7 +279,7 @@ public enum MobilePlanningFiles {
             try change.validate()
         }
         if edit.operation == .previewProject {
-            guard let entry = edit.originalEntry, entry.parentPath == "Projects", entry.isDirectory,
+            guard let entry = edit.originalEntry, entry.isDirectory,
                   MobileWorkspacePath.normalizedRelative(entry.path) == entry.path, WorkspaceListing.isAreaChild(entry.path, area: "Projects") else {
                 throw Error.invalid("Choose a local project to preview.")
             }

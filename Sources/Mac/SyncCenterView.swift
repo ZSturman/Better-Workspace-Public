@@ -26,19 +26,18 @@ enum SyncSection: String, CaseIterable, Identifiable {
 }
 
 extension AppModel {
-    /// Every difference, in the section a person would look for it.
+    /// Every difference, in the section a person would look for it. The planner decides:
+    /// Needs You is exactly what an automatic pass leaves for a person.
     var syncSections: [SyncSection: [ProjectSyncTriage.Item]] {
         _ = graphRevision
+        let plan = syncPlan
         var sections: [SyncSection: [ProjectSyncTriage.Item]] = [:]
-        for item in syncTriage {
-            let section: SyncSection
-            if syncDeferred[item.id] == item.fingerprint { section = .deferred }
-            else if item.bucket == .obsolete { section = .cleanup }
-            else if item.bucket == .decision || (syncFailures[item.id]?.attempts ?? 0) >= ProjectAutoSyncPlanner.attemptsBeforeAttention { section = .needsYou }
-            else { section = .ready }
-            sections[section, default: []].append(item)
-        }
-        return sections
+        if !plan.attention.isEmpty { sections[.needsYou] = plan.attention }
+        let ready = plan.push + plan.pull + plan.settle + plan.receivable + plan.waiting
+        if !ready.isEmpty { sections[.ready] = ready }
+        if !plan.obsolete.isEmpty { sections[.cleanup] = plan.obsolete }
+        if !plan.deferred.isEmpty { sections[.deferred] = plan.deferred }
+        return sections.mapValues { $0.filter { !syncApplyingIDs.contains($0.id) } }
     }
 }
 
@@ -61,7 +60,8 @@ struct SyncStatusButton: View {
                 .contextMenu {
                     Button("Open Sync Center") { model.showingSyncCenter = true }
                     Button("Sync Now") { Task { await model.syncNow() } }.disabled(model.graphBusy)
-                    Toggle("Sync Automatically", isOn: Binding(get: { model.notionAutoSync }, set: { model.notionAutoSync = $0 }))
+                    Toggle("Send local updates automatically", isOn: Binding(get: { model.notionAutoSync }, set: { model.notionAutoSync = $0 }))
+                    SyncPolicyToggles()
                 }
         }
     }
@@ -75,6 +75,8 @@ struct SyncStatusButton: View {
         case .waiting:
             Image(systemName: "arrow.triangle.2.circlepath")
                 .overlay(alignment: .topTrailing) { Circle().fill(Color.accentColor).frame(width: 6, height: 6).offset(x: 3, y: -2) }
+        case .recovering:
+            Image(systemName: "arrow.clockwise.icloud")
         case .attention(let count):
             HStack(spacing: 2) {
                 Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
@@ -93,6 +95,7 @@ struct SyncStatusButton: View {
         case .syncing: return "Syncing with Notion"
         case .upToDate: return "In sync with Notion"
         case .waiting(let n): return "\(n) waiting to sync with Notion"
+        case .recovering(let n): return "Retrying \(n) \(n == 1 ? "record" : "records") after a failure; nothing needs you yet"
         case .attention(let n): return "\(n) \(n == 1 ? "difference needs" : "differences need") you"
         case .unavailable(let reason): return "Notion is unavailable: \(reason)"
         case .notConfigured: return ""
@@ -126,7 +129,7 @@ extension AppModel {
         await checkProjectGraph()
         guard !syncFeedbackIsError else { return }
         let plan = syncPlan
-        if !(plan.pull + plan.push).isEmpty { await applySync(plan.pull + plan.push) }
+        if !(plan.settle + plan.pull + plan.push).isEmpty { await applySync(plan.settle + plan.pull + plan.push) }
         else if !syncFeedbackIsError {
             var report = ProjectAutoSync.Report(); report.finishedAt = Date(); report.attention = plan.attention.count
             finishSyncFeedback(report)
@@ -173,6 +176,16 @@ struct SyncCenterView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            Text(model.syncPolicySummary)
+                .font(.caption).foregroundStyle(.secondary).padding(.horizontal).padding(.bottom, 8)
+                .accessibilityIdentifier("sync.policy")
+            ForEach(model.syncHealthFindings, id: \.message) { finding in
+                Label(finding.message, systemImage: "stethoscope")
+                    .font(.caption).foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal).padding(.bottom, 6)
+                    .accessibilityIdentifier("sync.health")
+            }
             syncFeedbackBanner
             Divider()
             HStack(spacing: 0) {
@@ -199,7 +212,7 @@ struct SyncCenterView: View {
                 Text("Manual").tag(false)
             }
             .pickerStyle(.segmented).labelsHidden().fixedSize()
-            .help("Automatic applies safe changes; merges, conflicts, deletions and uploads wait for review")
+            .help(model.syncPolicy.receiveNotionChanges ? "Sends updates to existing linked Notion pages and receives routine Notion changes in the background." : "Sends updates to existing linked Notion pages in the background. Notion changes wait until you receive them.")
             .accessibilityIdentifier("sync.mode")
             Button { Task { await model.syncNow() } } label: {
                 if model.graphBusy { HStack { ProgressView().controlSize(.small); Text("Syncing…") } }
@@ -209,12 +222,15 @@ struct SyncCenterView: View {
                 .accessibilityIdentifier("sync.now")
             Menu {
                 Button("Check Notion for Changes") { Task { await model.checkProjectGraph() } }.disabled(model.graphBusy)
-                Button("Merge All Multi-value Fields…") {
+                Button("Combine Lists From Both Sides…") {
                     let items = model.syncTriage.filter { !ProjectSyncTriage.mergeChoices($0).isEmpty && model.syncDeferred[$0.id] != $0.fingerprint }
                     pending = .init(kind: .merge, items: items)
                 }
                 .disabled(model.graphBusy || model.syncTriage.allSatisfy { ProjectSyncTriage.mergeChoices($0).isEmpty })
                 .accessibilityIdentifier("sync.mergeAll")
+                Divider()
+                SyncPolicyToggles()
+                Divider()
                 Button("Detailed Review…") { showsLegacyReview = true }
             } label: { Image(systemName: "ellipsis.circle") }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
@@ -251,16 +267,32 @@ struct SyncCenterView: View {
         }
     }
 
+    /// The four things a person needs to know: it is working, it is done, something needs
+    /// their decision, or something is wrong. Details stay in the banner and the list.
     private var statusLine: some View {
         let needs = sections[.needsYou]?.count ?? 0, ready = sections[.ready]?.count ?? 0
+        let plan = model.syncPlan, retrying = plan.waiting.count, toReceive = plan.receivable.count
+        let problem: String? = {
+            if case .unavailable(let reason) = model.notionSyncState { return reason }
+            return model.syncFeedbackIsError ? model.syncFeedback : nil
+        }()
+        let (icon, tint, title, detail): (String, AnyShapeStyle, String, String) =
+            model.graphBusy ? ("arrow.triangle.2.circlepath", AnyShapeStyle(.tint), "Syncing…", "You can keep working while this runs.")
+            : problem != nil ? ("exclamationmark.triangle.fill", AnyShapeStyle(.orange), "Sync needs attention", problem ?? "")
+            : needs > 0 ? ("exclamationmark.circle.fill", AnyShapeStyle(.orange), "\(needs.formatted()) \(needs == 1 ? "change" : "changes") to review",
+                           "Nothing here changes until you choose.")
+            : retrying > 0 ? ("arrow.clockwise.circle.fill", AnyShapeStyle(.tint), "Retrying \(retrying.formatted()) \(retrying == 1 ? "record" : "records")",
+                              "A failed transfer retries with backoff. Nothing needs you yet.")
+            : toReceive > 0 ? ("arrow.down.circle.fill", AnyShapeStyle(.tint), "\(toReceive.formatted()) Notion \(toReceive == 1 ? "change" : "changes") ready to receive",
+                               "Routine changes with no conflict. Receive them from Ready, or turn on automatic receiving.")
+            : ready > 0 ? ("arrow.triangle.2.circlepath.circle.fill", AnyShapeStyle(.tint),
+                           model.notionAutoSync ? "Syncing \(ready.formatted()) \(ready == 1 ? "update" : "updates")" : "\(ready.formatted()) ready to sync", lastSynced)
+            : ("checkmark.circle.fill", AnyShapeStyle(.green), "Everything is up to date", lastSynced)
         return HStack(spacing: 10) {
-            Image(systemName: model.graphBusy ? "arrow.triangle.2.circlepath" : needs > 0 ? "exclamationmark.circle.fill" : ready > 0 ? "arrow.triangle.2.circlepath.circle.fill" : "checkmark.circle.fill")
-                .font(.title2).foregroundStyle(needs > 0 ? AnyShapeStyle(.orange) : ready > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.green))
+            Image(systemName: icon).font(.title2).foregroundStyle(tint)
             VStack(alignment: .leading, spacing: 1) {
-                Text(model.graphBusy ? "Syncing…" : needs > 0 ? "\(needs.formatted()) need you" : ready > 0 ? "\(ready.formatted()) ready to sync" : "Everything is in sync")
-                    .font(.headline)
-                    .accessibilityIdentifier("sync.status")
-                Text(lastSynced).font(.caption).foregroundStyle(.secondary)
+                Text(title).font(.headline).accessibilityIdentifier("sync.status")
+                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
         }
     }
@@ -291,7 +323,7 @@ struct SyncCenterView: View {
             Divider()
             let groups = Dictionary(grouping: visible, by: \.category)
             HStack {
-                Text(sectionCaption).font(.caption).foregroundStyle(.secondary)
+                Text(sectionCaption).font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("sync.recordCount")
                 Spacer()
             }
             .padding(.horizontal, 12).padding(.vertical, 4)
@@ -387,7 +419,7 @@ struct SyncCenterView: View {
                            act: { action in perform(action) })
                 .id(item.id)
         } else if selected.count > 1 {
-            BulkPanel(items: selected, act: { action in perform(action) })
+            BulkPanel(items: selected, act: { action in perform(action) }).disabled(model.graphBusy)
         } else {
             overview
         }
@@ -466,6 +498,35 @@ struct SyncCenterView: View {
     }
 }
 
+// MARK: - Policy
+
+/// The person's two standing choices about what moves without them. Buttons with a
+/// checkmark rather than `Toggle`s: a toggle inside a menu here did not apply its change.
+struct SyncPolicyToggles: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let policy = model.syncPolicy
+        choice("Receive Routine Notion Changes Automatically", on: policy.receiveNotionChanges, id: "sync.policy.receive",
+               help: "Takes Notion changes that do not conflict with anything here, on records whose changes touch no Workspace file. Conflicts, new projects, tasks and archives still wait for you.") {
+            var next = model.syncPolicy; next.receiveNotionChanges.toggle(); model.setSyncPolicy(next)
+        }
+        choice("Offer Background-Service Records for Notion", on: policy.offerServiceRecords, id: "sync.policy.serviceRecords",
+               help: "Ideas and daily work logs the background service observes. Off: the service keeps them and they are not offered as Notion pages.") {
+            var next = model.syncPolicy; next.offerServiceRecords.toggle(); model.setSyncPolicy(next)
+        }
+    }
+
+    private func choice(_ title: String, on: Bool, id: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            if on { Label(title, systemImage: "checkmark") } else { Text(title) }
+        }
+        .help(help)
+        .accessibilityIdentifier(id)
+        .accessibilityValue(on ? "On" : "Off")
+    }
+}
+
 // MARK: - Bulk actions and their summary
 
 struct BulkAction: Identifiable {
@@ -540,7 +601,6 @@ struct BulkAction: Identifiable {
 
 private struct BulkSummary: View {
     @Environment(\.dismiss) private var dismiss
-    @Environment(AppModel.self) private var model
     let action: BulkAction
     let run: () async -> Void
     @State private var running = false
@@ -563,18 +623,12 @@ private struct BulkSummary: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(action.title) {
                     running = true
-                    Task { @MainActor in await run(); running = false; dismiss() }
+                    dismiss()
+                    Task { @MainActor in await run() }
                 }
                 .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
                 .disabled(running || action.summary.allSatisfy { $0.0.hasPrefix("Skipped") })
                 .accessibilityIdentifier("sync.summary.confirm")
-            }
-            if running {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text(model.syncActivity ?? "Applying reviewed changes…").font(.caption)
-                        .accessibilityIdentifier("sync.summary.progress")
-                }
             }
         }
         .padding(20).frame(width: 380)
@@ -786,11 +840,11 @@ private struct SyncItemDetail: View {
                 Button(item.record.pageID == nil ? "Send to Notion" : item.category == .newInNotion ? "Bring Here" : "Apply") {
                     act(.init(kind: .chosen, items: [item]))
                 }
-                .buttonStyle(.borderedProminent).disabled(!chosenAll)
+                .buttonStyle(.borderedProminent).disabled(!chosenAll || model.graphBusy)
                 .accessibilityIdentifier("sync.detail.apply")
                 if !ProjectSyncTriage.mergeChoices(item).isEmpty {
                     Button("Merge Multi-value Fields") { act(.init(kind: .merge, items: [item])) }
-                        .accessibilityIdentifier("sync.detail.merge")
+                        .disabled(model.graphBusy).accessibilityIdentifier("sync.detail.merge")
                 }
                 if item.record.pageID == nil && item.category != .serviceRecord {
                     Button("Discard Draft", role: .destructive) { act(.init(kind: .discard, items: [item])) }

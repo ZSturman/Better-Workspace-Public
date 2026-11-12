@@ -355,7 +355,7 @@ public actor MeasurementService {
 /// Only `completed` sessions are worth anything: Watcher marks a great many as
 /// `discarded` because they were a file provider, a dev server heartbeat or a metadata
 /// write rather than a person working, and counting those inflates everything.
-public struct WorkSession: Sendable, Hashable, Identifiable {
+public struct WorkSession: Sendable, Hashable, Identifiable, Codable {
     public let id: String
     public let projectID: String
     public let projectName: String

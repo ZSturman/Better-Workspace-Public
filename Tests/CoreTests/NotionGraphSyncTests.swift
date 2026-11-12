@@ -398,6 +398,35 @@ final class NotionGraphSyncTests: XCTestCase {
         XCTAssertEqual(report.counts["Tasks"], 1); XCTAssertNotNil(report.failures["Tasks"])
         XCTAssertEqual(try store.record(id: record.id), record); XCTAssertEqual(try store.read("cursor:s", as: Date.self), cursor)
     }
+    /// One seed that keeps failing (a database no longer shared) must not turn every
+    /// later pass into a full read of every source. November 9: a 404 on one seed made
+    /// each five-minute pass re-read ~4,700 pages.
+    func testAFailingSeedDoesNotRepeatFullReadsOfSourcesAlreadyRead() async throws {
+        let verifications = NSLock(); nonisolated(unsafe) var verified = 0
+        let (client, store) = try setup { request in
+            let path = request.url!.path
+            if path == "/v1/data_sources/s" { return (200, ProjectJSON(["id": "s", "title": [["text": ["content": "Tasks"]]], "properties": self.source.schema.foundationObject])) }
+            if path == "/v1/data_sources/missing" { return (404, ProjectJSON(["message": "Could not find database"])) }
+            if path.hasSuffix("/query") { return (200, ProjectJSON(["results": [["id": "p", "properties": ["Task": self.text("Kept", type: "title").foundationObject]]], "has_more": false])) }
+            if path == "/v1/pages/gone" {
+                verifications.lock(); verified += 1; verifications.unlock()
+                return (200, ProjectJSON(["id": "gone", "in_trash": true, "properties": ["Task": self.text("Gone", type: "title").foundationObject]]))
+            }
+            return (200, ProjectJSON(["bot": ["workspace_name": "Fixture"]]))
+        }
+        try store.save(ProjectGraphRecord(pageID: "gone", sourceID: "s", kind: .tasks))
+        let sync = NotionProjectSync(store: store, client: client)
+        let first = try await sync.check(seeds: [.tasks: "s", .projects: "missing"])
+        XCTAssertNotNil(first.failures["Projects"], "The missing seed is still reported")
+        XCTAssertEqual(verified, 1, "The first pass is a full read and verifies the missing page")
+        XCTAssertNotNil(try store.read("fullCheck:s", as: Date.self))
+        XCTAssertNil(try store.read("lastFullCheck", as: Date.self), "The whole check did not succeed")
+        _ = try await sync.check(seeds: [.tasks: "s", .projects: "missing"])
+        XCTAssertEqual(verified, 1, "The next pass is incremental for the source read in full")
+        _ = try await sync.check(seeds: [.tasks: "s", .projects: "missing"], forceFull: true)
+        XCTAssertEqual(verified, 2, "A requested full check still reads everything")
+    }
+
     func testIngestUpdatesTheKnownRecordForAPageAndCountsEachReadSource() async throws {
         let (client, store) = try setup { request in
             if request.url!.path == "/v1/data_sources/s" { return (200, ProjectJSON(["id": "s", "title": [["text": ["content": "Tasks"]]], "properties": self.source.schema.foundationObject])) }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import BetterWorkspaceCore
 
 /// Ideas are a lightweight working notebook. The idea folders and files remain normal
@@ -68,8 +69,11 @@ struct IdeasView: View {
                     .labelsHidden()
                     .frame(width: 150)
                     Menu {
-                        Button { creation = .note } label: { Label("New Note", systemImage: "doc.badge.plus") }
-                        Button { creation = .folder } label: { Label("New Folder", systemImage: "folder.badge.plus") }
+                        Button { creation = .idea } label: { Label("New Idea", systemImage: "lightbulb") }
+                        if selectedIdea?.isDirectory == true {
+                            Button { creation = .note } label: { Label("New Note in Selected Idea", systemImage: "doc.badge.plus") }
+                            Button { creation = .folder } label: { Label("New Subfolder in Selected Idea", systemImage: "folder.badge.plus") }
+                        }
                         Divider()
                         Button { importFromFinder() } label: { Label("Add Files…", systemImage: "plus.rectangle.on.folder") }
                     } label: {
@@ -87,9 +91,12 @@ struct IdeasView: View {
                     symbol: "lightbulb",
                     title: query.isEmpty ? "No ideas yet" : "No matching ideas",
                     message: query.isEmpty
-                        ? "Capture something in the inbox and classify it as an Idea."
+                        ? "Capture something in the inbox and classify it as an Idea, or drop files and images here."
                         : "Nothing here matches “\(query)”."
                 )
+                .onDrop(of: IdeaDrop.types, isTargeted: nil) { providers in
+                    importDropped(providers, into: model.workspace.url(for: .ideas)); return true
+                }
             } else {
                 HSplitView {
                     List(items, selection: selectedIdeaID) { item in
@@ -104,20 +111,28 @@ struct IdeasView: View {
                     }
                     .listStyle(.sidebar)
                     .frame(minWidth: 230, idealWidth: 310, maxWidth: 390, maxHeight: .infinity)
+                    // Dropped on the list: each file or image becomes a new idea.
+                    .onDrop(of: IdeaDrop.types, isTargeted: nil) { providers in
+                        importDropped(providers, into: model.workspace.url(for: .ideas)); return true
+                    }
 
                     IdeaWorkspacePane(item: selectedIdea)
                         .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
+                        // Dropped on an open idea: added to its Attachments.
+                        .onDrop(of: IdeaDrop.types, isTargeted: nil) { providers in
+                            importDropped(providers, into: targetDirectory); return true
+                        }
                 }
             }
         }
         .sheet(item: $creation) { kind in
-            IdeaNameSheet(kind: kind, targetName: targetDirectory.lastPathComponent,
-                          canClassify: targetDirectory.canonicalPath == model.workspace.url(for: .ideas).canonicalPath) { name, potential in
-                let target = targetDirectory
+            let target = kind == .idea ? model.workspace.url(for: .ideas) : targetDirectory
+            IdeaNameSheet(kind: kind, targetName: target.lastPathComponent, canClassify: kind == .idea) { name, potential in
                 Task { @MainActor in
                     do {
                         let item: WorkspaceItem
                         switch kind {
+                        case .idea: item = try await model.createIdea(named: name)
                         case .note: item = try await model.createIdeaNote(named: name, in: target)
                         case .folder: item = try await model.createIdeaFolder(named: name, in: target)
                         }
@@ -145,6 +160,16 @@ struct IdeasView: View {
         return selected.isDirectory ? selected.url : selected.url.deletingLastPathComponent()
     }
 
+    private func importDropped(_ providers: [NSItemProvider], into target: URL) {
+        Task { @MainActor in
+            let staged = await IdeaDrop.files(from: providers)
+            defer { staged.cleanup() }
+            guard staged.urls.isEmpty == false else { return }
+            do { _ = try await model.importIdeaItems(staged.urls, into: target) }
+            catch { model.lastError = error.localizedDescription }
+        }
+    }
+
     private func importFromFinder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -161,10 +186,22 @@ struct IdeasView: View {
 }
 
 private enum IdeaCreation: String, Identifiable {
-    case note, folder
+    case idea, note, folder
     var id: String { rawValue }
-    var title: String { self == .note ? "New Idea Note" : "New Idea Folder" }
-    var prompt: String { self == .note ? "Note name" : "Folder name" }
+    var title: String {
+        switch self {
+        case .idea: "New Idea"
+        case .note: "New Note"
+        case .folder: "New Subfolder"
+        }
+    }
+    var prompt: String {
+        switch self {
+        case .idea: "Idea name"
+        case .note: "Note name"
+        case .folder: "Folder name"
+        }
+    }
 }
 
 private struct IdeaNameSheet: View {
@@ -478,5 +515,54 @@ private struct IdeaFacts: View {
                 .foregroundStyle(.tertiary)
                 .help("Not resurfaced while you work")
         }
+    }
+}
+
+/// Turns dropped items into files: Finder files as they are, images from other apps
+/// (a browser, Preview, a screenshot thumbnail) written to a private temporary folder
+/// first. The temporary copies are removed after the import has copied them.
+enum IdeaDrop {
+    static let types: [UTType] = [.fileURL, .image]
+
+    struct Staged {
+        var urls: [URL] = []
+        var temporary: URL?
+        func cleanup() { if let temporary { try? FileManager.default.removeItem(at: temporary) } }
+    }
+
+    static func files(from providers: [NSItemProvider]) async -> Staged {
+        var staged = Staged()
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
+               let url = await fileURL(from: provider) {
+                staged.urls.append(url); continue
+            }
+            guard provider.hasItemConformingToTypeIdentifier(UTType.image.identifier),
+                  let data = await imageData(from: provider) else { continue }
+            let directory = staged.temporary ?? FileManager.default.temporaryDirectory.appendingPathComponent("bw-idea-drop-" + UUID().uuidString, isDirectory: true)
+            guard (try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)) != nil else { continue }
+            staged.temporary = directory
+            let name = (provider.suggestedName?.isEmpty == false ? provider.suggestedName! : "Image")
+            let url = CaptureNaming.uniqueURL(in: directory, base: CaptureNaming.safeFilename((name as NSString).deletingPathExtension), extension: "png")
+            if (try? data.write(to: url, options: .withoutOverwriting)) != nil { staged.urls.append(url) }
+        }
+        return staged
+    }
+
+    private static func fileURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { continuation in
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in continuation.resume(returning: url?.isFileURL == true ? url : nil) }
+        }
+    }
+
+    /// PNG bytes, converting other image formats so every dropped image opens anywhere.
+    private static func imageData(from provider: NSItemProvider) async -> Data? {
+        let data: Data? = await withCheckedContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in continuation.resume(returning: data) }
+        }
+        guard let data else { return nil }
+        if let image = NSImage(data: data), let tiff = image.tiffRepresentation,
+           let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) { return png }
+        return nil
     }
 }

@@ -195,6 +195,12 @@ class IsolatedUITestCase: XCTestCase {
     ///
     /// The app lands on Overview now, so anything that drives capture has to navigate
     /// there first — the capture field is not on screen at launch any more.
+    /// A project opens on Details (October 20); work lives in the Tasks section.
+    func showProjectTasks(_ app: XCUIApplication) {
+        let tasks = app.radioGroups["projects.sections"].radioButtons["Tasks"].firstMatch
+        if tasks.waitForExistence(timeout: 10), (tasks.value as? Int) != 1 { tasks.click() }
+    }
+
     func openIngest(_ app: XCUIApplication) {
         if app.buttons["ingest.newCapture"].firstMatch.exists { return }
         let row = app.descendants(matching: .any)["sidebar.ingest"].firstMatch

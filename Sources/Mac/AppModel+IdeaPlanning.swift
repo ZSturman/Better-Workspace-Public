@@ -11,8 +11,15 @@ extension AppModel {
         guard let fresh = await BackgroundServiceClient.shared.ideas() else { return }
         var byPath = Dictionary(fresh.map { ($0.canonicalPath, $0) }, uniquingKeysWith: { first, _ in first })
         let store = projectStore
-        let projectsByIdentity = Dictionary(store.allRecords().compactMap { record in record.identityKey.map { ($0, record) } }, uniquingKeysWith: { first, _ in first })
         var changed = false
+        let identities = store.identityIndex()
+        // By identity, not key text: a key written before a restart names the volume by
+        // device number, which changes (October 27: 19 moved projects looked deleted).
+        for item in items(for: .ideas) {
+            if let identity = item.identity, let prior = identities.record(for: identity, at: item.url.canonicalPath) {
+                await reflectFinderProjectLocation(prior, item: item, isIdea: true)
+            }
+        }
         let candidates = items(for: .ideas).filter { byPath[$0.url.canonicalPath]?.planning == nil }
         if !candidates.isEmpty, !TestIsolation.isActive {
             do { try await claimServiceProjectGraphWriter() } catch { lastError = error.localizedDescription; return }
@@ -20,7 +27,7 @@ extension AppModel {
         for item in candidates.prefix(20) {
             guard let path = workspaceRelativePath(for: item.url), (try? MobilePlanningFiles.resolve(path, workspace: workspace)) != nil,
                   var record = await BackgroundServiceClient.shared.registerIdea(at: item.url) else { continue }
-            if let identity = item.identity?.key, let source = projectsByIdentity[identity], record.planning?.ratings.isEmpty != false {
+            if let identity = item.identity, let source = identities.record(for: identity, at: item.url.canonicalPath), record.planning?.ratings.isEmpty != false {
                 var inherited = record.planning ?? IdeaPlanning()
                 inherited.ratings = ratingsByProject[source.id] ?? store.ratings(for: source.id)
                 inherited.potential = inherited.potential ?? .project; inherited.sourceProjectID = source.id
@@ -32,6 +39,7 @@ extension AppModel {
             byPath[record.canonicalPath] = record; changed = true
         }
         let projectionChanged = byPath != serviceIdeasByPath
+        serviceIdeasLoaded = true
         updateIdeaPlanningRecords(byPath)
         if changed || projectionChanged { refreshOverview(); requestMobileCloudSync() }
     }
@@ -111,7 +119,9 @@ extension AppModel {
             if let project = original.planning?.project {
                 var metadata = project.metadata
                 metadata.status = "Queued"
+                let previous = projectStore.metadata(for: record.id)
                 projectStore.setMetadata(metadata, for: record.id)
+                forwardOwnedMetadata(projectID: record.id, from: previous, to: metadata)
                 projectStore.setDescription(ProjectDescription(oneLiner: project.oneLiner, summary: project.summary), for: record.id)
             }
             try await finishPotentialIdeaPromotion(serviceID: original.serviceID, project: record, destination: destination)

@@ -4,11 +4,12 @@ import TipKit
 import BetterWorkspaceCore
 
 enum MobileWorkspaceTab: Hashable, CaseIterable, Identifiable {
-    case overview, projects, work, ideas, capture
+    case overview, workspace, projects, work, ideas, capture
     var id: Self { self }
     var title: String {
         switch self {
         case .overview: "Overview"
+        case .workspace: "Workspace"
         case .projects: "Projects"
         case .work: "Work"
         case .ideas: "Ideas"
@@ -18,6 +19,7 @@ enum MobileWorkspaceTab: Hashable, CaseIterable, Identifiable {
     var symbolName: String {
         switch self {
         case .overview: "rectangle.3.group"
+        case .workspace: "square.grid.2x2"
         case .projects: "square.stack.3d.up"
         case .work: "checklist"
         case .ideas: "lightbulb"
@@ -30,50 +32,126 @@ struct MobileWorkspaceRootView: View {
     @Environment(MobileWorkspaceModel.self) private var model
     @Binding var selectedTab: MobileWorkspaceTab
     let captureRequest: Int
+    var includesWorkspace = false
+    var session: WorkspaceSession? = nil
+    var workspaceLoadError: String? = nil
+    var retryWorkspace: (() -> Void)? = nil
+    @State private var showsSettings = false
+    @State private var planningTab: MobileWorkspaceTab = .work
+    @State private var workspaceQuery = ""
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
     /// Each section's navigation, held here so the iPad sidebar — which rebuilds the
     /// detail when the section changes — returns to the page you left, as tabs do.
     @Environment(MobileModel.self) private var captureModel
     private var tabs: [MobileWorkspaceTab] {
-        MobileWorkspaceTab.allCases.filter { !model.isSample || $0 != .capture }
+        if includesWorkspace {
+            return [.overview, .workspace, .work, .ideas, .capture]
+        }
+        return MobileWorkspaceTab.allCases.filter { $0 != .workspace && (!model.isSample || $0 != .capture) }
     }
     @State private var paths: [MobileWorkspaceTab: NavigationPath] = [:]
+    @State private var readyTabs: Set<MobileWorkspaceTab> = []
     private func path(_ tab: MobileWorkspaceTab) -> Binding<NavigationPath> {
         // A section being swapped out writes back an empty path as it is torn down;
         // only the section on screen may change its own navigation.
         Binding(get: { paths[tab] ?? NavigationPath() }, set: { if tab == selectedTab { paths[tab] = $0 } })
     }
+    /// Projects and Work share Planning without changing their deep-link identities.
+    private var navigationSelection: Binding<MobileWorkspaceTab> {
+        Binding(get: { includesWorkspace && selectedTab == .projects ? .work : selectedTab }, set: { value in
+            selectedTab = includesWorkspace && value == .work ? planningTab : value
+        })
+    }
+    private var usesSidebar: Bool { UIDevice.current.userInterfaceIdiom == .pad && horizontalSizeClass == .regular }
+    private var planningPicker: some View {
+        Picker("Planning view", selection: Binding(get: { selectedTab == .projects ? MobileWorkspaceTab.projects : .work }, set: { selectedTab = $0; planningTab = $0 })) {
+            Text("Projects").tag(MobileWorkspaceTab.projects)
+            Text("Work").tag(MobileWorkspaceTab.work)
+        }.pickerStyle(.segmented).accessibilityIdentifier("workspace.planningView")
+    }
+    private var planningNavigation: some View {
+        let tab: MobileWorkspaceTab = selectedTab == .projects ? .projects : .work
+        return NavigationStack(path: path(tab)) {
+            if tab == .projects { MobileProjectsList().mobilePlanningDestinations() }
+            else { MobileWorkList() }
+        }.id(tab)
+            .onAppear { readyTabs.insert(tab); Task { await applyWidgetNavigation() } }
+            .onDisappear { readyTabs.remove(tab) }
+    }
+    private func destination(_ tab: MobileWorkspaceTab) -> some View {
+        content(tab)
+            .onAppear {
+                if !includesWorkspace || tab != .work {
+                    readyTabs.insert(tab)
+                    Task { await applyWidgetNavigation() }
+                }
+            }
+            .onDisappear { if !includesWorkspace || tab != .work { readyTabs.remove(tab) } }
+    }
+    private func title(_ tab: MobileWorkspaceTab) -> String { includesWorkspace && tab == .work ? "Planning" : tab.title }
+    private func symbol(_ tab: MobileWorkspaceTab) -> String { includesWorkspace && tab == .work ? "list.bullet.rectangle" : tab.symbolName }
     var body: some View {
         Group {
-        if UIDevice.current.userInterfaceIdiom == .pad && horizontalSizeClass == .regular {
+        if usesSidebar {
             NavigationSplitView(columnVisibility: $sidebarVisibility) {
                 // Choosing the section already shown returns to its top, as a tab does.
-                List(selection: Binding<MobileWorkspaceTab?>(get: { selectedTab }, set: { tab in
+                List(selection: Binding<MobileWorkspaceTab?>(get: { navigationSelection.wrappedValue }, set: { tab in
                     guard let tab else { return }
-                    if tab == selectedTab { paths[tab] = NavigationPath() } else { selectedTab = tab }
+                    if tab == navigationSelection.wrappedValue { paths[selectedTab] = NavigationPath() } else { navigationSelection.wrappedValue = tab }
                 })) {
                     ForEach(tabs) { tab in
-                        Label(tab.title, systemImage: tab.symbolName).tag(tab)
+                        Label(title(tab), systemImage: symbol(tab)).tag(tab)
                             .accessibilityIdentifier("workspace-sidebar-\(tab.title.lowercased())")
+                        if includesWorkspace && tab == .work && navigationSelection.wrappedValue == .work {
+                            // Split-view pushes replace the detail root. Keep this
+                            // switch in the persistent sidebar on regular-width iPad.
+                            planningPicker.padding(.vertical, 4)
+                        }
                     }
                 }.navigationTitle("Better Workspace")
-            } detail: { content(selectedTab) }
+            } detail: { destination(navigationSelection.wrappedValue) }
             .navigationSplitViewStyle(.balanced)
         } else {
-            TabView(selection: $selectedTab) {
+            TabView(selection: navigationSelection) {
                 ForEach(tabs) { tab in
-                    content(tab).tabItem { Label(tab.title, systemImage: tab.symbolName) }.tag(tab)
+                    destination(tab).tabItem { Label(title(tab), systemImage: symbol(tab)) }.tag(tab)
                 }
             }
         }
         }
-        .onChange(of: model.widgetNavigation) { _, _ in applyWidgetNavigation() }
-        .onChange(of: model.snapshot.fetchedAt) { _, _ in applyWidgetNavigation() }
-        .task { applyWidgetNavigation() }
+        .sheet(isPresented: $showsSettings) {
+            if let session { MobileSettingsView(session: session) }
+        }
+        .onAppear {
+            if selectedTab == .projects || selectedTab == .work { planningTab = selectedTab }
+        }
+        .onChange(of: selectedTab) { _, value in
+            if value == .projects || value == .work { planningTab = value }
+        }
+        .onChange(of: captureRequest) { _, _ in selectedTab = .capture }
+        .onChange(of: model.widgetNavigation) { _, _ in Task { await applyWidgetNavigation() } }
+        .onChange(of: model.snapshot.fetchedAt) { _, _ in Task { await applyWidgetNavigation() } }
+        .task(id: session != nil) { await applyWidgetNavigation() }
     }
-    private func applyWidgetNavigation() {
+    @MainActor private func applyWidgetNavigation() async {
         guard let route = model.widgetNavigation else { return }
+        // One router handles both journal UUIDs and the older Mac snapshot links.
+        if includesWorkspace {
+            let value: String?
+            switch route { case .project(let id), .task(let id), .idea(let id): value = id; default: value = nil }
+            if let value, let id = UUID(uuidString: value) {
+                guard let session else { return }
+                try? await session.reload()
+                guard model.widgetNavigation == route else { return }
+                if session.records.contains(where: { $0.id == id }) {
+                    session.focusedRecordID = id
+                    selectedTab = .workspace
+                    model.widgetNavigation = nil
+                    return
+                }
+            }
+        }
         if model.syncState == .loading {
             switch route { case .project, .task, .idea: return; default: break }
         }
@@ -97,14 +175,37 @@ struct MobileWorkspaceRootView: View {
         case .attention(let category): selectedTab = .overview; navigation.append(MobileWidgetDestination.attention(category))
         case .overview: selectedTab = .overview
         }
+        // A newly mounted NavigationStack can initialize its binding with an
+        // empty path. Keep the route pending until that destination has appeared.
+        guard readyTabs.contains(selectedTab) else { return }
         paths[selectedTab] = navigation
         model.widgetNavigation = nil
     }
     @ViewBuilder private func content(_ tab: MobileWorkspaceTab) -> some View {
         switch tab {
-        case .overview: MobileOverviewView(path: path(.overview))
+        case .overview: MobileOverviewView(path: path(.overview), showSettings: session == nil ? nil : { showsSettings = true },
+                                           selectTab: includesWorkspace ? { selectedTab = $0 } : nil)
+        case .workspace:
+            if let session {
+                UnifiedWorkspaceHome(session: session, showSettings: { showsSettings = true }, projectHistory: { id in
+                    model.snapshot.entries.first { entry in entry.projectDetails?.projectID.map { WorkspaceMacProjection.recordID(source: .project, sourceID: $0) == id } == true }?.projectDetails?.history
+                }, searchQuery: $workspaceQuery, synchronizesWhileVisible: false)
+            } else if let workspaceLoadError {
+                ContentUnavailableView {
+                    Label("Workspace could not be opened", systemImage: "externaldrive.badge.exclamationmark")
+                } description: { Text(workspaceLoadError) } actions: { Button("Try again") { retryWorkspace?() } }
+            } else { ProgressView("Opening workspace…") }
         case .projects: MobileProjectsView(path: path(.projects))
-        case .work: WorkItemsMobileView(path: path(.work))
+        case .work:
+            if includesWorkspace {
+                if usesSidebar { planningNavigation }
+                else {
+                    VStack(spacing: 0) {
+                        planningPicker.padding(.horizontal).padding(.vertical, 8).background(.bar)
+                        planningNavigation
+                    }
+                }
+            } else { WorkItemsMobileView(path: path(.work)) }
         case .ideas: NavigationStack(path: path(.ideas)) { IdeasMobileView().mobilePlanningDestinations() }
         case .capture: CaptureScreen(captureRequest: captureRequest)
         }
@@ -116,9 +217,12 @@ private enum MobileOverviewDestination: Hashable { case projects, ideas, workspa
 private struct MobileOverviewView: View {
     @Environment(MobileWorkspaceModel.self) private var model
     @Binding var path: NavigationPath
+    var showSettings: (() -> Void)? = nil
+    var selectTab: ((MobileWorkspaceTab) -> Void)? = nil
     @State private var newIdea = false
     @State private var showsSample = false
     @State private var showsCustomization = false
+    @State private var showsSettings = false
     @State private var layoutValue = ""
     @State private var layoutLoaded = false
     private let supportedSections: [OverviewSectionID] = [.nextAction, .attention, .review, .focus, .projects, .ideas, .pending]
@@ -126,9 +230,16 @@ private struct MobileOverviewView: View {
         OverviewLayout.load(layoutValue, defaultOrder: supportedSections).visible(in: supportedSections)
     }
     private var projects: [MobileWorkspaceEntry] {
-        model.entries(in: "Projects").filter(\.isDirectory).sorted { lhs, rhs in
-            let left = model.workItems(forProjectPath: lhs.path).first { $0.stage != .later }
-            let right = model.workItems(forProjectPath: rhs.path).first { $0.stage != .later }
+        // Rank work once per render, rather than filtering and sorting every
+        // task for both projects on every comparison (a device watchdog hotspot).
+        var next: [String: MobileWorkItem] = [:]
+        for item in model.filteredWorkItems() where item.status != .completed && item.stage != .later {
+            guard let path = item.projectPath else { continue }
+            if next[path].map({ MobileWorkspaceModel.workComesFirst(item, $0) }) ?? true { next[path] = item }
+        }
+        return model.entries(in: "Projects").filter(\.isDirectory).sorted { lhs, rhs in
+            let left = next[lhs.path]
+            let right = next[rhs.path]
             if let left, let right { return MobileWorkspaceModel.workComesFirst(left, right) }
             if (left != nil) != (right != nil) { return left != nil }
             return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
@@ -167,7 +278,8 @@ private struct MobileOverviewView: View {
                         ForEach(model.filteredIdeas().filter { $0.planning?.needsSetup == true }.sorted(by: IdeaRanking.comesFirst).prefix(3)) { idea in
                             NavigationLink(value: idea) { MobileIdeaRow(idea: idea) }
                         }
-                        NavigationLink("All ideas", value: MobileOverviewDestination.ideas)
+                        if let selectTab { Button("All ideas") { selectTab(.ideas) } }
+                        else { NavigationLink("All ideas", value: MobileOverviewDestination.ideas) }
                     }
                 }
                 case .review: MobileOverviewInboxSection()
@@ -177,8 +289,10 @@ private struct MobileOverviewView: View {
                     ForEach(projects.prefix(3)) { project in
                         NavigationLink(value: project) { MobileProjectRow(project: project) }
                     }
-                    NavigationLink("All projects", value: MobileOverviewDestination.projects)
-                        .accessibilityIdentifier("overview-all-projects")
+                    Group {
+                        if let selectTab { Button("All projects") { selectTab(.projects) } }
+                        else { NavigationLink("All projects", value: MobileOverviewDestination.projects) }
+                    }.accessibilityIdentifier("overview-all-projects")
                 }
                 case .ideas:
                 Section("Ideas to bring forward") {
@@ -205,6 +319,9 @@ private struct MobileOverviewView: View {
                 }
             }
             .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Settings", systemImage: "gearshape") { if let showSettings { showSettings() } else { showsSettings = true } }.accessibilityIdentifier("workspace.settings")
+                }
                 MobileRefreshToolbar()
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -234,6 +351,16 @@ private struct MobileOverviewView: View {
             }
             .onChange(of: layoutValue) { _, value in
                 if layoutLoaded { model.overviewDefaults.set(value, forKey: "overview.layout.connected") }
+            }
+            .sheet(isPresented: $showsSettings) {
+                NavigationStack {
+                    List {
+                        Button("Customize Overview") { showsSettings = false; showsCustomization = true }
+                        NavigationLink("Downloads") { MobileDownloadsList() }
+                        NavigationLink("Privacy, storage & support") { WorkspacePrivacyView() }
+                    }.navigationTitle("Settings")
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showsSettings = false } } }
+                }
             }
             .sheet(isPresented: $showsCustomization) { OverviewCustomizationView(encoded: $layoutValue, supported: supportedSections) }
             .sheet(isPresented: $newIdea) { MobileIdeaEditor() }
@@ -283,7 +410,18 @@ struct MobileProjectRow: View {
     var body: some View {
         let all = model.allWorkItems(forProjectPath: project.path)
         VStack(alignment: .leading, spacing: 5) {
-            Text(project.name).font(.headline)
+            HStack {
+                Text(project.name).font(.headline)
+                Spacer()
+                if project.projectDetails?.ratings != nil {
+                    Button { model.toggleFeatured(project) } label: { Image(systemName: project.projectDetails?.editablePortfolio.featured == true ? "star.fill" : "star") }
+                        .buttonStyle(.borderless).foregroundStyle(.yellow).accessibilityLabel("Toggle featured " + project.name)
+                }
+            }
+            HStack {
+                ProjectDomainBadge(domain: project.projectDetails?.domain)
+                Text(project.projectDetails?.status ?? "No status").font(.caption).foregroundStyle(.secondary)
+            }
             if project.projectDetails?.needsSetup == true { Label("New project created · add details and score", systemImage: "sparkles").font(.caption).foregroundStyle(.orange) }
             if let score = project.projectDetails?.rankingScore { Text("Score \(Int(score.rounded()))/100").font(.caption).foregroundStyle(.secondary) }
             // The same next action the project page and the Mac show.
@@ -322,6 +460,22 @@ struct MobileProjectDetailView: View {
 
     var body: some View {
         List {
+            if !projectDrafts.isEmpty {
+                Section("Saved changes") {
+                    ForEach(projectDrafts) { draft in
+                        NavigationLink { MobileSavedDraftView(draft: draft) } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(model.planningErrors[draft.id.uuidString] == nil ? "Saved on this device · syncing with Mac" : "Mac needs review · saved draft retained")
+                                if let domain = draft.projectEdit?.properties?.domain {
+                                    Text("Saved domain: \(domain.isEmpty ? "Not set" : domain)")
+                                }
+                            }
+                        }
+                    }
+                    Text("Your saved values stay here until the Mac confirms them. Better Workspace retries automatically while open; open it on your Mac to apply pending changes.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            }
             Section {
                 if current.projectDetails?.needsSetup == true { Label("New project created", systemImage: "sparkles") }
                 Button("Zen mode", systemImage: "viewfinder") { zenScoring = true }.accessibilityIdentifier("project.zen.open")
@@ -329,6 +483,12 @@ struct MobileProjectDetailView: View {
                     .accessibilityIdentifier("project.score.edit")
                 if let score = current.projectDetails?.rankingScore { LabeledContent("Your score", value: "\(Int(score.rounded()))/100") }
             }
+            Section {
+                NavigationLink { ProjectWorkHistoryView(history: current.projectDetails?.history) } label: {
+                    Label("Work logs & sessions", systemImage: "clock.arrow.circlepath")
+                }.accessibilityIdentifier("project.history.open")
+            }
+            MobileProjectPropertiesSection(project: current).id(current.id)
             MobileDownloadSection(entry: current)
             MobileProjectPreviewsSection(project: current)
             upNext
@@ -346,6 +506,15 @@ struct MobileProjectDetailView: View {
                 }.accessibilityIdentifier("project.assessment.open")
             } }
             MobileTagAssignmentSection(entry: current)
+            if !projectHistory.isEmpty {
+                Section("Recent saved details") {
+                    ForEach(projectHistory) { draft in
+                        NavigationLink { MobileSavedDraftView(draft: draft) } label: {
+                            Text("Saved domain: \(draft.projectEdit?.properties?.domain ?? "Not changed")")
+                        }
+                    }
+                }
+            }
         }
         .navigationTitle(current.name)
         .toolbar {
@@ -374,6 +543,13 @@ struct MobileProjectDetailView: View {
         .sheet(item: $creatingKind) { kind in MobileWorkEditor(projectPath: current.path, kind: kind) }
         .fullScreenCover(isPresented: $zenScoring) { MobileProjectScoreEditor(project: current, zenMode: true) }
         .sheet(isPresented: $editingProject) { MobileProjectScoreEditor(project: current) }
+    }
+
+    private var projectDrafts: [MobilePlanningEdit] {
+        model.planningDrafts.filter { $0.projectEdit?.original.path == current.path }
+    }
+    private var projectHistory: [MobilePlanningEdit] {
+        Array(model.planningHistory.filter { $0.projectEdit?.original.path == current.path }.suffix(5).reversed())
     }
 
     private var upNext: some View {
@@ -448,7 +624,7 @@ struct MobileProjectDetailView: View {
                 if let line = details?.oneLiner { Text(MarkdownInline.attributed(line)) }
                 if let summary = details?.summary, !summary.isEmpty { MarkdownView(text: summary).foregroundStyle(.secondary) }
                 if hasMore {
-                    DisclosureGroup("Details") {
+                    Group {
                         if let status = details?.status { LabeledContent("Status", value: status) }
                         if let phase = details?.phase { LabeledContent("Phase", value: phase) }
                         if let github = details?.githubURL, let url = URL(string: github) { Link("GitHub", destination: url) }
@@ -470,6 +646,7 @@ struct MobileWorkRow: View {
             Text(MarkdownInline.attributed(item.title)).font(.headline)
                 .foregroundStyle(item.status == .completed ? .secondary : .primary)
             Text([item.status == .completed ? "Done" : item.stage.displayName,
+                  item.actionMetadata?.responsibilityLabel.map { "For " + $0 },
                   showsProject ? item.projectPath.map { model.projectName(for: $0) } : nil].compactMap { $0 }.joined(separator: " · "))
                 .font(.caption).foregroundStyle(.secondary)
         }.padding(.vertical, 3)
@@ -478,12 +655,16 @@ struct MobileWorkRow: View {
 }
 
 private struct WorkItemsMobileView: View {
+    @Binding var path: NavigationPath
+    var body: some View { NavigationStack(path: $path) { MobileWorkList() } }
+}
+
+private struct MobileWorkList: View {
     @Environment(MobileWorkspaceModel.self) private var model
     @State private var newWork = false
     @State private var showCompleted = false
     @State private var pendingDelete: MobileWorkItem?
     @State private var query = ""
-    @Binding var path: NavigationPath
 
     /// Thousands of records are normal here, so the list is computed once per render
     /// and searchable; a search also reaches completed work.
@@ -502,7 +683,6 @@ private struct WorkItemsMobileView: View {
         let attention = visible.filter(\.needsAttention).sorted(by: MobileWorkspaceModel.workComesFirst)
         let open = visible.filter { $0.status != .completed && $0.needsAttention == false }
         let completed = visible.filter { $0.status == .completed }
-        NavigationStack(path: $path) {
             List {
                 MobilePlanningStatusSection()
                 let progress = WorkProgressCounts(visible)
@@ -556,11 +736,10 @@ private struct WorkItemsMobileView: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("New work", systemImage: "plus") { newWork = true } } }
             .sheet(isPresented: $newWork) { MobileWorkEditor() }
             .refreshable { await model.refresh() }
-        }
     }
 }
 
-extension WorkItemsMobileView {
+extension MobileWorkList {
     /// The usual row, with its project one menu away.
     private func attentionRow(_ item: MobileWorkItem) -> some View {
         HStack {
@@ -869,6 +1048,7 @@ private struct WorkspaceEntryDetail: View {
             Section {
                 DisclosureGroup("File location") { Text(current.path).font(.footnote).textSelection(.enabled) }
             }
+            MobileProjectPropertiesSection(project: current).id(current.id)
             MobileDownloadSection(entry: current)
             MobileTagAssignmentSection(entry: current)
         }

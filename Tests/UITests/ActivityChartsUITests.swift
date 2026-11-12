@@ -3,11 +3,18 @@ import BetterWorkspaceCore
 
 /// Uses private fixtures, including measured, lower-bound, absent and historical evidence.
 final class ActivityChartsUITests: IsolatedUITestCase {
+    /// At 820x520 the summary tiles fill the dashboard and its charts sit below them in a
+    /// lazy grid; scroll to the end so the chosen chart is built.
+    private func showCharts(_ app: XCUIApplication) {
+        let dashboard = app.scrollViews["projects.charts"].firstMatch
+        for _ in 0..<3 { dashboard.scroll(byDeltaX: 0, deltaY: -1000) }
+    }
     private func element(_ app: XCUIApplication, _ id: String) -> XCUIElement {
         app.descendants(matching: .any)[id].firstMatch
     }
     private func bar(_ chart: XCUIElement, _ name: String) -> XCUIElement {
-        chart.otherElements.matching(NSPredicate(format: "label BEGINSWITH %@", name + ", ")).firstMatch
+        // Bars are buttons that open their project.
+        chart.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", name + ", ")).firstMatch
     }
     func testActivityBoundsPeriodsHistoryAndEmptyCharts() throws {
         let database = try Database(url: Self.fixtureRoot.appendingPathComponent("test.sqlite"))
@@ -54,9 +61,11 @@ final class ActivityChartsUITests: IsolatedUITestCase {
         for title in ["Outstanding work", "Closest to done", "High value, not recently worked on", "Recent attention", "Time by domain"] {
             customize.click(); app.menuItems[title].firstMatch.click()
         }
-        XCTAssertTrue(app.staticTexts["No project with five or more open records has gone 30 days without observed work. Try a shorter period."].waitForExistence(timeout: 10))
+        showCharts(app)
+        XCTAssertTrue(app.staticTexts["No project has 5+ open records and 30+ days without observed work."].waitForExistence(timeout: 10))
         let period = element(app, "projects.charts.period")
         period.click(); app.menuItems["7 days"].firstMatch.click()
+        showCharts(app)
         let chart = element(app, "projects.charts.stalled")
         XCTAssertTrue(bar(chart, "Never measured").waitForExistence(timeout: 10))
         XCTAssertTrue(bar(chart, "Measured work").exists)
@@ -65,6 +74,7 @@ final class ActivityChartsUITests: IsolatedUITestCase {
                       chart.debugDescription)
         customize.click(); app.menuItems["Unfinished and inactive"].firstMatch.click()
         customize.click(); app.menuItems["Longest since observed work"].firstMatch.click()
+        showCharts(app)
         let idle = element(app, "projects.charts.idle")
         XCTAssertTrue(bar(idle, "Never measured").waitForExistence(timeout: 10))
         XCTAssertTrue(bar(idle, "Never measured").label.contains("at least 26 days"),
@@ -74,8 +84,10 @@ final class ActivityChartsUITests: IsolatedUITestCase {
         shot.name = "activity-lower-bound-820"; shot.lifetime = .keepAlways; add(shot)
         customize.click(); app.menuItems["Longest since observed work"].firstMatch.click()
         customize.click(); app.menuItems["Recent attention"].firstMatch.click()
-        XCTAssertTrue(app.staticTexts["No observed work in the last 7 days for these projects. Missing measurements are never counted as zero."].waitForExistence(timeout: 10))
+        showCharts(app)
+        XCTAssertTrue(app.staticTexts["No observed work in the last 7 days. Missing observations do not mean no work."].waitForExistence(timeout: 10))
         period.click(); app.menuItems["90 days"].firstMatch.click()
+        showCharts(app)
         let attention = element(app, "projects.charts.attention")
         XCTAssertTrue(bar(attention, "Measured work").waitForExistence(timeout: 10))
         XCTAssertEqual(bar(attention, "Measured work").label, "Measured work, 2 hours")
@@ -83,8 +95,9 @@ final class ActivityChartsUITests: IsolatedUITestCase {
         XCTAssertFalse(bar(attention, "Missing evidence").exists)
         customize.click(); app.menuItems["Recent attention"].firstMatch.click()
         customize.click(); app.menuItems["Closest to done"].firstMatch.click()
+        showCharts(app)
         let completion = bar(element(app, "projects.charts.nearDone"), "Measured work")
         XCTAssertTrue(completion.waitForExistence(timeout: 10))
-        XCTAssertEqual(completion.label, "Measured work, 14 % complete · 6 open", "Percent must be announced only once")
+        XCTAssertEqual(completion.label, "Measured work, 14 % complete, 1 completed · 6 open", "Percent must be announced only once")
     }
 }

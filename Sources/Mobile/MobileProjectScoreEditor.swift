@@ -16,6 +16,9 @@ struct MobileProjectScoreEditor: View {
     private enum NotesField: Hashable { case oneLiner, summary }
     @FocusState private var notesField: NotesField?
 
+    private var portfolioBinding: Binding<ProjectPortfolioDetails> {
+        Binding(get: { properties.portfolio ?? .init() }, set: { properties.portfolio = $0 })
+    }
     var body: some View {
         NavigationStack {
             Group {
@@ -27,11 +30,13 @@ struct MobileProjectScoreEditor: View {
                     WorkspaceChoiceField("Domain", selection: $properties.domain, suggestions: model.propertyOptions["domain"] ?? [], identifier: "project.property.domain", store: model.overviewDefaults)
                     WorkspaceChoiceField("Status", selection: $properties.status, suggestions: model.propertyOptions["Status"] ?? [], identifier: "project.property.status", store: model.overviewDefaults)
                     WorkspaceChoiceField("Phase", selection: $properties.phase, suggestions: model.propertyOptions["Phase"] ?? [], identifier: "project.property.phase", store: model.overviewDefaults)
-                    WorkspaceChoiceField("Type", selection: $properties.projectType, suggestions: model.propertyOptions["Type"] ?? [], identifier: "project.property.type", store: model.overviewDefaults)
+                    ProjectTypeField(value: $properties.projectType, suggestions: model.propertyOptions["Type"] ?? [], store: model.overviewDefaults)
+                    ProjectPortfolioFields(details: portfolioBinding)
                     TextField("One-liner", text: $oneLiner, axis: .vertical).focused($notesField, equals: .oneLiner)
                         .accessibilityIdentifier("project.score.oneLiner")
                     TextField("Summary", text: $summary, axis: .vertical).lineLimit(3...8).focused($notesField, equals: .summary)
                 }
+                Section("Links") { ProjectLinksFields(details: portfolioBinding) }
                 if let original {
                     let score = MobileProjectDetails(path: project.path, ratings: ratings, scoringPreferences: original.scoringPreferences).currentScore
                     Section {
@@ -138,4 +143,56 @@ struct MobileFilePreviewCards: View {
         return UIImage(cgImage: bitmap)
     }
 
+}
+
+/// The same bounded Save command as scoring, directly on the selected project.
+struct MobileProjectPropertiesSection: View {
+    @Environment(MobileWorkspaceModel.self) private var model
+    let project: MobileWorkspaceEntry
+    @State private var properties: MobileProjectProperties?
+    @State private var baseline: MobileProjectDetails?
+    init(project: MobileWorkspaceEntry) {
+        self.project = project
+        _baseline = State(initialValue: project.projectDetails)
+        _properties = State(initialValue: project.projectDetails.map(MobileProjectProperties.init))
+    }
+    private var binding: Binding<MobileProjectProperties> {
+        Binding(get: { properties ?? .init(project.projectDetails ?? .init(path: project.path)) }, set: { properties = $0 })
+    }
+    private var portfolio: Binding<ProjectPortfolioDetails> {
+        Binding(get: { binding.wrappedValue.portfolio ?? .init() }, set: { binding.wrappedValue.portfolio = $0 })
+    }
+    var body: some View {
+        fields.onChange(of: project.projectDetails) { _, updated in
+            // Scoring sheets and incoming snapshots update the same project. Keep
+            // pristine inline fields current without overwriting an unsaved edit.
+            guard properties == baseline.map(MobileProjectProperties.init) else { return }
+            baseline = updated
+            properties = updated.map(MobileProjectProperties.init)
+        }
+    }
+    @ViewBuilder private var fields: some View {
+        Section("Project details") {
+            WorkspaceChoiceField("Domain", selection: binding.domain, suggestions: model.propertyOptions["domain"] ?? [], identifier: "project.details.domain", store: model.overviewDefaults)
+            WorkspaceChoiceField("Status", selection: binding.status, suggestions: model.propertyOptions["Status"] ?? [], store: model.overviewDefaults)
+            ProjectTypeField(value: binding.projectType, suggestions: model.propertyOptions["Type"] ?? [], store: model.overviewDefaults)
+            ProjectPortfolioFields(details: portfolio)
+            if binding.wrappedValue.domain.isEmpty { Text("Choose a domain to classify this project.").font(.caption).foregroundStyle(.secondary) }
+        }
+        Section("Links") {
+            ProjectLinksFields(details: portfolio)
+            if let raw = project.projectDetails?.notionURL, let url = ProjectLink(label: "Notion", url: raw).destination { Link("Notion page", destination: url) }
+        }
+        Section {
+            Button("Save project details") {
+                guard var original = baseline else { return }; original.previews = nil
+                let change = MobileProjectEdit(original: original, ratings: original.ratings ?? [:], oneLiner: original.oneLiner ?? "", summary: original.summary ?? "", properties: binding.wrappedValue)
+                if model.savePlanning(.init(operation: .saveProject, title: project.name, projectEdit: change)) {
+                    baseline = model.snapshot.entries.first { $0.id == project.id }?.projectDetails
+                }
+            }.disabled(baseline?.ratings == nil || properties == baseline.map(MobileProjectProperties.init))
+            Button("Revert project details") { baseline = project.projectDetails; properties = baseline.map(MobileProjectProperties.init) }
+            if let message = model.saveMessage { Text(message).font(.caption) }
+        }
+    }
 }

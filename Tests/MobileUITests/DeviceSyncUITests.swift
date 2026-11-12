@@ -99,7 +99,7 @@ final class DeviceSyncUITests: XCTestCase {
     }
 
     private func createWork(_ app: XCUIApplication, title: String, dueDate: Bool) {
-        app.workspaceDestination("Work").tap()
+        app.openPlanning("Work")
         let add = app.buttons["New work"]
         XCTAssertTrue(add.waitForExistence(timeout: 10)); add.tap()
         let field = app.textFields["planning-title"]
@@ -142,8 +142,8 @@ final class DeviceSyncUITests: XCTestCase {
 
     /// The Work list itself, not a page pushed on it (an iPad section keeps its place).
     private func workRoot(_ app: XCUIApplication) {
-        let work = app.workspaceDestination("Work")
-        work.tap()
+        // Work is a view of Planning in the production shell (October 23).
+        app.openPlanning("Work")
         for _ in 0..<4 {
             let back = app.navigationBars.buttons["BackButton"].firstMatch
             guard back.exists, back.label == "Work" || back.label == "Back" else { break }
@@ -231,7 +231,7 @@ final class DeviceSyncUITests: XCTestCase {
         XCTAssertTrue(label(app, "Due, ").waitForExistence(timeout: 10))
         editTitle(app, appending: " edited")
         XCTAssertTrue(app.staticTexts[base + " edited"].waitForExistence(timeout: 10))
-        app.buttons["work-toggle-completion"].tap()
+        app.scrollTo(app.buttons["work-toggle-completion"]); app.buttons["work-toggle-completion"].tap()
         XCTAssertTrue(label(app, "Status, Completed").waitForExistence(timeout: 10))
         XCTAssertTrue(label(app, "Due, ").exists, "Completing dropped the due date")
         shoot("qa1-completed-on-phone")
@@ -244,7 +244,7 @@ final class DeviceSyncUITests: XCTestCase {
         let app = launch()
         XCTAssertTrue(openWhenSynced(app, base + " edited", expecting: ["Status, Completed", "Due, "]))
         shoot("qa2-ipad-sees-completed")
-        app.buttons["work-toggle-completion"].tap()
+        app.scrollTo(app.buttons["work-toggle-completion"]); app.buttons["work-toggle-completion"].tap()
         XCTAssertTrue(label(app, "Status, Open").waitForExistence(timeout: 10))
         waitUntilSent(app)
         signal("QA2-DONE")
@@ -265,12 +265,23 @@ final class DeviceSyncUITests: XCTestCase {
 
     /// iPad. Holds an edit screen open while the Mac changes the same record, then saves
     /// on the stale copy: the Mac must refuse it and the iPad must offer it for review.
+    /// The editor is opened first: an open detail page now refreshes to the Mac's version,
+    /// so editing after the wait would edit the current copy, not a stale one.
     func testQA4_ConflictingEditsBecomeAReviewDraft() {
         let app = launch()
         XCTAssertTrue(openWhenSynced(app, base + " C"))
+        app.buttons["Edit"].tap()
+        let field = app.textFields["planning-title"]
+        XCTAssertTrue(field.waitForExistence(timeout: 10)); field.tap()
+        field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
+        field.typeText(" phone")
         signal("QA4-READY")
-        stayAwake(app, for: 75) // the script edits the Mac file now
-        editTitle(app, appending: " phone")
+        // The script edits the Mac file now. Tapping the field keeps the device awake
+        // without touching anything outside the sheet.
+        let awake = Date().addingTimeInterval(75)
+        while Date() < awake { Thread.sleep(forTimeInterval: 10); field.tap() }
+        XCTAssertEqual(field.value as? String, base + " C phone", "The open draft must survive the Mac's change arriving")
+        app.buttons["Save"].firstMatch.tap()
         XCTAssertTrue(app.staticTexts[base + " C phone"].waitForExistence(timeout: 10))
         let review = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Review “" + base + " C phone")).firstMatch
         let deadline = Date().addingTimeInterval(240)
@@ -328,11 +339,12 @@ final class DeviceSyncUITests: XCTestCase {
         XCTAssertTrue(openWhenSynced(app, base + " mac"))
         signal("QA6-READY")
         stayAwake(app, for: 60) // the script renames the file now
-        app.buttons["work-delete"].tap()
+        app.scrollTo(app.buttons["work-delete"]); app.buttons["work-delete"].tap()
         confirmDelete(app)
         XCTAssertTrue(app.navigationBars["Work"].waitForExistence(timeout: 10))
         search(app, base + " mac")
-        XCTAssertFalse(row(app, base + " mac").waitForExistence(timeout: 3))
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: row(app, base + " mac"))
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 15), .completed, "The deleted task is still listed")
         waitUntilSent(app)
         signal("QA6-DONE")
     }
@@ -356,7 +368,7 @@ final class DeviceSyncUITests: XCTestCase {
         }
         let app = launch()
         XCTAssertTrue(openWhenSynced(app, title))
-        app.buttons["work-delete"].tap()
+        app.scrollTo(app.buttons["work-delete"]); app.buttons["work-delete"].tap()
         confirmDelete(app)
         XCTAssertTrue(app.navigationBars["Work"].waitForExistence(timeout: 10))
         waitUntilSent(app)
@@ -371,7 +383,7 @@ final class DeviceSyncUITests: XCTestCase {
         }
         let app = launch()
         XCTAssertTrue(openWhenSynced(app, title))
-        app.buttons["work-delete"].tap()
+        app.scrollTo(app.buttons["work-delete"]); app.buttons["work-delete"].tap()
         confirmDelete(app)
         XCTAssertTrue(app.navigationBars["Work"].waitForExistence(timeout: 10))
         waitUntilSent(app)
@@ -417,7 +429,7 @@ final class DeviceSyncUITests: XCTestCase {
         let item = row(app, base + " offline")
         XCTAssertTrue(item.waitForExistence(timeout: 10), "The cached index does not have the item offline")
         item.tap()
-        app.buttons["work-toggle-completion"].tap()
+        app.scrollTo(app.buttons["work-toggle-completion"]); app.buttons["work-toggle-completion"].tap()
         XCTAssertTrue(label(app, "Status, Completed").waitForExistence(timeout: 10))
         shoot("qa11-completed-offline")
         app.terminate()
@@ -433,6 +445,156 @@ final class DeviceSyncUITests: XCTestCase {
         signal("QA11-DONE")
     }
 
+    /// Turns the radios off or back on in Settings. The device stays reachable over its USB
+    /// cable, so the already running test continues offline. Returns what it changed so the
+    /// caller can restore exactly that.
+    @discardableResult
+    private func setRadios(offline: Bool, restoreWiFi: Bool = false) -> Bool {
+        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+        settings.terminate(); settings.launch()
+        let airplane = settings.switches["Airplane Mode"].firstMatch
+        XCTAssertTrue(airplane.waitForExistence(timeout: 15), "Settings has no Airplane Mode switch")
+        if (airplane.value as? String == "1") != offline { airplane.switches.firstMatch.tap() }
+        let alert = settings.alerts.firstMatch
+        if alert.waitForExistence(timeout: 2) {
+            print("BWQA-ALERT \(alert.label): \(alert.buttons.allElementsBoundByIndex.map(\.label))")
+            (alert.buttons["OK"].exists ? alert.buttons["OK"] : alert.buttons.element(boundBy: 0)).tap()
+        }
+        let wanted = NSPredicate(format: "value == %@", offline ? "1" : "0")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: wanted, object: airplane)], timeout: 10), .completed)
+        // Airplane Mode leaves Wi-Fi on when the person turned it back on before.
+        var turnedWiFiOff = false
+        if offline || restoreWiFi {
+            let cell = settings.cells.containing(NSPredicate(format: "label BEGINSWITH 'Wi-Fi' OR identifier == 'WIFI'")).firstMatch
+            XCTAssertTrue(cell.waitForExistence(timeout: 10)); cell.tap()
+            let wifi = settings.switches["Wi-Fi"].firstMatch
+            XCTAssertTrue(wifi.waitForExistence(timeout: 10))
+            let on = wifi.value as? String == "1"
+            if offline && on { wifi.switches.firstMatch.tap(); turnedWiFiOff = true }
+            if !offline && restoreWiFi && !on { wifi.switches.firstMatch.tap() }
+        }
+        settings.terminate()
+        return turnedWiFiOff
+    }
+
+    /// Read-only: what Planning shows for `BW QA <id> offline` — its status, any draft waiting
+    /// for review, and the sync status.
+    func testQA19_InspectTheOfflineItem() {
+        let app = launch()
+        app.workspaceDestination("Overview").tap()
+        let refresh = app.buttons["Refresh workspace index"]
+        if refresh.waitForExistence(timeout: 10) { print("BWQA-STATE refresh: \(refresh.value ?? "")") }
+        workRoot(app)
+        for text in app.staticTexts.allElementsBoundByIndex.map(\.label) where text.contains("waiting") || text.contains("review") || text.contains("Review") {
+            print("BWQA-STATE work note: \(text)")
+        }
+        for button in app.buttons.allElementsBoundByIndex.map(\.label) where button.hasPrefix("Review") { print("BWQA-STATE review: \(button)") }
+        search(app, base + " offline")
+        let item = row(app, base + " offline")
+        guard item.waitForExistence(timeout: 10) else { print("BWQA-STATE row missing"); return }
+        print("BWQA-STATE row: \(item.label)")
+        item.tap()
+        for text in app.staticTexts.allElementsBoundByIndex.map(\.label) where text.contains(",") || text.contains("Saved") || text.contains("Mac") {
+            print("BWQA-STATE detail: \(text)")
+        }
+    }
+
+    /// Read-only: Settings' Airplane Mode, Wi-Fi and Cellular rows as shown.
+    func testQA20_ReadNetworkSettings() {
+        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+        settings.terminate(); settings.launch()
+        _ = settings.switches["Airplane Mode"].firstMatch.waitForExistence(timeout: 15)
+        print("BWQA-NET airplane=\(settings.switches["Airplane Mode"].firstMatch.value ?? "?")")
+        for cell in settings.cells.allElementsBoundByIndex.prefix(12) { print("BWQA-NET cell: \(cell.label) = \(cell.value ?? "")") }
+        let wifi = settings.cells.containing(NSPredicate(format: "label BEGINSWITH 'Wi-Fi'")).firstMatch
+        if wifi.exists {
+            wifi.tap()
+            _ = settings.switches["Wi-Fi"].firstMatch.waitForExistence(timeout: 10)
+            print("BWQA-NET wifi switch=\(settings.switches["Wi-Fi"].firstMatch.value ?? "?")")
+            for cell in settings.cells.allElementsBoundByIndex.prefix(8) { print("BWQA-NET wifi cell: \(cell.label)") }
+        }
+        settings.terminate()
+    }
+
+    /// Lists the Home Screen icons, to find how this app's icon is named and placed.
+    func testQA18_ListHomeScreenIcons() {
+        XCUIDevice.shared.press(.home)
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        for page in 0..<6 {
+            let icons = springboard.icons.allElementsBoundByIndex.filter(\.isHittable).map(\.label)
+            print("BWQA-ICONS page \(page): \(icons.joined(separator: ", "))")
+            springboard.swipeLeft()
+        }
+        XCUIDevice.shared.press(.home)
+    }
+
+    /// Turns Airplane Mode off and Wi-Fi back on, for a run that ended before it could.
+    func testQA15_RestoreRadios() { setRadios(offline: false, restoreWiFi: true) }
+
+    /// iPhone. Turns Airplane Mode (and Wi-Fi) off in Settings.
+    func testQA16_GoOffline() { setRadios(offline: true) }
+
+    /// Opens the app the way a person does, from its Home Screen icon. While the device is
+    /// offline iOS refuses XCUITest's own launch of a development build ("Developer App
+    /// Certificate is not trusted"), but not this one.
+    private func openFromHomeScreen() -> XCUIApplication {
+        XCUIDevice.shared.press(.home)
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let icon = springboard.icons["Better Workspace"].firstMatch
+        for _ in 0..<4 where !icon.isHittable { springboard.swipeLeft() }
+        XCTAssertTrue(icon.isHittable, "No Better Workspace icon on the Home Screen")
+        icon.tap()
+        let app = XCUIApplication()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 20), "The app did not open from its icon")
+        XCTAssertTrue(app.workspaceDestination("Overview").waitForExistence(timeout: 30))
+        return app
+    }
+
+    /// iPhone, physically offline with no person needed, in one runner session (iOS will not
+    /// start a new development runner offline). Launched online; Airplane Mode on in Settings;
+    /// complete the cached `BW QA <id> offline` task; force-quit; reopen from the Home Screen
+    /// offline; still completed and waiting; radios back on; sent. Run QA10 first.
+    func testQA14_OfflineCompletionWithAirplaneMode() {
+        _ = launch()
+        let turnedWiFiOff = setRadios(offline: true)
+        var restored = false
+        addTeardownBlock { if !restored { self.setRadios(offline: false, restoreWiFi: turnedWiFiOff) } }
+        signal("QA14-OFFLINE")
+        let app = XCUIApplication(); app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 15))
+        let refresh = app.buttons["Refresh workspace index"]
+        app.workspaceDestination("Overview").tap()
+        XCTAssertTrue(refresh.waitForExistence(timeout: 15))
+        refresh.tap()
+        let offline = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value BEGINSWITH 'Offline'"), object: refresh)
+        XCTAssertEqual(XCTWaiter.wait(for: [offline], timeout: 200), .completed, "Not reported offline: \(refresh.value ?? "")")
+        search(app, base + " offline")
+        let item = row(app, base + " offline")
+        XCTAssertTrue(item.waitForExistence(timeout: 10), "The cached index does not have the item offline")
+        item.tap()
+        app.scrollTo(app.buttons["work-toggle-completion"]); app.buttons["work-toggle-completion"].tap()
+        XCTAssertTrue(label(app, "Status, Completed").waitForExistence(timeout: 10))
+        shoot("qa14-completed-offline")
+        app.terminate() // force-quit
+        signal("QA14-QUIT")
+        let again = openFromHomeScreen()
+        search(again, base + " offline")
+        let cached = row(again, base + " offline")
+        XCTAssertTrue(cached.waitForExistence(timeout: 15), "Reopening offline lost the item")
+        cached.tap()
+        XCTAssertTrue(label(again, "Status, Completed").waitForExistence(timeout: 10), "Reopening offline lost the edit")
+        workRoot(again)
+        XCTAssertTrue(again.staticTexts.containing(NSPredicate(format: "label CONTAINS 'waiting for the Mac'")).firstMatch.waitForExistence(timeout: 10))
+        shoot("qa14-reopened-offline")
+        signal("QA14-REOPENED")
+        setRadios(offline: false, restoreWiFi: turnedWiFiOff); restored = true
+        signal("QA14-ONLINE")
+        again.activate()
+        XCTAssertTrue(again.wait(for: .runningForeground, timeout: 15))
+        waitUntilSent(again)
+        signal("QA14-SENT")
+    }
+
     /// iPhone, back online. The offline edit leaves the phone.
     func testQA12_SendTheOfflineEditAfterReconnecting() {
         let app = launch()
@@ -444,7 +606,7 @@ final class DeviceSyncUITests: XCTestCase {
     func testQA8_CleanUpTheConflictItem() {
         let app = launch()
         XCTAssertTrue(openWhenSynced(app, base + " C mac"))
-        app.buttons["work-delete"].tap()
+        app.scrollTo(app.buttons["work-delete"]); app.buttons["work-delete"].tap()
         confirmDelete(app)
         XCTAssertTrue(app.navigationBars["Work"].waitForExistence(timeout: 10))
         waitUntilSent(app)

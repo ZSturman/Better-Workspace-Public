@@ -8,9 +8,15 @@ import BetterWorkspaceCore
 /// the day's work in Logs. A link to something that no longer exists opens Overview
 /// rather than failing silently on a blank screen.
 extension AppModel {
+    struct FinderWorkDraft: Identifiable {
+        let id = UUID()
+        let kind: WorkItemKind
+        let projectPath: String
+    }
 
     enum DeepLink: Equatable {
         case project(serviceID: String)
+        case finderProject(id: String, kind: WorkItemKind?)
         case item(serviceID: String)
         case intent(serviceID: String)
         case today
@@ -23,6 +29,16 @@ extension AppModel {
             let id = url.pathComponents.dropFirst().first
             switch url.host {
             case "project": guard let id else { return nil }; self = .project(serviceID: id)
+            case "finder-project":
+                let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+                guard let projectID = query?.first(where: { $0.name == "id" })?.value,
+                      !projectID.isEmpty, projectID.utf8.count <= 4096,
+                      let action = query?.first(where: { $0.name == "action" })?.value else { return nil }
+                switch action {
+                case "plan": self = .finderProject(id: projectID, kind: nil)
+                case "task", "feature", "milestone": self = .finderProject(id: projectID, kind: WorkItemKind(rawValue: action))
+                default: return nil
+                }
             case "item": guard let id else { return nil }; self = .item(serviceID: id)
             case "intent": guard let id else { return nil }; self = .intent(serviceID: id)
             case "today": self = .today
@@ -40,6 +56,20 @@ extension AppModel {
         if let route = WidgetRoute(url: url) { await openWidgetRoute(route); return }
         guard let link = DeepLink(url) else { return }
         switch link {
+        case let .finderProject(id, kind):
+            if projects().isEmpty { await refresh(area: .projects) }
+            if !projects().isEmpty, projectRecordsByPath.isEmpty { await refreshProjectRecords() }
+            guard let item = projects().first(where: { projectRecord(for: $0)?.id == id || workspaceRelativePath(for: $0.url) == id }),
+                  let path = workspaceRelativePath(for: item.url) else {
+                statusMessage = "This Finder project is no longer available."
+                return
+            }
+            openProjectWorkspace(for: item)
+            requestedProjectSection = .tasks
+            if let kind, finderWorkDraft == nil, editingWorkItem == nil {
+                finderWorkDraft = FinderWorkDraft(kind: kind, projectPath: path)
+            }
+            return
         case let .project(serviceID):
             // A widget clicked while the app was closed launches it with the link, before
             // the first scan has finished; load what the link needs rather than give up.
@@ -79,6 +109,14 @@ extension AppModel {
     }
     @MainActor
     func openWidgetRoute(_ route: WidgetRoute) async {
+        let value: String?
+        switch route { case .project(let id), .task(let id), .idea(let id): value = id; default: value = nil }
+        if let value, let id = UUID(uuidString: value), let session = try? await WorkspaceSession.openLive() {
+            try? await session.reload()
+            if session.records.contains(where: { $0.id == id }) {
+                unifiedWorkspace = session; session.focusedRecordID = id; selection = .unified; return
+            }
+        }
         switch route {
         case .project(let id):
             if projects().isEmpty { await refresh(area: .projects) }

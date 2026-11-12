@@ -60,6 +60,7 @@ public struct DashboardProject: Codable, Hashable, Identifiable, Sendable {
     public var focus: OverviewFocusItem
     public var nextTask: MobileWorkItem?
     public var rankingScore: Double? = nil
+    public var portfolioPriority: Int? = nil
     public var route: WidgetRoute { .project(id) }
 }
 
@@ -118,8 +119,10 @@ public struct WorkspaceDashboardSnapshot: Codable, Hashable, Sendable {
         case .next:
             // Repeatedly use the same recommendation function as the apps. Dependencies
             // are resolved against the whole universe, not only the displayed project.
+            let unavailable = Set(projects.filter { ProjectMetadata(status: $0.status).isUnavailableForNextWork || $0.focus.blocked || $0.focus.terminal }.map(\.path))
+            candidates.removeAll { $0.projectPath.map(unavailable.contains) ?? false }
             var ordered: [MobileWorkItem] = []
-            while let next = WorkItemRecommendation.nextMobileAction(in: candidates, allItems: work, projectScores: Dictionary(uniqueKeysWithValues: projects.compactMap { project in (project.rankingScore ?? project.focus.score).map { (project.path, $0) } })) {
+            while let next = WorkItemRecommendation.nextMobileAction(in: candidates, allItems: work, projectScores: Dictionary(uniqueKeysWithValues: projects.compactMap { project in (project.rankingScore ?? project.focus.score).map { (project.path, $0) } }), projectPriorities: Dictionary(uniqueKeysWithValues: projects.compactMap { project in project.portfolioPriority.map { (project.path, $0) } })) {
                 ordered.append(next); candidates.removeAll { $0.id == next.id }
             }
             return ordered
@@ -156,7 +159,7 @@ public struct WorkspaceDashboardSnapshot: Codable, Hashable, Sendable {
                 terminal: terminal, blocked: evidence?.blocked ?? false)
             let nextID = WorkItemRecommendation.nextAction(in: portableByProject[entry.path] ?? [], allItems: portable)?.id
             projects.append(DashboardProject(id: focus.id, serviceID: details?.serviceID, path: entry.path, name: entry.name,
-                status: details?.status, focus: focus, nextTask: tasks.first { $0.id == nextID }, rankingScore: details?.rankingScore ?? evidence?.score))
+                status: details?.status, focus: focus, nextTask: tasks.first { $0.id == nextID }, rankingScore: details?.rankingScore ?? evidence?.score, portfolioPriority: details?.portfolioPriority))
         }
         projects.sort { $0.name == $1.name ? $0.id < $1.id : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         var focuses = snapshot.overview?.focusItems.filter { $0.kind != .projects } ?? []
@@ -207,6 +210,9 @@ public enum DashboardWidgetStore {
     /// Serializes read/modify/write across the app and widget process. Capture
     /// publication and CloudKit publication each own a different part of the cache.
     public static func update(directory: URL, _ transform: (WorkspaceDashboardSnapshot?) throws -> WorkspaceDashboardSnapshot) throws {
+        try SuspensionProtection.run("Widget cache") { try lockedUpdate(directory: directory, transform) }
+    }
+    private static func lockedUpdate(directory: URL, _ transform: (WorkspaceDashboardSnapshot?) throws -> WorkspaceDashboardSnapshot) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let descriptor = open(directory.appendingPathComponent("snapshot.lock").path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { throw WidgetCommandError.message("Widget cache could not be locked.") }

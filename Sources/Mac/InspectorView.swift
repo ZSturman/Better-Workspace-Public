@@ -96,9 +96,11 @@ struct InspectorView: View {
 
     private var emptyPrompt: String {
         switch model.selection {
+        case .unified: return "Open an item in Workspace to edit it."
         case .overview: return "Select a project or next action to see its context."
         case .work: return "Select a work item to edit it here."
         case .folder(let name): return "Select an item in \(name) to inspect it here."
+        case .rootItem: return "Root items show their details in the main workspace."
         case .tag: return "Select a tagged item to inspect it here."
         case .ingest, .none: return "Select an item in any area to tag and inspect it."
         }

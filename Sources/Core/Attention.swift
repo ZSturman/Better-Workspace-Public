@@ -108,10 +108,12 @@ public enum Attention {
             public let lastSessionAt: Date?
             public let observedHours: Double?
             public var needsSetup: Bool
+            public var priority: Int?
 
             public init(name: String, path: String, contentModifiedAt: Date?, score: Double?,
                         ratedCount: Int, lastSessionAt: Date?, observedHours: Double?,
-                        watcherID: String? = nil, needsSetup: Bool = false) {
+                        watcherID: String? = nil, needsSetup: Bool = false, priority: Int? = nil) {
+                self.priority = priority
                 self.needsSetup = needsSetup
                 self.name = name
                 self.path = path
@@ -278,14 +280,32 @@ public enum Attention {
                 }
             }
         }
-        return merged.values
+        let ordered = merged.values
             .sorted { lhs, rhs in
                 if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
                 if lhs.reasons.count != rhs.reasons.count { return lhs.reasons.count > rhs.reasons.count }
                 return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
             }
-            .prefix(limit)
-            .map { $0 }
+        let projects = Dictionary(input.projects.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+        // Preserve idea/inbox/health positions. Within project slots, setup remains
+        // actionable; explicit priority then manual scores precede unscored signals.
+        var rankedProjects = ordered.filter { if case .project = $0.target { return true }; return false }
+        rankedProjects.sort { lhs, rhs in
+            guard case let .project(aPath) = lhs.target, case let .project(bPath) = rhs.target else { return false }
+            let a = projects[aPath], b = projects[bPath]
+            if (a?.needsSetup ?? false) != (b?.needsSetup ?? false) { return a?.needsSetup == true }
+            if (a?.priority ?? 3) != (b?.priority ?? 3) { return (a?.priority ?? 3) > (b?.priority ?? 3) }
+            let aScore = a?.score.flatMap { $0.isFinite ? $0 : nil }
+            let bScore = b?.score.flatMap { $0.isFinite ? $0 : nil }
+            if aScore != bScore { return (aScore ?? -.infinity) > (bScore ?? -.infinity) }
+            if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
+            if lhs.reasons.count != rhs.reasons.count { return lhs.reasons.count > rhs.reasons.count }
+            return lhs.title == rhs.title ? aPath < bPath : lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+        }
+        var nextProject = rankedProjects.makeIterator()
+        return Array(ordered.map { item in
+            if case .project = item.target { return nextProject.next() ?? item }; return item
+        }.prefix(max(0, limit)))
     }
 
     // MARK: - Resume

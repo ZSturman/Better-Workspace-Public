@@ -21,10 +21,14 @@ final class MobileDeletionUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Move to Trash"].waitForExistence(timeout: 5))
         screenshot("delete-idea-iphone")
         app.buttons["Move to Trash"].tap()
-        XCTAssertTrue(app.staticTexts["Record an idea. Add detail now, organize it when you are ready."].waitForExistence(timeout: 5))
+        // The fixture's other idea ("Potential studio") stays, so the list is not empty.
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: row)
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 5), .completed)
+        XCTAssertTrue(app.staticTexts["1 change waiting for the Mac"].waitForExistence(timeout: 5))
         app.terminate()
         let reopened = launch("ideas", fresh: false)
-        XCTAssertTrue(reopened.staticTexts["Record an idea. Add detail now, organize it when you are ready."].waitForExistence(timeout: 10))
+        XCTAssertTrue(reopened.buttons["mobile-idea-Ideas/Potential studio"].waitForExistence(timeout: 10))
+        XCTAssertTrue(reopened.staticTexts["1 change waiting for the Mac"].exists)
         XCTAssertFalse(reopened.buttons["mobile-idea-Ideas/Example.md"].exists)
     }
     func testProjectLongPressRequiresConfirmationAndWorksInLandscape() {

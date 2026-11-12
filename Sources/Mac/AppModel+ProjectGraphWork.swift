@@ -42,11 +42,19 @@ extension AppModel {
         try ProjectGraphStore(database: database).save(bound)
     }
 
-    func bindExistingGraphWork() {
+    func bindExistingGraphWork() async {
+        let database = database, workItems = workItems, graphRecords = graphRecords, sources = graphSourcesByID
         do {
+            try await Task.detached(priority: .utility) {
             let store = try ProjectGraphStore(database: database)
+            let recordsByPage = Dictionary(graphRecords.compactMap { record in
+                record.pageID.map { (ProjectGraph.normalizedID($0), record) }
+            }, uniquingKeysWith: { first, _ in first })
             for work in workItems {
-                guard let id = work.importedNotionPageID, var record = graphRecords.first(where: { $0.pageID.map(ProjectGraph.normalizedID) == ProjectGraph.normalizedID(id) }), let source = graphSource(for: record), record.local.isEmpty, record.baseline.isEmpty else { continue }
+                guard let id = work.importedNotionPageID, var record = recordsByPage[ProjectGraph.normalizedID(id)],
+                      record.local.isEmpty, record.baseline.isEmpty, let source = sources[record.sourceID],
+                      try store.record(id: record.id) == record else { continue }
+                let original = record
                 var owned: [String: ProjectJSON] = [:]
                 for (name, schema) in source.schema.object where schema["type"].string == "title" { owned[name] = ProjectServiceBridge.text(work.title) }
                 owned["Complete"] = .bool(!work.isOpen)
@@ -57,8 +65,12 @@ extension AppModel {
                                                                  options: field.definition[type]["options"].array.compactMap { $0["name"].string }) { owned["Status"] = ProjectJSON(["name": name]) }
                 record.seedInitialLocalState(owned, source: source)
                 record.localPath = work.url.canonicalPath
-                try store.save(record)
+                try database.transaction {
+                    guard try store.record(id: record.id) == original else { return }
+                    try store.save(record)
+                }
             }
+            }.value
         } catch { lastError = error.localizedDescription }
     }
 

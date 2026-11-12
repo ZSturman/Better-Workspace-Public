@@ -155,26 +155,32 @@ class IntentFolderDetector:
                 continue
             for current, dirnames, _ in os.walk(root, followlinks=self.settings.follow_symlinks):
                 current_path = Path(current)
-                dirnames[:] = [name for name in dirnames if name not in self.settings.excluded_names and self._should_descend(current_path / name)]
-                for name in list(dirnames):
-                    candidate = current_path / name
-                    if candidate.resolve() in seen:
-                        # Already yielded as declared; never descend into its items.
-                        dirnames.remove(name)
+                descend = []
+                for name in dirnames:
+                    if name in self.settings.excluded_names or name in FOREIGN_NAMES:
                         continue
-                    explanation = self.explain(candidate)
-                    if explanation.is_intent and candidate.resolve() not in seen:
-                        seen.add(candidate.resolve())
-                        yield IntentFolder(candidate.resolve(), self._containing_root(candidate.resolve()) or root, explanation.intent_name or name, load_intent_config(candidate / INTENT_FILENAME))
-                        if not self.settings.allow_nested:
-                            dirnames.remove(name)
-
-    def _should_descend(self, path: Path) -> bool:
-        if path.name in FOREIGN_NAMES:
-            return False
-        if self._is_excluded(path.resolve()):
-            return False
-        return self.settings.follow_symlinks or not path.is_symlink()
+                    candidate = current_path / name
+                    if not self.settings.follow_symlinks and candidate.is_symlink():
+                        continue
+                    # Search roots are resolved and os.walk never enters a symlink
+                    # unless requested. In the default mode the path is already
+                    # canonical, so avoid resolving every ancestor on every walk.
+                    canonical = candidate.resolve() if self.settings.follow_symlinks else candidate
+                    if self._is_excluded(canonical):
+                        continue
+                    if canonical in seen:
+                        # Already yielded as declared; never descend into its items.
+                        continue
+                    if INTENT_PATTERN.fullmatch(name):
+                        explanation = self.explain(candidate)
+                        if explanation.is_intent:
+                            seen.add(canonical)
+                            yield IntentFolder(canonical, self._containing_root(canonical) or root,
+                                               explanation.intent_name or name, load_intent_config(candidate / INTENT_FILENAME))
+                            if not self.settings.allow_nested:
+                                continue
+                    descend.append(name)
+                dirnames[:] = descend
 
     def _containing_root(self, path: Path) -> Path | None:
         return next((root for root in self.settings.search_roots if path == root or root in path.parents), None)

@@ -48,7 +48,7 @@ public enum SecretStore {
 
     // Isolated UI previews cannot use credentials or send remote changes. Avoid a
     // synchronous Keychain access prompt while their project view is rendering.
-    public static var hasNotionToken: Bool { !TestIsolation.isActive && read() != nil }
+    public static var hasNotionToken: Bool { !TestIsolation.isActive && read(interactive: false) != nil }
 
     @discardableResult
     public static func remove(account: String = notionTokenAccount) -> Bool {

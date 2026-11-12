@@ -22,12 +22,12 @@ struct DashboardActionIntent: AppIntent {
         defer { WidgetCenter.shared.reloadAllTimelines() }
         do {
             try store.clear("error:" + scope)
-            let snapshot = DashboardWidgetStore.load(directory: store.directory)
+            let snapshot = WidgetDashboardRuntime.load()
             switch action {
             case "complete":
                 if let item = snapshot?.work.first(where: { $0.id == target }), !token.isEmpty,
-                   String(item.modifiedAt?.timeIntervalSince1970 ?? 0) != token { throw WidgetCommandError.message("The task changed. Refresh before completing it.") }
-                try WidgetDashboardRuntime.complete(taskID: target)
+                   WidgetDashboardRuntime.revisionToken(for: item) != token { throw WidgetCommandError.message("The task changed. Refresh before completing it.") }
+                try WidgetDashboardRuntime.complete(taskID: target, expectedRevisionID: UUID(uuidString: token))
             case "undo":
                 guard let id = UUID(uuidString: target) else { throw WidgetCommandError.message("Invalid completion.") }
                 try WidgetDashboardRuntime.undo(id: id)

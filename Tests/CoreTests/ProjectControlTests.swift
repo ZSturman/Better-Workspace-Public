@@ -78,6 +78,21 @@ final class ProjectControlTests: XCTestCase {
         XCTAssertEqual(dashboard.tasks(queue: .next).map(\.id), ["high", "low"], "Even partial scores must have the same priority on the widget")
     }
 
+    func testExplicitProjectPriorityAndUnknownScoresAgreeAcrossWidgetsAndMobile() {
+        let scored = MobileWorkItem(id: "scored", path: "scored", title: "Scored", kind: .task, status: .open, stage: .next, priority: .medium, projectPath: "Projects/Scored", revision: 1)
+        let unknown = MobileWorkItem(id: "unknown", path: "unknown", title: "Unknown", kind: .task, status: .open, stage: .next, priority: .medium, projectPath: "Projects/Unknown", revision: 1)
+        let scores = ["Projects/Scored": 1.0]
+        XCTAssertEqual(WorkItemRecommendation.nextMobileAction(in: [unknown, scored], projectScores: scores)?.id, "scored")
+        XCTAssertEqual(WorkItemRecommendation.nextMobileAction(in: [unknown], projectScores: scores)?.id, "unknown")
+        let priorities = ["Projects/Unknown": 5]
+        XCTAssertEqual(WorkItemRecommendation.nextMobileAction(in: [unknown, scored], projectScores: scores, projectPriorities: priorities)?.id, "unknown")
+        let entries = [MobileWorkspaceEntry(path: "Projects/Scored", parentPath: "Projects", name: "Scored", isDirectory: true, revision: 1, projectDetails: .init(path: "Projects/Scored", manualScore: 1)),
+                       MobileWorkspaceEntry(path: "Projects/Unknown", parentPath: "Projects", name: "Unknown", isDirectory: true, revision: 1, projectDetails: .init(path: "Projects/Unknown", portfolioPriority: 5))]
+        let snapshot = MobileWorkspaceSnapshot(entries: entries, workItems: [scored, unknown])
+        XCTAssertEqual(WorkspaceDashboardSnapshot.make(from: snapshot).tasks(queue: .next).map(\.id), ["unknown", "scored"])
+        XCTAssertEqual(WorkspaceWidgetSnapshot.make(from: snapshot).nextWorkItem?.title, "Unknown")
+    }
+
     func testScoreRankingStillRespectsLaterCompletionDependenciesAndBlocks() {
         var high = WorkItem(id: "high", kind: .task, title: "High", stage: .next, priority: .high, projectPath: "Projects/High", url: root.appendingPathComponent("high"))
         let low = WorkItem(id: "low", kind: .task, title: "Low", stage: .now, projectPath: "Projects/Low", url: root.appendingPathComponent("low"))

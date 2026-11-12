@@ -155,6 +155,14 @@ struct WorkItemEditor: View {
                     Picker("Priority", selection: $priority) { ForEach(WorkItemPriority.allCases) { Text($0.rawValue.capitalized).tag($0) } }
                         .pickerStyle(.segmented).labelsHidden().fixedSize()
                 }
+                if let owner = base?.responsibilityLabel {
+                    GridRow {
+                        label("For")
+                        Text(owner)
+                            .help("Me: needs you. Agent: a coding agent can do it. Either: you or an agent. Set by the Agent Completion Monitor or a project audit.")
+                            .accessibilityIdentifier("workItem.responsibility")
+                    }
+                }
             }
             GridRow {
                 label("Part of")

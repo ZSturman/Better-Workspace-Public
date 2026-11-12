@@ -51,6 +51,7 @@ extension AppModel {
             if change.oneLiner != (change.original.oneLiner ?? "") { fields.insert("one liner") }
             if change.summary != (change.original.summary ?? "") { fields.insert("summary") }
             fields.formUnion(MetricDefinition.all.filter { change.ratings[$0.id] != change.original.ratings?[$0.id] }.map(\.displayName))
+            if let portfolio = change.properties?.portfolio { fields.formUnion(portfolioGraphFields(portfolio, original: change.original.editablePortfolio)) }
             if !fields.isEmpty { queueProjectGraphEdits(for: project, fields: fields) }
             refreshOverview()
         case .previewProject:

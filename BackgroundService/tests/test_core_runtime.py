@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -37,6 +38,9 @@ def test_live_v2_create_move_copy_next_route_and_restart_are_idempotent(tmp_path
 
     runtime = runtime_for(tmp_path)
     runtime.start()
+    # As in `workspace-watcher run`: the tick drains a reconcile deferred by the
+    # cooldown between filesystem-triggered full walks.
+    threading.Thread(target=runtime.tick_loop, daemon=True).start()
     try:
         thought = inbox / "Dashboard Thought"
         thought.mkdir()

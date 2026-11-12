@@ -172,6 +172,13 @@ private struct PersonalWorkspaceHome: View {
                 }
             }
             .navigationTitle("My Workspace")
+            .task(id: records.map(\.modifiedAt)) {
+                guard !isSample else { return }
+                while !Task.isCancelled {
+                    ConnectedApps.shared.publishSummary("\(records.filter { !$0.isArchived }.count) personal workspace items", generatedAt: .now)
+                    try? await Task.sleep(for: .seconds(60))
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .automatic) {
                     Menu {

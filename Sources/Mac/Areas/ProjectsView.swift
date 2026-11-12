@@ -605,12 +605,13 @@ struct ProjectsView: View {
 
     /// Probes run after the list is already on screen, in small batches, so 383
     /// directory probes never block first paint.
-    @MainActor
-    private func loadDetails() async {
+    @MainActor private func loadDetails() async {
         let items = model.projects()
+        let revision = model.revision(ofArea: WorkspaceArea.projects.directoryName)
         var batch: [String: ItemDetail] = [:]
         for (index, item) in items.enumerated() {
             batch[item.url.path] = await model.probe.detail(for: item)
+            guard !Task.isCancelled, model.revision(ofArea: WorkspaceArea.projects.directoryName) == revision else { return }
             if index % 25 == 24 {
                 let snapshot = batch
                 await MainActor.run { details.merge(snapshot) { _, new in new } }

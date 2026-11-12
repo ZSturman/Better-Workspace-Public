@@ -11,7 +11,10 @@ public enum WidgetDashboardRuntime {
         #endif
     }
     public static func load() -> WorkspaceDashboardSnapshot? {
-        guard let store = WidgetCommandStore.shared(appGroup: appGroup), let snapshot = DashboardWidgetStore.load(directory: store.directory) else { return nil }
+        guard let store = WidgetCommandStore.shared(appGroup: appGroup) else { return nil }
+        let saved = DashboardWidgetStore.load(directory: store.directory)
+        let combined = (try? WorkspaceUnifiedWidgets.read()).map { WorkspaceUnifiedWidgets.overlay(saved, replica: $0.graph) } ?? saved
+        guard let snapshot = combined else { return nil }
         try? store.reconcile(snapshot)
         return (try? store.overlay(snapshot)) ?? snapshot
     }
@@ -46,7 +49,11 @@ public enum WidgetDashboardRuntime {
         #endif
     }
 
-    public static func complete(taskID: String) throws {
+    public static func revisionToken(for item: MobileWorkItem) -> String {
+        item.workspaceRevisionID?.uuidString ?? String(item.modifiedAt?.timeIntervalSince1970 ?? 0)
+    }
+    public static func complete(taskID: String, expectedRevisionID: UUID? = nil) throws {
+        if try WorkspaceUnifiedWidgets.completeIfPresent(taskID: taskID, expectedRevisionID: expectedRevisionID) { return }
         guard let store = WidgetCommandStore.shared(appGroup: appGroup) else { throw WidgetCommandError.message("Shared widget storage is unavailable.") }
         try complete(taskID: taskID, store: store)
     }

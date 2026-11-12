@@ -2,6 +2,32 @@ import XCTest
 @testable import BetterWorkspaceCore
 
 final class MobilePlanningTests: XCTestCase {
+    func testBodyOnlyWorkDraftWaitsForDownloadedTextAfterReceipt() {
+        let original = MobileWorkItem(id: "body-only", path: "To Do/Body.bw.md", title: "Body", kind: .task,
+            status: .open, stage: .next, priority: .medium, revision: 1, body: "Before")
+        var changed = original; changed.body = "After"
+        let edit = MobilePlanningEdit(operation: .saveWork, title: changed.title, description: "After", work: changed, originalWork: original)
+        let receipts = [edit.id: Date(timeIntervalSinceNow: -7 * 86400)]
+        XCTAssertTrue(MobilePlanningFiles.settledDraftIDs([edit], appliedAt: receipts, snapshot: .init(workItems: [original])).isEmpty)
+        XCTAssertEqual(MobilePlanningFiles.settledDraftIDs([edit], appliedAt: receipts, snapshot: .init(workItems: [changed])), [edit.id])
+    }
+    func testProjectDraftNeverExpiresBeforeItsExactDomainArrives() {
+        let original = MobileProjectDetails(path: "Projects/_Collections/3D Models Collection", projectID: "project", ratings: [:])
+        var properties = MobileProjectProperties(original); properties.domain = "Technology"
+        let edit = MobilePlanningEdit(operation: .saveProject, title: "3D Models Collection",
+            projectEdit: .init(original: original, ratings: [:], oneLiner: "", summary: "", properties: properties))
+        let receipt = [edit.id: Date(timeIntervalSinceNow: -7 * 86400)]
+        func snapshot(_ details: MobileProjectDetails) -> MobileWorkspaceSnapshot {
+            .init(entries: [.init(path: original.path, parentPath: "Projects/_Collections", name: edit.title,
+                isDirectory: true, revision: 1, projectDetails: details)])
+        }
+        XCTAssertTrue(MobilePlanningFiles.settledDraftIDs([edit], appliedAt: receipt, snapshot: snapshot(original)).isEmpty)
+        var unrelated = original; unrelated.domain = "Art"
+        XCTAssertTrue(MobilePlanningFiles.settledDraftIDs([edit], appliedAt: receipt, snapshot: snapshot(unrelated)).isEmpty)
+        var confirmed = original; confirmed.domain = "Technology"
+        XCTAssertEqual(MobilePlanningFiles.settledDraftIDs([edit], appliedAt: receipt, snapshot: snapshot(confirmed)), [edit.id])
+        XCTAssertTrue(MobilePlanningFiles.settledDraftIDs([edit], appliedAt: [:], snapshot: snapshot(confirmed)).isEmpty)
+    }
     private func withWorkspace(_ body: (WorkspaceLocation) throws -> Void) throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("bw-planning-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

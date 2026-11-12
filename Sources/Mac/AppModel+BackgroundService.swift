@@ -67,6 +67,7 @@ extension AppModel {
         let client = BackgroundServiceClient.shared
         await refreshLiveActivity()
         if let ideas = await client.ideas() {
+            serviceIdeasLoaded = true
             let records = Dictionary(ideas.map { ($0.canonicalPath, $0) }, uniquingKeysWith: { first, _ in first })
             if records != serviceIdeasByPath { serviceIdeasByPath = records; refreshOverview(); requestMobileCloudSync() }
         }

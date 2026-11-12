@@ -237,7 +237,7 @@ struct DashboardWidgetView: View {
     private func taskRow(_ item: MobileWorkItem, showProject: Bool = true) -> some View {
         HStack(alignment: .top, spacing: 7) {
             if !accessory && item.kind == .task {
-                Button(intent: action("complete", target: item.id, token: String(item.modifiedAt?.timeIntervalSince1970 ?? 0))) {
+                Button(intent: action("complete", target: item.id, token: WidgetDashboardRuntime.revisionToken(for: item))) {
                     Image(systemName: "circle").font(.title3)
                 }.buttonStyle(.plain).accessibilityLabel("Complete \(item.title)")
             }

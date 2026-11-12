@@ -18,8 +18,11 @@ settings:
     "CODE_SIGN_STYLE[sdk=iphoneos*]": Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
     SWIFT_STRICT_CONCURRENCY: minimal
-    MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.0.5"
+    CURRENT_PROJECT_VERSION: "57"
+    # The commit a build was made from (Info.plist BWSourceCommit); release and install
+    # builds pass BW_SOURCE_COMMIT=$(git rev-parse HEAD).
+    BW_SOURCE_COMMIT: unrecorded
 
 targets:
 
@@ -33,6 +36,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspaceCore
+        # XcodeGen otherwise injects target build 1, masking the shared release number.
+        CURRENT_PROJECT_VERSION: $(inherited)
         DEFINES_MODULE: "YES"
         "CODE_SIGN_IDENTITY[sdk=macosx*]": Apple Development
         "CODE_SIGN_STYLE[sdk=macosx*]": Automatic
@@ -95,10 +100,16 @@ targets:
       properties:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        BWSourceCommit: $(BW_SOURCE_COMMIT)
         CFBundleName: Better Workspace
         CFBundleDisplayName: Better Workspace
         LSMinimumSystemVersion: "14.4"
         BWNotebookCloudSyncEnabled: true
+        NSUbiquitousContainers:
+          iCloud.com.zacharysturman.BetterWorkspace:
+            NSUbiquitousContainerIsDocumentScopePublic: true
+            NSUbiquitousContainerName: Better Workspace
+            NSUbiquitousContainerSupportedFolderLevels: Any
         NSHumanReadableCopyright: "Copyright © 2026 Zachary Sturman"
         LSApplicationCategoryType: public.app-category.productivity
         NSSupportsAutomaticTermination: false
@@ -209,6 +220,7 @@ targets:
       properties:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        BWSourceCommit: $(BW_SOURCE_COMMIT)
         CFBundleName: Better Workspace
         CFBundleDisplayName: Better Workspace
         UILaunchScreen: {}
@@ -227,7 +239,7 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleURLTypes:
           - CFBundleURLName: com.zacharysturman.BetterWorkspace.Mobile
-            CFBundleURLSchemes: [betterworkspace-mobile]
+            CFBundleURLSchemes: [betterworkspace-mobile, betterworkspace]
         NSPhotoLibraryUsageDescription: "Attach photos and video to a workspace capture."
         NSCameraUsageDescription: "Capture a photo for your workspace inbox."
         NSHumanReadableCopyright: "Copyright © 2026 Zachary Sturman"
@@ -420,6 +432,35 @@ targets:
         GENERATE_INFOPLIST_FILE: "YES"
         TEST_TARGET_NAME: BetterWorkspaceMobile
 
+  # App hosting is required for unit tests on physical iPhone/iPad destinations.
+  # The host's explicit backend-test mode opens only a memory sample, with no app
+  # groups, CloudKit activity, personal records or connected Mac commands.
+  BetterWorkspaceReplicaDeviceTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/CoreTests/ProjectPropertiesTests.swift
+      - path: Tests/CoreTests/WorkspaceReplicaTests.swift
+      - path: Tests/CoreTests/WorkspaceMacProjectionTests.swift
+      - path: Tests/CoreTests/WorkspaceMacWorkCreationTests.swift
+      - path: Tests/CoreTests/WorkspaceMacDirectoryCreationTests.swift
+      - path: Tests/CoreTests/WorkspaceMacFileTests.swift
+      - path: Tests/CoreTests/WorkspaceDeletionSafetyTests.swift
+      - path: Tests/CoreTests/WorkspaceMacReceiptTests.swift
+      - path: Tests/CoreTests/WorkspaceSessionTests.swift
+      - path: Tests/CoreTests/WorkspaceLiveCloudTests.swift
+      - path: Tests/CoreTests/WorkspaceNotebookTests.swift
+    dependencies:
+      - target: BetterWorkspaceMobile
+      - target: BetterWorkspaceCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zacharysturman.BetterWorkspace.ReplicaDeviceTests
+        GENERATE_INFOPLIST_FILE: "YES"
+        CODE_SIGN_STYLE: Automatic
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/BetterWorkspaceMobile.app/BetterWorkspaceMobile"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
   BetterWorkspaceCoreTests:
     type: bundle.unit-test
     platform: macOS
@@ -450,6 +491,28 @@ targets:
         BUNDLE_LOADER: "$(TEST_HOST)"
 
 schemes:
+  BetterWorkspaceUnifiedCloudDevices:
+    build:
+      targets:
+        BetterWorkspaceMobile: all
+        BetterWorkspaceReplicaDeviceTests: [test]
+    test:
+      config: Debug
+      targets: [BetterWorkspaceReplicaDeviceTests]
+      environmentVariables:
+        BW_RUN_ISOLATED_CORE_TESTS: "1"
+        BW_RUN_UNIFIED_CLOUD_ACCEPTANCE: "1"
+  BetterWorkspaceReplicaDevices:
+    build:
+      targets:
+        BetterWorkspaceMobile: all
+        BetterWorkspaceReplicaDeviceTests: [test]
+    test:
+      config: Debug
+      targets: [BetterWorkspaceReplicaDeviceTests]
+      environmentVariables:
+        BW_RUN_ISOLATED_CORE_TESTS: "1"
+
   BetterWorkspaceCloudAcceptance:
     build:
       targets:

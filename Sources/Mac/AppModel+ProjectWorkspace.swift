@@ -34,11 +34,38 @@ extension AppModel {
 
     func saveProjectMetadata(_ metadata: ProjectMetadata, relatedProjectIDs: Set<String>, for item: WorkspaceItem) {
         guard let record = projectRecord(for: item) else { return }
-        projectStore.setMetadata(metadata, for: record.id)
+        let previous = projectStore.metadata(for: record.id)
+        do { try projectStore.saveMetadata(metadata, for: record.id) }
+        catch { lastError = "Couldn’t save details for “\(item.displayTitle)”. \(error.localizedDescription)"; return }
+        forwardOwnedMetadata(projectID: record.id, from: previous, to: metadata)
         projectStore.setRelatedProjectIDs(relatedProjectIDs, for: record.id)
         statusMessage = "Saved details for “\(item.displayTitle)”"
         queueProjectGraphEdits(for: item, fields: ["domain", "Status", "Phase", "Type", "Completion Model", "Maintenance Cadence", "Current Work", "Next Work", "Recent Work", "Work Mode", "Blocked By", "status details", "Local Directory", "started at", "last update at", "related projects"])
         refreshOverview()
+    }
+
+    func saveProjectPortfolio(_ desired: ProjectPortfolioDetails, original: ProjectPortfolioDetails, for item: WorkspaceItem) throws {
+        guard let record = projectRecord(for: item) else { throw MobilePlanningFiles.Error.conflict }
+        try ProjectProperties.validateChanges(desired, from: original)
+        let merged = try ProjectProperties.merging(desired, original: original, current: projectStore.portfolioDetails(for: record.id))
+        try projectStore.savePortfolioDetails(merged, for: record.id)
+        let fields = portfolioGraphFields(desired, original: original)
+        if !fields.isEmpty { queueProjectGraphEdits(for: item, fields: fields) }
+        refreshOverview(); requestMobileCloudSync()
+    }
+
+    /// Reuse existing mapped URL/checkbox draft fields; never send from a local Save.
+    func portfolioGraphFields(_ desired: ProjectPortfolioDetails, original: ProjectPortfolioDetails) -> Set<String> {
+        var fields = Set<String>()
+        guard let source = graphSources.first(where: { $0.kind == .projects }) else { return fields }
+        for (changed, aliases) in [(desired.githubURL != original.githubURL, ["GitHub", "Github", "Repo Link", "Repository URL", "Repository", "Repo"]),
+                                   (desired.websiteURL != original.websiteURL, ["Website", "Project URL", "URL", "Live URL", "Download URL"])] where changed {
+            if let name = aliases.first(where: { source.property(named: $0)?.definition["type"].string == "url" }) { fields.insert(name) }
+        }
+        for (changed, name) in [(desired.featured != original.featured, "Featured"), (desired.inShowcase != original.inShowcase, "In Showcase"), (desired.isPublic != original.isPublic, "Public")] where changed {
+            if source.property(named: name)?.definition["type"].string == "checkbox" { fields.insert(name) }
+        }
+        return fields
     }
 
     func relatedProjects(for item: WorkspaceItem) -> [WorkspaceItem] {
@@ -69,7 +96,8 @@ extension AppModel {
         // resolve every project directory for every work item while the portfolio
         // table is rendering.  Discovery URLs are lexical paths under this workspace.
         let legacyPath = item.url.path
-        return workItems.filter { $0.projectPath == path || $0.projectPath == legacyPath }
+        let former = Set(projectLinkAliases.filter { $0.value == path && projectRecordsByPath[workspace.root.appendingPathComponent($0.key).canonicalPath] == nil }.keys)
+        return workItems.filter { $0.projectPath == path || $0.projectPath == legacyPath || $0.projectPath.map(former.contains) == true }
     }
 
     func projectNextAction(for item: WorkspaceItem) -> WorkItem? {
@@ -87,18 +115,21 @@ extension AppModel {
 
     func portfolioCandidates() -> [ProjectPortfolio.Candidate] {
         let preferences = scoringPreferences()
-        return projects().compactMap { portfolioCandidate(for: $0, preferences: preferences) }
+        let completed = WorkItemRecommendation.completedDependencyIDs(in: workItems)
+        return projects().compactMap { portfolioCandidate(for: $0, preferences: preferences, completedDependencies: completed) }
     }
 
     /// One project's candidate. Every call reads the database and scans work items, so
     /// callers building many rows use this per row rather than `portfolioCandidates()`
     /// per row — that was quadratic, and froze Projects → Decide for minutes.
-    func portfolioCandidate(for item: WorkspaceItem, preferences: ProjectScoringPreferences) -> ProjectPortfolio.Candidate? {
+    func portfolioCandidate(for item: WorkspaceItem, preferences: ProjectScoringPreferences,
+                            completedDependencies: Set<String>) -> ProjectPortfolio.Candidate? {
         guard let record = projectRecord(for: item) else { return nil }
         let age = measurements(for: item)?.measurement(.activityAge)?.rawValue
             ?? measurements(for: item)?.measurement(.activityAge)?.value
         return ProjectPortfolio.Candidate(id: record.id, name: item.displayTitle, metadata: projectMetadata(for: item),
-                                          score: score(for: item, preferences: preferences), nextAction: projectNextAction(for: item),
+                                          score: score(for: item, preferences: preferences),
+                                          nextAction: WorkItemRecommendation.nextAction(in: projectWorkItems(for: item), completedDependencyIDs: completedDependencies),
                                           activityAgeDays: age)
     }
 

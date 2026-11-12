@@ -1,9 +1,14 @@
 import SwiftUI
+import AppKit
+import TipKit
 import BetterWorkspaceCore
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var showingWorkspaceSetup = false
+    @State private var inspectorWidth: CGFloat = 290
+    @State private var inspectorDragStart: CGFloat?
 
     /// Sidebar (190) + detail (360) + inspector (250) needs 800pt before any padding.
     /// Below this the split view starts stealing width from the sidebar, which clipped
@@ -15,39 +20,71 @@ struct ContentView: View {
         GeometryReader { geometry in
             shell(windowWidth: geometry.size.width)
         }
+        #if DEBUG
+        .overlay(alignment: .topTrailing) {
+            if TestIsolation.isActive, TestIsolation.launchArgument("BWReliabilityResizeFixture") == "YES" {
+                HStack {
+                    Button("820") { resizeFixtureWindow(width: 820, height: 520) }.accessibilityIdentifier("reliability.resizeNarrow")
+                    Button("1240") { resizeFixtureWindow(width: 1240, height: 820) }.accessibilityIdentifier("reliability.resizeWide")
+                }.buttonStyle(.bordered).padding(8)
+            }
+        }
+        #endif
         .sheet(item: Binding(get: { ["widget", "newProject"].contains(model.graphSyncReview?.presenterID ?? "") ? model.graphSyncReview : nil }, set: { model.graphSyncReview = $0 })) { review in
             ProjectSyncReviewView(review: review).environment(model)
         }
         .sheet(isPresented: $model.showingSyncCenter) { SyncCenterView().environment(model) }
         .sheet(item: $model.editingWorkItem) { item in WorkItemEditor(mode: .edit(item)).environment(model) }
+        .sheet(item: $model.finderWorkDraft) { draft in
+            WorkItemEditor(mode: .create, kind: draft.kind, projectPath: draft.projectPath) { value in
+                try await model.createWorkItem(value)
+            }.environment(model)
+        }
         .sheet(item: $model.projectToolTarget) { target in
             ProjectToolSheet(target: target)
                 .environment(model)
         }
+        .sheet(isPresented: $showingWorkspaceSetup) {
+            WorkspaceSetupView(root: model.workspace.root).environment(model)
+        }
+        .task { @MainActor in
+            guard !TestIsolation.defaults.bool(forKey: "macWorkspaceSetupCompleted") else { return }
+            let root = model.workspace.root
+            let needsSetup = await Task.detached(priority: .utility) {
+                guard let names = try? FileManager.default.contentsOfDirectory(atPath: root.path) else { return true }
+                return names.filter(WorkspaceFolderDiscovery.couldBeArea).isEmpty
+            }.value
+            if needsSetup { showingWorkspaceSetup = true }
+        }
     }
+
+    #if DEBUG
+    private func resizeFixtureWindow(width: CGFloat, height: CGFloat) {
+        let window = NSApp.windows.first { $0.isVisible && AppDelegate.isMainWorkspaceWindow($0) }
+        window?.setContentSize(NSSize(width: width, height: height))
+    }
+    #endif
 
     private func shell(windowWidth: CGFloat) -> some View {
         @Bindable var model = model
         let roomForInspector = windowWidth >= Self.inspectorMinimumWindowWidth
+        let focusedWork = !roomForInspector && model.showInspector && model.selectedItem.map { selected in
+            model.workItems.contains { $0.url.canonicalPath == selected.url.canonicalPath }
+        } == true
         return NavigationSplitView(columnVisibility: $columnVisibility) {
             Sidebar()
                 .navigationSplitViewColumnWidth(min: 190, ideal: 215, max: 280)
         } detail: {
-            // Deliberately not `.inspector(isPresented:)`.
-            //
-            // That modifier bridges to an AppKit split-view controller which, once
-            // accessibility-enhanced UI is switched on (VoiceOver, or anything driving
-            // the app through the accessibility API), re-invalidates layout from inside
-            // AppKit's update-constraints pass and aborts the process from
-            // `-[NSWindow _postWindowNeedsUpdateConstraints]`. Reproduced reliably under
-            // XCUITest; an `HSplitView` gives the same resizable trailing pane and is
-            // stable. See README "Problems found".
-            HSplitView {
+            // A plain stack keeps the main list stable and lets it shrink when
+            // the inspector disappears. NSSplitView retained old pane constraints;
+            // replacing its identity during live resize crashed outgoing table rows.
+            HStack(spacing: 0) {
                 VStack(spacing: 0) {
                     if model.workspaceAvailable == false { unavailableBanner }
-                    if !roomForInspector, model.showInspector,
-                       let selected = model.selectedItem,
-                       model.workItems.contains(where: { $0.url.canonicalPath == selected.url.canonicalPath }) {
+                    ZStack {
+                        detail.opacity(focusedWork ? 0 : 1)
+                            .allowsHitTesting(!focusedWork).accessibilityHidden(focusedWork)
+                    if focusedWork {
                         // At narrow widths the trailing inspector cannot fit. Keep
                         // a linked task/feature/milestone visible as the main screen.
                         VStack(spacing: 0) {
@@ -63,24 +100,22 @@ struct ContentView: View {
                             Divider()
                             InspectorView()
                         }
-                    } else {
-                        detail
+                    }
                     }
                 }
                     .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
                 // The ingest classifier carries its own title/tag/destination editor, so
                 // a second inspector beside it is 300 points of "Nothing selected".
-                if model.showInspector, model.selection != .ingest, roomForInspector,
+                if model.showInspector, model.selection != .ingest, model.selection != .unified, !isRootSelection, roomForInspector,
                    model.selection != .folder("Projects") || model.selectedItem?.isDirectory == false {
+                    inspectorDivider
                     InspectorView()
-                        .frame(minWidth: 250, idealWidth: 290, maxWidth: 400, maxHeight: .infinity)
+                        .frame(width: inspectorWidth).frame(maxHeight: .infinity)
                 }
             }
-            // Shrinking below the inspector threshold removes its pane, and HSplitView
-            // then kept the detail pane at its old width: launching at a restored 1400pt
-            // frame and resizing to 820pt left Overview running off the window. A new
-            // identity when the pane comes or goes lays the split out afresh.
-            .id(roomForInspector)
+            // Keep the main pane's identity stable across live resize/fullscreen.
+            // Replacing the split tears down its NSTableView while AppKit is still
+            // preparing outgoing rows, triggering ViewListTree.visitItem assertions.
             // Moving to another area must not leave the inspector describing an item
             // from the one you just left.
             .onChange(of: model.selection) { _, _ in
@@ -90,6 +125,12 @@ struct ContentView: View {
                 model.selectionAfterNavigation = nil
             }
                 .toolbar {
+                    ToolbarItem(id: "workspaceSetup", placement: .primaryAction) {
+                        Button { showingWorkspaceSetup = true } label: {
+                            Label("Workspace Setup", systemImage: "folder.badge.gearshape")
+                        }.accessibilityIdentifier("workspace.setup")
+                            .popoverTip(MacWorkspaceSetupTip(), arrowEdge: .bottom)
+                    }
                     ToolbarItem(id: "notionSync", placement: .primaryAction) {
                         if !model.graphSources.isEmpty { SyncStatusButton() }
                     }
@@ -99,7 +140,7 @@ struct ContentView: View {
                             Label("Inspector", systemImage: "sidebar.trailing")
                         }
                         .keyboardShortcut("i", modifiers: [.command, .option])
-                        .disabled(model.selection == .ingest || roomForInspector == false)
+                        .disabled(model.selection == .ingest || model.selection == .unified || isRootSelection || roomForInspector == false)
                         .help(roomForInspector
                               ? "Show or hide the inspector"
                               : "The window is too narrow for the inspector")
@@ -113,16 +154,6 @@ struct ContentView: View {
                 }
         }
         .navigationTitle("")
-        .alert("Workspace files changed outside Better Workspace", isPresented: Binding(
-            get: { model.workItemSyncPrompt != nil },
-            set: { if $0 == false { model.dismissWorkItemSyncPrompt() } }
-        )) {
-            Button("Add files back") { model.restoreMissingWorkItems() }
-            Button("Sync app to folder", role: .destructive) { model.syncWorkItemsToFolder() }
-            Button("Later", role: .cancel) { model.dismissWorkItemSyncPrompt() }
-        } message: {
-            Text(model.workItemSyncPrompt?.message ?? "The Workspace no longer matches the tasks currently shown in the app.")
-        }
         .alert("Delete “\(model.deletionRequest?.title ?? "item")”?", isPresented: Binding(
             get: { model.deletionRequest != nil }, set: { if !$0 { model.deletionRequest = nil } }
         )) {
@@ -130,6 +161,23 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { model.deletionRequest = nil }
         } message: { Text(model.deletionRequest?.message ?? "") }
         .overlay(alignment: .bottom) { statusBar }
+    }
+
+    private var inspectorDivider: some View {
+        Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
+            .padding(.horizontal, 3).contentShape(Rectangle())
+            .gesture(DragGesture().onChanged { value in
+                if inspectorDragStart == nil { inspectorDragStart = inspectorWidth }
+                inspectorWidth = min(400, max(250, (inspectorDragStart ?? inspectorWidth) - value.translation.width))
+            }.onEnded { _ in inspectorDragStart = nil })
+            .accessibilityLabel("Inspector width")
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: inspectorWidth = min(400, inspectorWidth + 20)
+                case .decrement: inspectorWidth = max(250, inspectorWidth - 20)
+                @unknown default: break
+                }
+            }.help("Drag to resize the inspector")
     }
 
     /// Says the Workspace is missing rather than letting every area look emptied.
@@ -155,10 +203,24 @@ struct ContentView: View {
         switch model.selection {
         case .overview, .none:
             OverviewView()
+        case .unified:
+            MacUnifiedWorkspaceView()
         case .work:
             WorkItemsView()
         case .ingest:
             IngestView()
+        case .rootItem(let name):
+            if let item = model.rootItems.first(where: { $0.id == name }) {
+                Group {
+                    switch item.kind {
+                    case .application: WorkspaceApplicationDetail(item: item)
+                    case .webpage: WorkspaceWebpageDetail(item: item)
+                    case .file: WorkspaceRootFileDetail(item: item)
+                    }
+                }.id(item.id)
+            } else {
+                EmptyAreaState(symbol: "doc.badge.ellipsis", title: "Item unavailable", message: "It may have moved or been removed. Refresh the workspace to update the sidebar.")
+            }
         case .tag(let id):
             if let tag = model.allTags.first(where: { $0.id == id }) {
                 TagBrowserView(tag: tag)
@@ -181,6 +243,10 @@ struct ContentView: View {
                 EmptyAreaState(symbol: "folder.badge.questionmark", title: "Folder not found", message: "It may have been moved or removed in Finder.")
             }
         }
+    }
+
+    private var isRootSelection: Bool {
+        if case .rootItem = model.selection { return true }; return false
     }
 
     @ViewBuilder
@@ -228,6 +294,9 @@ struct Sidebar: View {
         @Bindable var model = model
         List(selection: $model.selection) {
             Section {
+                NavigationLink(value: SidebarSelection.unified) {
+                    Label("Workspace", systemImage: "square.stack.3d.up")
+                }.accessibilityIdentifier("sidebar.unified")
                 NavigationLink(value: SidebarSelection.overview) {
                     Label("Overview", systemImage: "rectangle.3.group")
                 }
@@ -272,6 +341,21 @@ struct Sidebar: View {
                 }
             } header: {
                 Text("Workspace")
+            }
+
+            if !model.rootItems.isEmpty {
+                Section {
+                    ForEach(model.rootItems) { item in
+                        NavigationLink(value: SidebarSelection.rootItem(item.id)) {
+                            Label(item.title, systemImage: item.symbol).lineLimit(1)
+                        }.accessibilityIdentifier("sidebar.root." + item.id)
+                            .contextMenu { Button("Show in Finder") { model.revealInFinder(item.url) } }
+                    }
+                } header: {
+                    Text("Apps, Webpages & Files")
+                } footer: {
+                    TipView(WorkspaceRootItemsTip()).font(.caption)
+                }
             }
 
             Section {

@@ -72,7 +72,7 @@ extension AppModel {
                         tags: idea.tags, ratings: idea.planning?.ratings ?? [:], to: existing, source: source)
                     if existing != record { try store.save(record) }
                     records.removeAll { $0.id == record.id }; records.append(record)
-                    guard !TestIsolation.isActive, let token = SecretStore.read(), IdeaProjectBridge.canAutomaticallySend(record, source: source) else { continue }
+                    guard !TestIsolation.isActive, let token = SecretStore.read(interactive: false), IdeaProjectBridge.canAutomaticallySend(record, source: source) else { continue }
                     let fieldIDs = Set((record.serviceSnapshot ?? [:]).keys)
                     // An ambiguous create is deliberately never repeated by the existing
                     // sync coordinator. A human can recover the page in Sync Center.
@@ -95,7 +95,7 @@ extension AppModel {
                 let key = "ideaPromotionOutgoing:" + record.id
                 guard let captured = try store.read(key, as: [String: ProjectJSON].self), !captured.isEmpty,
                       captured.allSatisfy({ record.local[$0.key]?.comparable == $0.value.comparable }),
-                      !TestIsolation.isActive, let token = SecretStore.read() else { continue }
+                      !TestIsolation.isActive, let token = SecretStore.read(interactive: false) else { continue }
                 if record.pageID == nil {
                     let allowed = Set((record.serviceSnapshot ?? [:]).keys).union(captured.keys)
                     guard Set(record.local.keys).isSubset(of: allowed), (record.pendingUploads ?? []).isEmpty, !record.archiveRequested else { continue }
@@ -138,8 +138,10 @@ extension AppModel {
             let remote = record.remote[field.id]
             if let remote, !remote.display.isEmpty, ProjectViewQuery.normalize(remote.display) != "idea" {
                 record.local[field.id] = remote; record.baseline[field.id] = remote
-                var metadata = projectStore.metadata(for: project.id); metadata.status = remote.display
+                let previous = projectStore.metadata(for: project.id)
+                var metadata = previous; metadata.status = remote.display
                 projectStore.setMetadata(metadata, for: project.id)
+                forwardOwnedMetadata(projectID: project.id, from: previous, to: metadata)
             } else {
                 record.set("Status", value: ProjectJSON(["name": "Queued"]), source: source)
                 outgoing[field.id] = record.local[field.id]

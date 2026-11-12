@@ -201,6 +201,9 @@ struct ProjectGraphRecordEditor: View {
         case "title", "rich_text", "url":
             TextField(prompt ?? label, text: textBinding(name, type: type, source: source), axis: .vertical)
                 .lineLimit(1...4).accessibilityIdentifier(id)
+            if type == "url", record.kind == .projects, let destination = ProjectLink(label: label, url: draft.value(name, source: source).display).destination {
+                Link("Open " + label, destination: destination)
+            }
         case "number":
             TextField(prompt ?? label, text: textBinding(name, type: type, source: source)).accessibilityIdentifier(id)
         case "date":
@@ -215,6 +218,11 @@ struct ProjectGraphRecordEditor: View {
                 suggestions: options(schema, type), identifier: id, store: TestIsolation.defaults)
         case "multi_select":
             let selected = draft.value(name, source: source)[type].array.compactMap { $0["name"].string }
+            if record.kind == .projects && name.lowercased() == "type" {
+                ProjectTypeField(value: Binding(get: { selected.joined(separator: ", ") }, set: { value in
+                    draft.set(name, value: .array(ProjectProperties.types(value).map { ProjectJSON(["name": $0]) }), source: source)
+                }), suggestions: options(schema, type), store: TestIsolation.defaults)
+            } else {
             Menu {
                 ForEach(options(schema, type), id: \.self) { option in
                     Toggle(option, isOn: Binding(get: { selected.contains(option) }, set: { enabled in
@@ -228,6 +236,7 @@ struct ProjectGraphRecordEditor: View {
                     .foregroundStyle(selected.isEmpty ? .secondary : .primary)
             }
             .fixedSize(horizontal: false, vertical: true).accessibilityIdentifier(id)
+            }
         case "files":
             Text("\(draft.value(name, source: source)[type].array.count) files").foregroundStyle(.secondary)
         default:

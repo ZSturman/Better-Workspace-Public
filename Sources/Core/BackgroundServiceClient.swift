@@ -375,6 +375,7 @@ public actor BackgroundServiceClient {
             let status: String
             let payload_json: String?
             let notion_page_id: String?
+            let session_ids_json: String?
         }
         struct Payload: Decodable {
             let active_minutes: Double?
@@ -383,12 +384,15 @@ public actor BackgroundServiceClient {
             let summary: String?
             let files: [String]?
             let backfilled_session_count: Int?
+            let start: String?
+            let end: String?
+            let sessions: [ProjectJSON]?
         }
         return try JSONDecoder().decode(Envelope<[Row]>.self, from: data).data.map { row in
             let payload = row.payload_json
                 .flatMap { $0.data(using: .utf8) }
                 .flatMap { try? JSONDecoder().decode(Payload.self, from: $0) }
-            return WorkLogEntry(
+            var entry = WorkLogEntry(
                 id: row.id, projectID: row.project_id, projectName: row.project_name, dateKey: row.date_key,
                 status: row.status, activeMinutes: payload?.active_minutes ?? 0,
                 elapsedMinutes: payload?.elapsed_minutes ?? 0, sessionCount: payload?.session_count ?? 0,
@@ -396,6 +400,21 @@ public actor BackgroundServiceClient {
                 syncedToNotion: row.notion_page_id?.isEmpty == false,
                 reconstructedSessionCount: payload?.backfilled_session_count ?? 0, notionPageID: row.notion_page_id
             )
+            entry.sessionIDs = row.session_ids_json.flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode([String].self, from: $0) }
+            entry.startedAt = payload?.start.flatMap(ServiceDates.parse)
+            entry.endedAt = payload?.end.flatMap(ServiceDates.parse)
+            entry.sessions = payload?.sessions?.compactMap { fact -> WorkSession? in
+                guard let projectID = row.project_id, let id = fact["session_id"].string,
+                      let start = fact["start"].string.flatMap(ServiceDates.parse),
+                      let end = fact["end"].string.flatMap(ServiceDates.parse) else { return nil }
+                let active: Double
+                if case .number(let seconds) = fact["active_seconds"] { active = seconds } else { active = 0 }
+                return WorkSession(id: id, projectID: projectID, projectName: row.project_name,
+                    startedAt: start, endedAt: end, activeSeconds: active,
+                    files: fact["files"].array.compactMap(\.string), gitBranch: fact["git"]["branch"].string, gitSubject: fact["git"]["head_subject"].string)
+            }
+            return entry
         }
         .sorted { ($0.dateKey, $0.projectName) > ($1.dateKey, $1.projectName) }
     }
@@ -502,7 +521,7 @@ public struct IdeaRecord: Sendable, Hashable, Identifiable {
     public var canonicalPath: String { URL(fileURLWithPath: path).canonicalPath }
 }
 
-public struct WorkLogEntry: Sendable, Hashable, Identifiable {
+public struct WorkLogEntry: Sendable, Hashable, Identifiable, Codable {
     public let id: String
     public let projectID: String?
     public let projectName: String
@@ -519,6 +538,11 @@ public struct WorkLogEntry: Sendable, Hashable, Identifiable {
     /// Sessions rebuilt from the surviving journals rather than observed live.
     public var reconstructedSessionCount: Int = 0
     public var notionPageID: String? = nil
+
+    public var sessionIDs: [String]? = nil
+    public var startedAt: Date? = nil
+    public var endedAt: Date? = nil
+    public var sessions: [WorkSession]? = nil
 
     public var isReconstructed: Bool { reconstructedSessionCount > 0 }
     public var isWhollyReconstructed: Bool { reconstructedSessionCount > 0 && reconstructedSessionCount >= sessionCount }

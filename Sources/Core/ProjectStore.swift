@@ -66,29 +66,101 @@ public final class ProjectStore: @unchecked Sendable {
 
     // MARK: - Identity
 
+    /// Reserve the canonical portable UUID before publishing a newly created
+    /// directory. Discovery may run immediately after the move; it must adopt this
+    /// UUID rather than inventing another project identity. Existing rows/links
+    /// are never reassigned by a reservation.
+    public func reserveWorkspaceIdentity(_ id: UUID, for identity: FileIdentity, createdAt: Date) throws {
+        lock.lock(); defer { lock.unlock() }
+        try db.transaction {
+            try db.execute("CREATE TABLE IF NOT EXISTS workspace_project_identity_reservations (identity_key TEXT PRIMARY KEY, project_id TEXT NOT NULL UNIQUE, created_at REAL NOT NULL)")
+            guard all("WHERE id = ? OR identity_key = ?", [.text(id.uuidString), .text(identity.key)]).allSatisfy({ $0.id == id.uuidString && $0.identityKey == identity.key }) else { throw WorkspaceReplicaError.changed }
+            let existing = try db.query("SELECT identity_key,project_id,created_at FROM workspace_project_identity_reservations WHERE identity_key=? OR project_id=?", [.text(identity.key), .text(id.uuidString)]) { ($0.string(0), $0.string(1), $0.double(2)) }
+            guard existing.allSatisfy({ $0.0 == identity.key && $0.1 == id.uuidString && $0.2 == createdAt.timeIntervalSince1970 }) else { throw WorkspaceReplicaError.changed }
+            try db.run("INSERT OR IGNORE INTO workspace_project_identity_reservations(identity_key,project_id,created_at) VALUES(?,?,?)", [.text(identity.key), .text(id.uuidString), .double(createdAt.timeIntervalSince1970)])
+        }
+    }
+
+    /// Throwing readback for explicit canonical creation; normal registration keeps
+    /// its existing compatibility behavior for previously discovered projects.
+    public func registerWorkspaceProject(_ id: UUID, at url: URL) throws -> ProjectRecord {
+        lock.lock(); defer { lock.unlock() }
+        guard let identity = FileIdentityResolver.identity(of: url), let created = try url.resourceValues(forKeys: [.creationDateKey]).creationDate else { throw WorkspaceReplicaError.missing }
+        try reserveWorkspaceIdentity(id, for: identity, createdAt: created)
+        let record = register(url: url)
+        guard record.id == id.uuidString, let saved = self.record(id: id.uuidString),
+              saved.identityKey == identity.key, saved.lastPath == url.canonicalPath else { throw WorkspaceReplicaError.changed }
+        return saved
+    }
+
+    public func initializeWorkspaceProject(_ content: WorkspaceRecordContent, id: UUID, at url: URL) throws {
+        lock.lock(); defer { lock.unlock() }
+        _ = try registerWorkspaceProject(id, at: url)
+        try db.transaction {
+            let metadata = content.projectMetadata ?? .init(), portfolio = content.projectLinks ?? .init()
+            let description = ProjectDescription(summary: content.body).cleaned
+            guard (self.metadata(for: id.uuidString).isEmpty || self.metadata(for: id.uuidString) == metadata),
+                  (self.description(for: id.uuidString).isEmpty || self.description(for: id.uuidString) == description),
+                  (portfolioDetails(for: id.uuidString).isEmpty || portfolioDetails(for: id.uuidString) == portfolio) else { throw WorkspaceReplicaError.changed }
+            setMetadata(metadata, for: id.uuidString)
+            setDescription(description, for: id.uuidString)
+            try savePortfolioDetails(portfolio, for: id.uuidString)
+            guard self.metadata(for: id.uuidString) == metadata, self.description(for: id.uuidString) == description,
+                  portfolioDetails(for: id.uuidString) == portfolio else { throw WorkspaceReplicaError.changed }
+        }
+    }
+
+    public func releaseUnpublishedWorkspaceIdentity(_ id: UUID, identity: FileIdentity) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard record(id: id.uuidString) == nil else { return }
+        try db.run("DELETE FROM workspace_project_identity_reservations WHERE project_id=? AND identity_key=?", [.text(id.uuidString), .text(identity.key)])
+    }
+
     @discardableResult
     public func register(url: URL, name: String? = nil) -> ProjectRecord {
         lock.lock(); defer { lock.unlock() }
         let path = url.canonicalPath
         let displayName = name ?? url.lastPathComponent
-        let identity = FileIdentityResolver.identity(of: url)?.key
+        let fileIdentity = FileIdentityResolver.identity(of: url)
+        let identity = fileIdentity?.key
+        let reservedID = identity.flatMap { key in
+            (try? db.query("SELECT project_id,created_at FROM workspace_project_identity_reservations WHERE identity_key=?", [.text(key)], row: { ($0.string(0), $0.double(1)) }))?.first.flatMap { value in
+                (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate?.timeIntervalSince1970) == value.1 ? value.0 : nil
+            }
+        }
         let now = Date()
 
-        if let identity, let existing = first("WHERE identity_key = ?", [.text(identity)]) {
-            if existing.lastPath != path || existing.name != displayName {
-                _ = try? db.run(
-                    "UPDATE projects SET last_path = ?, name = ?, updated_at = ? WHERE id = ?",
-                    [.text(path), .text(displayName), .double(now.timeIntervalSince1970), .text(existing.id)]
-                )
+        if let fileIdentity, let existing = record(matching: fileIdentity, at: path) {
+            if existing.lastPath != path || existing.name != displayName || existing.identityKey != identity {
+                relocate(existing, to: path, name: displayName, identity: fileIdentity, at: now)
             }
             var updated = existing
             updated.lastPath = path
             updated.name = displayName
+            updated.identityKey = identity
             return updated
         }
 
         if let existing = first("WHERE last_path = ?", [.text(path)]) {
-            // Same folder, new inode — restored from a backup, or copied and replaced.
+            // A different folder at a known project's path is that project only when its
+            // own folder is gone (restored from a backup, or copied and replaced). If it
+            // still exists elsewhere — swapped in Finder — or this folder was reserved for
+            // another identity, the earlier record keeps its links and follows its folder,
+            // and this one is new. A silently ignored insert must never stand in for it.
+            let elsewhere = folderElsewhere(existing, than: fileIdentity, at: url)
+            if elsewhere != nil || (reservedID != nil && reservedID != existing.id) {
+                let destination = elsewhere.flatMap { first("WHERE last_path = ?", [.text($0)]) == nil ? $0 : nil }
+                    ?? (path as NSString).deletingLastPathComponent + "/.bw-superseded-" + existing.id
+                _ = try? db.run("UPDATE projects SET last_path = ?, name = ?, updated_at = ? WHERE id = ?",
+                                [.text(destination), .text(elsewhere.map { URL(fileURLWithPath: $0).lastPathComponent } ?? existing.name),
+                                 .double(now.timeIntervalSince1970), .text(existing.id)])
+                let record = ProjectRecord(
+                    id: reservedID ?? UUID().uuidString, identityKey: identity, lastPath: path, name: displayName,
+                    notionPageID: nil, watcherID: nil, documentID: nil, createdAt: now, updatedAt: now
+                )
+                insert(record)
+                return record
+            }
             if existing.identityKey != identity {
                 _ = try? db.run(
                     "UPDATE projects SET identity_key = ?, updated_at = ? WHERE id = ?",
@@ -101,7 +173,7 @@ public final class ProjectStore: @unchecked Sendable {
         }
 
         let record = ProjectRecord(
-            id: UUID().uuidString, identityKey: identity, lastPath: path, name: displayName,
+            id: reservedID ?? UUID().uuidString, identityKey: identity, lastPath: path, name: displayName,
             notionPageID: nil, watcherID: nil, documentID: nil, createdAt: now, updatedAt: now
         )
         insert(record)
@@ -117,20 +189,26 @@ public final class ProjectStore: @unchecked Sendable {
     public func record(for url: URL) -> ProjectRecord? {
         lock.lock(); defer { lock.unlock() }
         let path = url.canonicalPath
-        if let identity = FileIdentityResolver.identity(of: url)?.key,
-           var found = first("WHERE identity_key = ?", [.text(identity)]) {
-            if found.lastPath != path {
-                let name = url.lastPathComponent
-                _ = try? db.run(
-                    "UPDATE projects SET last_path = ?, name = ?, updated_at = ? WHERE id = ?",
-                    [.text(path), .text(name), .double(Date().timeIntervalSince1970), .text(found.id)]
-                )
+        if let identity = FileIdentityResolver.identity(of: url),
+           var found = record(matching: identity, at: path) {
+            if found.lastPath != path || found.identityKey != identity.key {
+                let name = found.lastPath != path ? url.lastPathComponent : found.name
+                relocate(found, to: path, name: name, identity: identity, at: Date())
                 found.lastPath = path
                 found.name = name
+                found.identityKey = identity.key
             }
             return found
         }
-        return first("WHERE last_path = ?", [.text(path)])
+        return first("WHERE last_path = ?", [.text(path)]).flatMap { folderElsewhere($0, than: FileIdentityResolver.identity(of: url), at: url) == nil ? $0 : nil }
+    }
+
+    /// Where a record's own folder is now, when that is not `url`: the path names a
+    /// different folder than the record's, and the record's folder still exists.
+    private func folderElsewhere(_ record: ProjectRecord, than identity: FileIdentity?, at url: URL) -> String? {
+        guard let recorded = record.identityKey.flatMap(FileIdentity.init(key:)), recorded.fileID != identity?.fileID,
+              let path = FileIdentityResolver.currentPath(of: recorded, onVolumeOf: url), path != url.canonicalPath else { return nil }
+        return path
     }
 
     public func record(id: String) -> ProjectRecord? {
@@ -170,9 +248,10 @@ public final class ProjectStore: @unchecked Sendable {
            existing.replacingOccurrences(of: "-", with: "").lowercased() != normalized {
             throw NotionLinkError.projectAlreadyLinked
         }
-        if let owner = first("WHERE notion_page_id = ?", [.text(pageID)]), owner.id != projectID {
+        if let owner = first("WHERE LOWER(REPLACE(notion_page_id, '-', '')) = ? AND id != ?", [.text(normalized), .text(projectID)]), owner.id != projectID {
             throw NotionLinkError.notionPageAlreadyLinked
         }
+        guard project.notionPageID != pageID else { return }
         try db.run(
             "UPDATE projects SET notion_page_id = ?, updated_at = ? WHERE id = ?",
             [.text(pageID), .double(Date().timeIntervalSince1970), .text(projectID)]
@@ -325,7 +404,81 @@ public final class ProjectStore: @unchecked Sendable {
         ProjectScore(ratings: ratings(for: projectID))
     }
 
+    /// Every project by identity, read once, for matching many folders (an Ideas refresh).
+    /// The same rule as `record(matching:at:)`: an exact key, else the one record whose
+    /// key carries a legacy device number for that inode and whose folder is no longer
+    /// where it was recorded. Used to follow projects moved out of Projects after a
+    /// restart changed `st_dev`.
+    public struct IdentityIndex: Sendable {
+        private let exact: [String: ProjectRecord]
+        private let legacy: [UInt64: [ProjectRecord]]
+        init(_ records: [ProjectRecord]) {
+            exact = Dictionary(records.compactMap { record in record.identityKey.map { ($0, record) } }, uniquingKeysWith: { first, _ in first })
+            legacy = Dictionary(grouping: records.filter { $0.identityKey.flatMap(FileIdentity.init(key:))?.hasLegacyVolume == true },
+                                by: { FileIdentity(key: $0.identityKey!)!.fileID })
+        }
+        public func record(for identity: FileIdentity, at path: String) -> ProjectRecord? {
+            if let match = exact[identity.key] { return match }
+            let candidates = (legacy[identity.fileID] ?? []).filter { $0.lastPath == path || !FileManager.default.fileExists(atPath: $0.lastPath) }
+            return candidates.count == 1 ? candidates[0] : nil
+        }
+    }
+
+    public func identityIndex() -> IdentityIndex { IdentityIndex(allRecords()) }
+
     // MARK: - Private
+
+    /// The record for the folder with this identity: the exact key, else the one record
+    /// whose key was written with a legacy device number for the same inode
+    /// (`FileIdentity.hasLegacyVolume`) and whose recorded folder is no longer there.
+    /// Without the legacy match, a project renamed in Finder before its key was upgraded
+    /// fell back to its path and either became a new project or claimed whichever
+    /// record still held that path (Current State → Better Signals, October 2026).
+    private func record(matching identity: FileIdentity, at path: String) -> ProjectRecord? {
+        if let exact = first("WHERE identity_key = ?", [.text(identity.key)]) { return exact }
+        let legacy = all("WHERE identity_key LIKE ?", [.text("%:\(identity.fileID)")]).filter { record in
+            guard let recorded = record.identityKey.flatMap(FileIdentity.init(key:)),
+                  recorded.hasLegacyVolume, recorded == identity else { return false }
+            return record.lastPath == path || !FileManager.default.fileExists(atPath: record.lastPath)
+        }
+        return legacy.count == 1 ? legacy[0] : nil
+    }
+
+    /// Moves a record to the folder its identity was found at. Another record still
+    /// naming that path is stale — the folder there is this one — so it is moved aside
+    /// to a path that cannot exist, keeping its id, links, ratings and metadata. A
+    /// silently failed update here once left two identities publishing one folder.
+    private func relocate(_ record: ProjectRecord, to path: String, name: String, identity: FileIdentity, at now: Date) {
+        _ = try? db.transaction {
+            if record.lastPath != path, !record.lastPath.contains("/.bw-superseded-") {
+                try recordAlias(record.lastPath, for: record.id)
+            }
+            if record.lastPath != path, let holder = first("WHERE last_path = ? AND id <> ?", [.text(path), .text(record.id)]) {
+                let aside = (path as NSString).deletingLastPathComponent + "/.bw-superseded-" + holder.id
+                try db.run("UPDATE projects SET last_path = ?, updated_at = ? WHERE id = ?",
+                           [.text(aside), .double(now.timeIntervalSince1970), .text(holder.id)])
+            }
+            try db.run("UPDATE projects SET last_path = ?, name = ?, identity_key = ?, updated_at = ? WHERE id = ?",
+                       [.text(path), .text(name), .text(identity.key), .double(now.timeIntervalSince1970), .text(record.id)])
+        }
+    }
+
+    /// Paths projects have left in Finder (renames and moves), each with the one project
+    /// that left it. Work files are never rewritten, so a `project:` line naming an old
+    /// path still means that project. A path left by two different projects means neither.
+    public func pathAliases() -> [String: String] {
+        lock.lock(); defer { lock.unlock() }
+        let rows = (try? db.query("SELECT path, project_id FROM project_path_aliases WHERE project_id <> ''", []) { ($0.string(0), $0.string(1)) }) ?? []
+        return Dictionary(rows, uniquingKeysWith: { first, _ in first })
+    }
+
+    private func recordAlias(_ path: String, for projectID: String) throws {
+        try db.execute("CREATE TABLE IF NOT EXISTS project_path_aliases (path TEXT PRIMARY KEY, project_id TEXT NOT NULL)")
+        try db.run("""
+            INSERT INTO project_path_aliases (path, project_id) VALUES (?, ?)
+            ON CONFLICT(path) DO UPDATE SET project_id = CASE WHEN project_id = excluded.project_id THEN project_id ELSE '' END
+            """, [.text(path), .text(projectID)])
+    }
 
     private static let columns =
         "id, identity_key, last_path, name, notion_page_id, watcher_id, document_id, created_at, updated_at"
@@ -386,6 +539,10 @@ public struct ProjectDescription: Hashable, Sendable {
 /// are intentionally a summary of relationships, not a second copy of the related
 /// Notion databases or media files.
 public struct ProjectPortfolioDetails: Hashable, Sendable, Codable {
+    public var featured: Bool?
+    public var inShowcase: Bool?
+    public var isPublic: Bool?
+    public var customLinks: [ProjectLink]?
     public var githubURL: String?
     public var websiteURL: String?
     public var resourceReferences: [String]
@@ -399,6 +556,7 @@ public struct ProjectPortfolioDetails: Hashable, Sendable, Codable {
     public var workLogReferences: [String]
 
     private enum CodingKeys: String, CodingKey {
+        case featured, inShowcase, isPublic, customLinks
         case githubURL, websiteURL, resourceReferences, collectionReferences, mediaReferences
         case taskReferences, featureReferences, milestoneReferences, workLogReferences
     }
@@ -407,7 +565,8 @@ public struct ProjectPortfolioDetails: Hashable, Sendable, Codable {
                 resourceReferences: [String] = [], collectionReferences: [String] = [],
                 mediaReferences: [String] = [], taskReferences: [String] = [],
                 featureReferences: [String] = [], milestoneReferences: [String] = [],
-                workLogReferences: [String] = []) {
+                workLogReferences: [String] = [], featured: Bool? = nil, inShowcase: Bool? = nil, isPublic: Bool? = nil) {
+        self.featured = featured; self.inShowcase = inShowcase; self.isPublic = isPublic
         self.githubURL = Self.clean(githubURL)
         self.websiteURL = Self.clean(websiteURL)
         self.resourceReferences = Self.cleaned(resourceReferences)
@@ -420,7 +579,8 @@ public struct ProjectPortfolioDetails: Hashable, Sendable, Codable {
     }
 
     public var isEmpty: Bool {
-        githubURL == nil && websiteURL == nil && resourceReferences.isEmpty
+        featured == nil && inShowcase == nil && isPublic == nil && (customLinks ?? []).isEmpty
+            && githubURL == nil && websiteURL == nil && resourceReferences.isEmpty
             && collectionReferences.isEmpty && mediaReferences.isEmpty && taskReferences.isEmpty
             && featureReferences.isEmpty && milestoneReferences.isEmpty && workLogReferences.isEmpty
     }
@@ -441,10 +601,18 @@ public struct ProjectPortfolioDetails: Hashable, Sendable, Codable {
             milestoneReferences: try values.decodeIfPresent([String].self, forKey: .milestoneReferences) ?? [],
             workLogReferences: try values.decodeIfPresent([String].self, forKey: .workLogReferences) ?? []
         )
+        featured = try values.decodeIfPresent(Bool.self, forKey: .featured)
+        inShowcase = try values.decodeIfPresent(Bool.self, forKey: .inShowcase)
+        isPublic = try values.decodeIfPresent(Bool.self, forKey: .isPublic)
+        customLinks = try values.decodeIfPresent([ProjectLink].self, forKey: .customLinks)
     }
 
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(featured, forKey: .featured)
+        try values.encodeIfPresent(inShowcase, forKey: .inShowcase)
+        try values.encodeIfPresent(isPublic, forKey: .isPublic)
+        try values.encodeIfPresent(customLinks, forKey: .customLinks)
         try values.encodeIfPresent(githubURL, forKey: .githubURL)
         try values.encodeIfPresent(websiteURL, forKey: .websiteURL)
         try values.encode(resourceReferences, forKey: .resourceReferences)
@@ -585,6 +753,12 @@ public extension ProjectStore {
             """, [.text(projectID), .text(raw), .double(Date().timeIntervalSince1970)])
     }
 
+    func savePortfolioDetails(_ details: ProjectPortfolioDetails, for projectID: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        let data = try JSONEncoder().encode(details)
+        try db.run("INSERT INTO project_portfolio_details(project_id,details_json,updated_at) VALUES (?,?,?) ON CONFLICT(project_id) DO UPDATE SET details_json=excluded.details_json,updated_at=excluded.updated_at", [.text(projectID), .text(String(decoding: data, as: UTF8.self)), .double(Date().timeIntervalSince1970)])
+    }
+
     func metadata(for projectID: String) -> ProjectMetadata {
         lock.lock(); defer { lock.unlock() }
         guard let metadata = (try? db.query("""
@@ -610,16 +784,20 @@ public extension ProjectStore {
     }
 
     func setMetadata(_ metadata: ProjectMetadata, for projectID: String) {
+        try? saveMetadata(metadata, for: projectID)
+    }
+
+    func saveMetadata(_ metadata: ProjectMetadata, for projectID: String) throws {
         lock.lock(); defer { lock.unlock() }
         if metadata.isEmpty {
-            _ = try? db.run("DELETE FROM project_metadata WHERE project_id = ?", [.text(projectID)])
+            _ = try db.run("DELETE FROM project_metadata WHERE project_id = ?", [.text(projectID)])
             return
         }
         func text(_ value: String?) -> Database.Value { value.map(Database.Value.text) ?? .null }
         func date(_ value: Date?) -> Database.Value { value.map { .double($0.timeIntervalSince1970) } ?? .null }
         func number(_ value: Double?) -> Database.Value { value.map(Database.Value.double) ?? .null }
         let priority = metadata.portfolioPriority.map { Database.Value.int(Int64(min(5, max(1, $0)))) } ?? .null
-        _ = try? db.run("""
+        _ = try db.run("""
             INSERT INTO project_metadata (project_id,domain,status,phase,completion_model,maintenance_cadence,project_type,
               work_modes_json,current_work_json,next_work_json,recent_work_json,blockers_json,status_detail,
               started_at,last_update_at,tracking_priority,portfolio_priority,updated_at)

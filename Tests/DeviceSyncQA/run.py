@@ -104,6 +104,21 @@ def find(qa_id: str, title: str) -> Path | None:
     return None
 
 
+def trash_names(qa_id: str) -> list[str]:
+    """Names in the Trash containing `qa_id`. A shell without Full Disk Access cannot read
+    ~/.Trash ("Operation not permitted"), so fall back to asking Finder."""
+    try:
+        return [p.name for p in TRASH.glob(f"*{qa_id}*")] or finder_trash(qa_id)
+    except PermissionError:
+        return finder_trash(qa_id)
+
+
+def finder_trash(qa_id: str) -> list[str]:
+    script = f'tell application "Finder" to get name of every item of trash whose name contains "{qa_id}"'
+    out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True).stdout.strip()
+    return [name for name in out.split(", ") if name]
+
+
 def wait_until(description: str, check, timeout: float = 300):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -184,8 +199,8 @@ def main() -> int:
     gone = wait_until("A trashed", lambda: find(qa, base + " mac") is None and not any(
         front_matter(p).get("title") == base + " mac" for p in qa_files(qa)), 300)
     record("Deleted task left the Workspace", bool(gone))
-    trashed = [p for p in TRASH.glob(f"*{qa}*")]
-    record("Deleted task is in the Mac Trash", bool(trashed), ", ".join(p.name for p in trashed))
+    trashed = trash_names(qa)
+    record("Deleted task is in the Mac Trash", bool(trashed), ", ".join(trashed))
     finish(watch, "QA5 iPad detail page reports the deletion and blocks edits")
 
     # 7. The fixture never sends anything, even on a signed-in device.
@@ -224,7 +239,7 @@ priority: medium
     finish(delete, "QA6 iPhone deletes from the stale path")
     gone = wait_until("trashed", lambda: not qa_files(qa), 300)
     record("Deleted task left the Workspace", bool(gone))
-    record("Deleted task is in the Mac Trash", bool(list(TRASH.glob(f"*{qa}*"))))
+    record("Deleted task is in the Mac Trash", bool(trash_names(qa)))
     finish(watch, "QA5 iPad detail page reports the deletion and blocks edits")
     return report()
 

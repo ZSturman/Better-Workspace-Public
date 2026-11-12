@@ -1,7 +1,145 @@
 import XCTest
+import AppKit
 import BetterWorkspaceCore
 
 final class CaptureComposerUITests: IsolatedUITestCase {
+    func testVideoFailureCanBeReadAndRemovedWithoutLosingIdeaText() throws {
+        let app = isolatedApp(arguments: ["-bwMenuBarPanelInWindow", "YES"])
+        app.launch(); requireWindow(app)
+        let panel = app.windows["Menu Bar Panel (inspection)"]
+        XCTAssertTrue(panel.waitForExistence(timeout: 20))
+        let field = panel.textViews["ingest.captureField"].firstMatch
+        field.click()
+        let clipboard = NSPasteboard.general
+        let previous = clipboard.pasteboardItems?.map { item -> NSPasteboardItem in
+            let copy = NSPasteboardItem()
+            for type in item.types { if let data = item.data(forType: type) { copy.setData(data, forType: type) } }
+            return copy
+        } ?? []
+        let noteText = "Keep this video idea\n\nThese notes must survive a failed attachment."
+        clipboard.clearContents()
+        XCTAssertTrue(clipboard.setString(noteText, forType: .string))
+        field.typeKey("a", modifierFlags: .command)
+        field.typeKey("v", modifierFlags: .command)
+        XCTAssertEqual(field.value as? String, noteText)
+        clipboard.clearContents()
+        let missing = Self.fixtureRoot.appendingPathComponent(String(repeating: "Unavailable video reference ", count: 5) + ".mov")
+        try Data("video fixture".utf8).write(to: missing)
+        XCTAssertTrue(clipboard.writeObjects([missing as NSURL]))
+        let change = clipboard.changeCount
+        defer {
+            if clipboard.changeCount == change {
+                clipboard.clearContents()
+                if !previous.isEmpty { clipboard.writeObjects(previous) }
+            }
+        }
+        field.typeKey("v", modifierFlags: .command)
+        XCTAssertTrue(panel.textFields["Image or file title"].firstMatch.waitForExistence(timeout: 5))
+        try FileManager.default.removeItem(at: missing)
+        panel.menuButtons["capture.destination"].click()
+        app.menuItems["New Idea"].click()
+        panel.buttons["ingest.captureButton"].click()
+        let result = panel.staticTexts["capture.result"]
+        XCTAssertTrue(result.waitForExistence(timeout: 15))
+        let message = (result.value as? String) ?? result.label
+        XCTAssertTrue(message.contains(missing.lastPathComponent), message)
+        XCTAssertTrue(message.contains("Your draft is still here"), message)
+        XCTAssertGreaterThan(result.frame.height, 30, "The full error wraps across lines")
+        let remove = panel.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'capture.removeAttachment.'")).firstMatch
+        remove.click()
+        XCTAssertTrue(panel.exists)
+        XCTAssertFalse(panel.textFields["Image or file title"].exists)
+        XCTAssertTrue((field.value as? String)?.contains("These notes must survive") == true)
+        panel.buttons["ingest.captureButton"].click()
+        let note = Self.workspaceRoot.appendingPathComponent("Ideas/Keep this video idea/Keep this video idea.md")
+        let saved = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in FileManager.default.fileExists(atPath: note.path) }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [saved], timeout: 20), .completed)
+        XCTAssertTrue(try String(contentsOf: note, encoding: .utf8).contains("These notes must survive"))
+    }
+
+    func testFilesPickerNavigatesAndCancellationKeepsDraft() throws {
+        let app = isolatedApp(arguments: ["-bwMenuBarPanelInWindow", "YES"])
+        app.launch(); requireWindow(app)
+        let panel = app.windows["Menu Bar Panel (inspection)"]
+        XCTAssertTrue(panel.waitForExistence(timeout: 20))
+        let field = panel.textViews["ingest.captureField"].firstMatch
+        field.click(); field.typeText("Picker draft survives cancellation")
+        let draftBeforePicker = try XCTUnwrap(field.value as? String)
+        XCTAssertTrue(draftBeforePicker.contains("Picker draft survives cancellation"))
+        panel.buttons["capture.files"].click()
+        let cancel = app.buttons["Cancel"].firstMatch
+        XCTAssertTrue(cancel.waitForExistence(timeout: 10)); XCTAssertTrue(cancel.isEnabled)
+        app.typeKey("g", modifierFlags: [.command, .shift])
+        // The Go to Folder control is a text field on current macOS, and a
+        // combo box on earlier versions. Type into its already focused editor.
+        app.typeText(Self.workspaceRoot.appendingPathComponent("For Reference").path)
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(app.buttons["Add to draft"].firstMatch.waitForExistence(timeout: 5))
+        cancel.click()
+        XCTAssertEqual(field.value as? String, draftBeforePicker)
+    }
+
+    func testMenuBarIdeaKeepsPastedImagesWithItsMarkdown() throws {
+        let app = isolatedApp(arguments: ["-bwMenuBarPanelInWindow", "YES", "-bwWindowWidth", "820", "-bwWindowHeight", "520"])
+        app.launch()
+        requireWindow(app)
+        let panel = app.windows["Menu Bar Panel (inspection)"].firstMatch
+        XCTAssertTrue(panel.waitForExistence(timeout: 20))
+        let field = panel.textViews["ingest.captureField"].firstMatch
+        field.click()
+        field.typeText("Visual idea\n\nThe pasted references belong here.")
+
+        let png = try Data(contentsOf: Self.workspaceRoot.appendingPathComponent("For Reference/Wide reference.png"))
+        let tiff = try XCTUnwrap(NSImage(data: png)?.tiffRepresentation)
+        let clipboard = NSPasteboard.general
+        let previous = clipboard.pasteboardItems?.map { item -> NSPasteboardItem in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+            }
+            return copy
+        } ?? []
+        var fixtureChange = clipboard.changeCount
+        defer {
+            if clipboard.changeCount == fixtureChange {
+                clipboard.clearContents()
+                if !previous.isEmpty { clipboard.writeObjects(previous) }
+            }
+        }
+        clipboard.clearContents()
+        XCTAssertTrue(clipboard.setData(png, forType: .png))
+        fixtureChange = clipboard.changeCount
+        field.typeKey("v", modifierFlags: .command)
+        XCTAssertTrue(panel.textFields["Image or file title"].firstMatch.waitForExistence(timeout: 5))
+
+        clipboard.clearContents()
+        XCTAssertTrue(clipboard.setData(tiff, forType: .tiff))
+        fixtureChange = clipboard.changeCount
+        panel.buttons["capture.paste"].click()
+        XCTAssertEqual(panel.textFields.matching(identifier: "Image or file title").count, 2)
+
+        panel.menuButtons["capture.destination"].firstMatch.click()
+        let ideas = app.menuItems["New Idea"].firstMatch
+        XCTAssertTrue(ideas.waitForExistence(timeout: 10))
+        ideas.click()
+        panel.buttons["ingest.captureButton"].firstMatch.click()
+        let folder = Self.workspaceRoot.appendingPathComponent("Ideas/Visual idea")
+        let note = folder.appendingPathComponent("Visual idea.md")
+        let written = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            FileManager.default.fileExists(atPath: note.path)
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [written], timeout: 15), .completed)
+        // Idea/Idea.md with the images under Attachments, each linked from the note.
+        let text = try String(contentsOf: note, encoding: .utf8)
+        XCTAssertTrue(text.hasPrefix("Visual idea\n\nThe pasted references belong here.\n"), text)
+        let images = try FileManager.default.contentsOfDirectory(at: folder.appendingPathComponent("Attachments"), includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "png" }
+        XCTAssertEqual(images.count, 2)
+        XCTAssertTrue(images.allSatisfy { NSImage(contentsOf: $0)?.isValid == true })
+        XCTAssertTrue(images.allSatisfy { text.contains("](<Attachments/\($0.lastPathComponent)>)") }, text)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: folder.path)), ["Visual idea.md", "Attachments"])
+    }
+
     func testProcessInboxReopensClosedWorkspace() throws {
         let app = isolatedApp(arguments: ["-bwMenuBarPanelInWindow", "YES"])
         app.launch()

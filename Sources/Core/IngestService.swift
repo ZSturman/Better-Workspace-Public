@@ -14,6 +14,7 @@ public final class IngestService: @unchecked Sendable {
         case moveFailed(String)
         /// Only an iCloud placeholder is here. A download has been started.
         case notDownloaded(String)
+        case attachmentFailed(String, String)
 
         public var errorDescription: String? {
             switch self {
@@ -23,6 +24,8 @@ public final class IngestService: @unchecked Sendable {
             case .moveFailed(let m): return "Move failed: \(m)"
             case .notDownloaded(let name):
                 return "“\(name)” is still in iCloud. It is downloading now; file it once it has arrived."
+            case .attachmentFailed(let name, let reason):
+                return "Couldn’t add “\(name)”. \(reason) Download it in Finder if it is in iCloud, or choose it again with Files."
             }
         }
     }
@@ -34,6 +37,7 @@ public final class IngestService: @unchecked Sendable {
     private let tagStore: TagStore
     private let workspace: WorkspaceLocation
     private let fs = FileManager.default
+    private let ideaFilingLock = NSLock()
     /// Metadata rows whose file was absent from the last inbox listing.
     private var missingLastScan: Set<String> = []
     private let orphanLock = NSLock()
@@ -98,6 +102,46 @@ public final class IngestService: @unchecked Sendable {
         let base = preferredName.isEmpty ? Self.timestampName() : preferredName
         let url = try writeNew(data, in: location.inbox, base: Self.safeFilename(base), extension: ext)
         return try record(url: url, source: source, title: base)
+    }
+
+    /// An idea draft becomes one Inbox item already in the idea layout: `<title>.md`
+    /// with every image and file under `Attachments/` (see `IdeaFolderLayout`).
+    public func captureIdea(title: String, note: CaptureDraftEntry?, attachments: [CaptureDraftEntry]) throws -> IngestItem {
+        let document = try note?.document
+        guard document != nil || !attachments.isEmpty else { throw IngestError.emptyText }
+        guard location.ensureExists() else { throw IngestError.inboxUnavailable }
+        let explicitTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = document?.name ?? (explicitTitle.isEmpty ? attachments.first?.title ?? "" : explicitTitle)
+        let base = Self.safeFilename(name)
+        let destination = uniqueURL(in: location.inbox, base: base, extension: "")
+        var files: [IdeaFolderLayout.Attachment] = []
+        for entry in attachments {
+            if let attachment = try entry.document {
+                files.append(.init(name: attachment.name, ext: attachment.ext) { try attachment.data.write(to: $0, options: .withoutOverwriting) })
+            } else if case .file(let source) = entry.content {
+                let name = entry.title.isEmpty ? source.deletingPathExtension().lastPathComponent : entry.title
+                files.append(.init(name: name, ext: source.pathExtension) { destination in
+                    // Finder clipboard URLs may be file-provider items. Coordinate
+                    // the selected original rather than copying a cold placeholder.
+                    let scoped = source.startAccessingSecurityScopedResource()
+                    defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+                    var coordinationError: NSError?
+                    var copyError: Swift.Error?
+                    NSFileCoordinator().coordinate(readingItemAt: source, options: .withoutChanges, error: &coordinationError) { readable in
+                        do { try FileManager.default.copyItem(at: readable, to: destination) }
+                        catch { copyError = error }
+                    }
+                    if let error = copyError ?? coordinationError {
+                        throw IngestError.attachmentFailed(source.lastPathComponent, error.localizedDescription)
+                    }
+                })
+            }
+        }
+        let markdown = document.map { String(decoding: $0.data, as: UTF8.self) }
+        try IdeaFileService.publishFolder(at: destination) { folder in
+            try IdeaFolderLayout.build(in: folder, base: base, title: base, markdown: markdown, attachments: files)
+        }
+        return try record(url: destination, source: .quickCapture, title: name.isEmpty ? base : name)
     }
 
     // MARK: - Inbox
@@ -288,6 +332,9 @@ public final class IngestService: @unchecked Sendable {
         }
 
         let sourceURL = ingestItem.url
+        let isIdea = areaURL.canonicalPath == workspace.url(for: .ideas).canonicalPath
+        if isIdea { ideaFilingLock.lock() }
+        defer { if isIdea { ideaFilingLock.unlock() } }
         // Asked fresh, not from the listing: it may have arrived since. Moving a
         // placeholder out of iCloud makes the move wait on the download — on the main
         // thread, offline, indefinitely — so it is refused and the download started.
@@ -301,16 +348,33 @@ public final class IngestService: @unchecked Sendable {
         let ext = sourceURL.pathExtension
         let requested = (newName?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
         let base = Self.safeFilename(requested ?? sourceURL.deletingPathExtension().lastPathComponent)
+        if isIdea {
+            try WorkspaceLocalPathChecks.rejectSymlinks(to: areaURL)
+            try WorkspaceLocalPathChecks.rejectSymlinks(to: sourceURL)
+            guard sourceURL.deletingLastPathComponent().canonicalPath == location.inbox.canonicalPath,
+                  let identity = FileIdentityResolver.identity(of: sourceURL),
+                  ingestItem.item.identity == nil || ingestItem.item.identity == identity else {
+                throw IngestError.moveFailed("This capture changed or is no longer in the Inbox.")
+            }
+            if !ingestItem.item.isDirectory {
+                return try fileIdeaDocument(ingestItem, in: areaURL, base: base,
+                                            title: requested ?? ingestItem.title, sourceIdentity: identity)
+            }
+            if IdeaFolderLayout.isCaptureBundle(sourceURL) {
+                let name = Self.safeFilename(requested ?? sourceURL.lastPathComponent)
+                return try fileIdeaBundle(ingestItem, in: areaURL, base: name,
+                                          title: requested ?? ingestItem.title, sourceIdentity: identity)
+            }
+        }
         var destination = areaURL.appendingPathComponent(base)
-        if ingestItem.item.isDirectory == false, ext.isEmpty == false {
+        if isIdea {
+            destination = uniqueURL(in: areaURL, base: Self.safeFilename(requested ?? sourceURL.lastPathComponent), extension: "")
+        } else if ingestItem.item.isDirectory == false, ext.isEmpty == false {
             destination = areaURL.appendingPathComponent(base).appendingPathExtension(ext)
         }
         if fs.fileExists(atPath: destination.path) {
             throw IngestError.destinationExists(destination.lastPathComponent)
         }
-
-        // Capture identity *before* the move so tags can be rebound either way.
-        let oldKey = ingestItem.id
 
         var originalKept = false
         if crossesVolumes(sourceURL, areaURL) {
@@ -335,12 +399,98 @@ public final class IngestService: @unchecked Sendable {
         // belonging to this app.
         SourceMarker.clear(from: destination)
         MobileCaptureBundleReceipt.clear(from: destination)
-        tagStore.rebindObject(fromIdentityKey: oldKey, to: destination, area: area)
-        if originalKept == false {
-            _ = try? db.run("DELETE FROM ingest_items WHERE identity_key = ?", [.text(oldKey)])
+        return finishFiling(ingestItem, at: destination, title: requested ?? ingestItem.title,
+                            area: area, originalKept: originalKept)
+    }
+
+    /// A single captured file becomes `<base>/<base>.md`; anything that is not Markdown
+    /// goes under `Attachments/` and the note links it (see `IdeaFolderLayout`).
+    private func fileIdeaDocument(_ item: IngestItem, in directory: URL, base: String,
+                                  title: String, sourceIdentity: FileIdentity) throws -> Filed {
+        let ext = item.url.pathExtension
+        let isMarkdown = ["md", "markdown", "mdown"].contains(ext.lowercased())
+        return try fileIdea(item, in: directory, base: base, title: title, sourceIdentity: sourceIdentity) { staged in
+            if isMarkdown {
+                let child = staged.appendingPathComponent(base).appendingPathExtension("md")
+                try SafeTransfer.copyIntoPlace(item.url, to: child, copy: copyItem)
+                SourceMarker.clear(from: child)
+            } else {
+                let source = item.url
+                try IdeaFolderLayout.build(in: staged, base: base, title: title, markdown: nil, attachments: [
+                    .init(name: source.deletingPathExtension().lastPathComponent, ext: ext) { target in
+                        try SafeTransfer.copyIntoPlace(source, to: target, copy: self.copyItem)
+                        SourceMarker.clear(from: target)
+                    }])
+            }
         }
-        recordFiling(of: ingestItem, at: destination, title: requested ?? ingestItem.title,
-                     destinationName: area ?? areaURL.lastPathComponent)
+    }
+
+    /// A phone capture bundle (`Note.md` plus photos and files) is rebuilt in the idea
+    /// layout: its note becomes `<base>.md` and every other file an attachment.
+    private func fileIdeaBundle(_ item: IngestItem, in directory: URL, base: String,
+                                title: String, sourceIdentity: FileIdentity) throws -> Filed {
+        let source = item.url
+        let names = try fs.contentsOfDirectory(atPath: source.path).filter { !$0.hasPrefix(".") }.sorted()
+        let noteURL = source.appendingPathComponent(IdeaFolderLayout.bundleNoteName)
+        let markdown = names.contains(IdeaFolderLayout.bundleNoteName)
+            ? try String(contentsOf: noteURL, encoding: .utf8) : nil
+        let files = names.filter { $0 != IdeaFolderLayout.bundleNoteName }.map { source.appendingPathComponent($0) }
+        return try fileIdea(item, in: directory, base: base, title: title, sourceIdentity: sourceIdentity) { staged in
+            try IdeaFolderLayout.build(in: staged, base: base, title: title, markdown: markdown, attachments: files.map { file in
+                .init(name: file.deletingPathExtension().lastPathComponent, ext: file.pathExtension) { target in
+                    try SafeTransfer.copyIntoPlace(file, to: target, copy: self.copyItem)
+                    SourceMarker.clear(from: target)
+                }
+            })
+        }
+    }
+
+    /// Builds the idea folder from a copy, publishes it under a free name, and removes
+    /// the Inbox original only if it did not change meanwhile; otherwise both are kept.
+    private func fileIdea(_ item: IngestItem, in directory: URL, base: String, title: String,
+                          sourceIdentity: FileIdentity, build: (URL) throws -> Void) throws -> Filed {
+        let destination = uniqueURL(in: directory, base: base, extension: "")
+        let before = contentStamp(of: item.url)
+        func sourceIsUnchanged() -> Bool {
+            FileIdentityResolver.identity(of: item.url) == sourceIdentity && before != nil && contentStamp(of: item.url) == before
+        }
+        try IdeaFileService.publishFolder(at: destination) { staged in
+            try build(staged)
+            guard sourceIsUnchanged() else {
+                throw IngestError.moveFailed("This capture changed during filing.")
+            }
+        }
+        var originalKept = true
+        if sourceIsUnchanged() {
+            do { try fs.removeItem(at: item.url); originalKept = false } catch {}
+        }
+        return finishFiling(item, at: destination, title: title,
+                            area: WorkspaceArea.ideas.directoryName, originalKept: originalKept)
+    }
+
+    /// Size and modification date of a file, or of each direct child of a folder.
+    private func contentStamp(of url: URL) -> [String]? {
+        func stamp(_ url: URL) -> String? {
+            guard let attributes = try? fs.attributesOfItem(atPath: url.path) else { return nil }
+            let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
+            return "\(url.lastPathComponent)|\((attributes[.size] as? NSNumber)?.int64Value ?? -1)|\(modified)"
+        }
+        var isDirectory: ObjCBool = false
+        guard fs.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return nil }
+        guard isDirectory.boolValue else { return stamp(url).map { [$0] } }
+        guard let names = try? fs.contentsOfDirectory(atPath: url.path) else { return nil }
+        let children = names.sorted().map { stamp(url.appendingPathComponent($0)) }
+        return children.contains(where: { $0 == nil }) ? nil : children.compactMap { $0 }
+    }
+
+    private func finishFiling(_ item: IngestItem, at destination: URL, title: String,
+                              area: String?, originalKept: Bool) -> Filed {
+        tagStore.rebindObject(fromIdentityKey: item.id, to: destination, area: area)
+        if originalKept == false {
+            _ = try? db.run("DELETE FROM ingest_items WHERE identity_key = ?", [.text(item.id)])
+        }
+        recordFiling(of: item, at: destination, title: title,
+                     destinationName: area ?? destination.deletingLastPathComponent().lastPathComponent)
         return Filed(destination: destination, originalKept: originalKept)
     }
 

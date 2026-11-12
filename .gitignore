@@ -4,6 +4,7 @@ Support/*-Info.plist
 
 .DS_Store
 build/
+.build/
 DerivedData/
 *.xcuserstate
 xcuserdata/
